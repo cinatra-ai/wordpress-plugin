@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  php-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+      - name: php -l (lint every PHP file)
+        run: |
+          set -e
+          find . -path ./vendor -prune -o -name '*.php' -print | while read -r f; do
+            php -l "$f"
+          done
+
+  readme-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: readme.txt has required headers + matching Stable tag
+        run: |
+          set -e
+          test -f readme.txt
+          grep -qE '^Stable tag: ' readme.txt
+          grep -qE '^License: GPL-2.0-or-later' readme.txt
+          stable="$(grep -E '^Stable tag: ' readme.txt | head -1 | sed -E 's/^Stable tag:[[:space:]]*//')"
+          header="$(grep -E '^\s*\*\s*Version:' cinatra.php | head -1 | sed -E 's/.*Version:[[:space:]]*//')"
+          echo "readme Stable tag = $stable ; plugin header Version = $header"
+          test "$stable" = "$header"
+
+  plugin-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Informational until initial findings are triaged (WPD-EXTRACT-03:
+    # "Optional WPCS once initial noisy findings are triaged"). The gating jobs
+    # are php-lint + readme-validate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: WordPress plugin check
+        uses: WordPress/plugin-check-action@v1
+        with:
+          build-dir: "./"
