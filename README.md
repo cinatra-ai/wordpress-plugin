@@ -32,9 +32,10 @@ live in the cinatra repo under `contracts/wp-drupal-assistant/`.
 ## Development
 
 This repo is the source of truth for the plugin. Cinatra developers consume it
-as a local clone for the dev docker stack. See the cinatra repo:
-`docs/developer/wp-drupal-plugin-development.md` for the multi-repo workflow,
-the contract-version bump checklist, and dirty-tree recovery.
+as a local clone for the dev docker stack. See
+<https://docs.cinatra.ai/guides/developer/wp-drupal-plugin-development/> for the
+multi-repo workflow, the contract-version bump checklist, and dirty-tree
+recovery.
 
 ## License
 
