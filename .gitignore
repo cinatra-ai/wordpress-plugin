@@ -1,0 +1,12 @@
+# Dependencies
+/vendor/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# Editor directories
+.idea/
+.vscode/
