@@ -3,7 +3,7 @@
  * Plugin Name: Cinatra
  * Plugin URI: https://cinatra.ai
  * Description: Embeds the Cinatra AI assistant chat widget in WordPress admin. Floating button bottom-right; opens chat panel on click.
- * Version: 0.1.0
+ * Version: 0.2.0
  * Author: Cinatra
  * Requires at least: 5.9
  * Tested up to: 6.8
@@ -14,13 +14,15 @@
 
 if (!defined('ABSPATH')) exit;
 
-// Bump this version whenever the Cinatra bundle or plugin UI changes so browsers
-// and WordPress invalidate their cached copy of bundle.js.
+// Bump this version whenever the vendored widget asset or plugin UI changes so
+// browsers and WordPress invalidate their cached copy of cinatra-widget.js.
 // Keep CINATRA_THEME_* values in sync with the canonical Cinatra brand tokens.
-define('CINATRA_PLUGIN_VERSION', '0.1.0');
+define('CINATRA_PLUGIN_VERSION', '0.2.0');
 // Plugin↔core wire-contract version. Cinatra rejects unknown versions with an
 // admin-visible error. See the cinatra repo: contracts/wp-drupal-assistant/.
-define('CINATRA_CONTRACT_VERSION', 'v1');
+// v2 drops the browser-side apiKey: the widget is served locally and streams
+// with a short-lived token minted by the same-origin REST broker below.
+define('CINATRA_CONTRACT_VERSION', 'v2');
 define('CINATRA_THEME_ACCENT',          '#2d4a8a');
 define('CINATRA_THEME_ACCENT_HOVER',    '#243e78');
 define('CINATRA_THEME_ACCENT_SOFT',     '#e6ede7');
@@ -205,25 +207,47 @@ add_action('admin_notices', function () {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Enqueue widget bundle from Cinatra and pass config
+// Enqueue the LOCAL widget asset and pass a secret-free config (contract v2).
+//
+// The widget JS is shipped inside this plugin (assets/cinatra-widget.js) — it is
+// never remote-loaded from the Cinatra instance, so wp-admin never executes
+// third-party code fetched over HTTP. The long-lived integration key
+// (cinatra_api_key) is NOT exposed to the browser: the widget exchanges it for a
+// short-lived, origin/audience/scope-bound stream token via the same-origin REST
+// broker route below (cinatra/v1/token). See wp#4 / cinatra#220.
 // ---------------------------------------------------------------------------
 
-add_action('admin_enqueue_scripts', function () {
+add_action('admin_enqueue_scripts', 'cinatra_enqueue_widget');
+
+/**
+ * Enqueue the locally-vendored widget asset and localize a secret-free config.
+ * Named (not anonymous) so it stays unit-testable and overridable.
+ */
+function cinatra_enqueue_widget(): void {
     if (!current_user_can('manage_options')) return;
     $url     = get_option('cinatra_url', '');
     $api_key = get_option('cinatra_api_key', '');
+    // Without an instance URL + integration key there is nothing for the broker
+    // to talk to; keep the widget off rather than mount a broken assistant.
     if (empty($url) || empty($api_key)) return;
-    $bundle_url = rtrim($url, '/') . '/api/wordpress/bundle.js';
-    wp_enqueue_script('cinatra', $bundle_url, [], CINATRA_PLUGIN_VERSION, true);
+    wp_enqueue_script(
+        'cinatra',
+        plugins_url('assets/cinatra-widget.js', __FILE__),
+        [],
+        CINATRA_PLUGIN_VERSION,
+        true
+    );
     $instance_id = get_option('cinatra_instance_id', '');
     wp_localize_script('cinatra', 'CinatraConfig', [
         'contractVersion' => CINATRA_CONTRACT_VERSION,
         'cinatraUrl'      => rtrim($url, '/'),
-        'apiKey'          => $api_key,
+        // No apiKey. The browser obtains a short-lived token from this endpoint.
+        'tokenEndpoint'   => rest_url('cinatra/v1/token'),
+        'nonce'           => wp_create_nonce('wp_rest'),
         'instanceId'      => $instance_id,
         'wpAdminUrl'      => admin_url(),
     ]);
-});
+}
 
 // ---------------------------------------------------------------------------
 // Mount point + inline fallback button — always visible even when Cinatra is down
@@ -280,7 +304,9 @@ add_action('admin_footer', function () {
   }
   btn.addEventListener("click",function(){
     if(ok)return;
-    fetch(cu+"/api/wordpress/bundle.js",{method:"HEAD",cache:"no-store",signal:AbortSignal.timeout(4000)})
+    // The widget JS is local; reachability now means "can the browser reach the
+    // instance API at all?". Probe the auth-free capabilities endpoint.
+    fetch(cu+"/api/agents/wordpress-content-editor/capabilities",{method:"GET",cache:"no-store",signal:AbortSignal.timeout(4000)})
       .then(function(r){
         msg.textContent=r.ok
           ?"Cinatra is reachable but the widget has not loaded yet. Try refreshing the page."
@@ -304,6 +330,19 @@ add_action('admin_footer', function () {
 // ---------------------------------------------------------------------------
 
 add_action('rest_api_init', function () {
+    // Short-lived stream-token broker. The browser calls this same-origin route
+    // (with a wp_rest nonce); the PHP backend holds the long-lived integration
+    // key, performs a server-to-server token exchange with the Cinatra instance,
+    // and returns ONLY the short-lived token to the browser. The long-lived key
+    // never leaves the server. See wp#4 / cinatra#220.
+    register_rest_route('cinatra/v1', '/token', [
+        'methods'             => 'POST',
+        'callback'            => 'cinatra_rest_mint_token',
+        'permission_callback' => function () {
+            return current_user_can('manage_options');
+        },
+    ]);
+
     register_rest_route('cinatra/v1', '/webhooks', [
         [
             'methods'             => 'GET',
@@ -335,6 +374,135 @@ add_action('rest_api_init', function () {
         ],
     ]);
 });
+
+/**
+ * Agent slug for the WordPress content-editor assistant. The token + stream +
+ * capabilities endpoints all live under /api/agents/{slug}/ on the instance.
+ */
+const CINATRA_AGENT_SLUG = 'wordpress-content-editor';
+
+/**
+ * Normalize a URL down to its scheme://host[:port] origin, lowercased, no
+ * trailing slash / path / query / fragment. Returns '' if the input has no
+ * usable scheme+host. The instance binds the minted token to this exact origin.
+ */
+function cinatra_site_origin(string $url): string {
+    $parts = wp_parse_url($url);
+    if (empty($parts['scheme']) || empty($parts['host'])) {
+        return '';
+    }
+    $origin = strtolower($parts['scheme']) . '://' . strtolower($parts['host']);
+    if (!empty($parts['port'])) {
+        $origin .= ':' . $parts['port'];
+    }
+    return $origin;
+}
+
+/**
+ * Mint a short-lived Cinatra stream token via server-to-server exchange.
+ *
+ * The browser sends the wp_rest nonce; this callback (gated to manage_options)
+ * reads the long-lived integration key from wp_options and POSTs it to the
+ * instance's token endpoint, returning only the short-lived token JSON to the
+ * caller. The long-lived key is never sent to the browser.
+ */
+function cinatra_rest_mint_token(WP_REST_Request $request): WP_REST_Response {
+    // CSRF: a valid wp_rest nonce must accompany the cookie-authenticated call.
+    $nonce = $request->get_header('X-WP-Nonce');
+    if (empty($nonce) || !wp_verify_nonce($nonce, 'wp_rest')) {
+        return new WP_REST_Response(['error' => 'Invalid or missing nonce.'], 403);
+    }
+
+    $url     = rtrim((string) get_option('cinatra_url', ''), '/');
+    $api_key = (string) get_option('cinatra_api_key', '');
+    if (empty($url) || empty($api_key)) {
+        return new WP_REST_Response(
+            ['error' => 'Cinatra URL or API key is not configured.'],
+            500
+        );
+    }
+
+    // Bind to the origin the BROWSER will present when it streams. The widget
+    // runs in wp-admin, so its Origin header is the admin origin (admin_url()),
+    // which can legitimately differ from the front-end home origin (WP_HOME vs
+    // WP_SITEURL, or admin-over-SSL setups). The instance re-checks this exact
+    // origin at stream-consume time, so it must match the admin origin.
+    $origin = cinatra_site_origin(admin_url());
+    if (empty($origin)) {
+        return new WP_REST_Response(
+            ['error' => 'Could not derive this site origin.'],
+            500
+        );
+    }
+
+    $params           = $request->get_json_params();
+    $contract_version = CINATRA_CONTRACT_VERSION;
+    if (is_array($params) && !empty($params['contractVersion'])) {
+        $candidate = sanitize_text_field((string) $params['contractVersion']);
+        // Only accept the versions this plugin knows; otherwise pin to ours.
+        if (in_array($candidate, ['v1', 'v2'], true)) {
+            $contract_version = $candidate;
+        }
+    }
+
+    $token_endpoint = $url . '/api/agents/' . CINATRA_AGENT_SLUG . '/token';
+    $body           = [
+        'contractVersion' => $contract_version,
+        'origin'          => $origin,
+        'sub'             => 'wp-user-' . get_current_user_id(),
+        'scope'           => CINATRA_AGENT_SLUG . '.stream',
+    ];
+
+    $response = wp_remote_post($token_endpoint, [
+        'timeout' => 10,
+        'headers' => [
+            'Authorization' => 'Bearer ' . $api_key,
+            'Content-Type'  => 'application/json',
+            'Accept'        => 'application/json',
+        ],
+        'body'    => wp_json_encode($body),
+    ]);
+
+    if (is_wp_error($response)) {
+        // Log the transport detail server-side; return a generic message so we
+        // never reflect low-level/internal error text to the browser.
+        error_log('[cinatra] token endpoint unreachable: ' . $response->get_error_message());
+        return new WP_REST_Response(
+            ['error' => 'Could not reach the Cinatra instance. Check the connector URL, or contact your administrator.'],
+            502
+        );
+    }
+
+    $status = (int) wp_remote_retrieve_response_code($response);
+    $raw    = (string) wp_remote_retrieve_body($response);
+    $json   = json_decode($raw, true);
+
+    if ($status < 200 || $status >= 300 || !is_array($json) || empty($json['token'])) {
+        // Do NOT reflect the upstream body to the browser — it could contain
+        // instance internals. Log the detail server-side for admins; return a
+        // generic, actionable message. Always 502: from the browser's
+        // perspective the upstream Cinatra instance failed the exchange
+        // (bad/rotated key, origin not configured, unreachable, malformed).
+        $detail = (is_array($json) && !empty($json['error']))
+            ? (string) $json['error']
+            : substr($raw, 0, 500);
+        error_log('[cinatra] token exchange failed (HTTP ' . $status . '): ' . $detail);
+        return new WP_REST_Response(
+            ['error' => 'Cinatra could not issue a session token. Check the connector settings, or contact your administrator.'],
+            502
+        );
+    }
+
+    // Return ONLY the short-lived token envelope to the browser.
+    return new WP_REST_Response([
+        'token'           => (string) $json['token'],
+        'tokenType'       => isset($json['tokenType']) ? (string) $json['tokenType'] : 'Bearer',
+        'expiresIn'       => isset($json['expiresIn']) ? (int) $json['expiresIn'] : 300,
+        'expiresAt'       => isset($json['expiresAt']) ? (string) $json['expiresAt'] : null,
+        'contractVersion' => isset($json['contractVersion']) ? (string) $json['contractVersion'] : $contract_version,
+        'scope'           => isset($json['scope']) ? (string) $json['scope'] : (CINATRA_AGENT_SLUG . '.stream'),
+    ], 200);
+}
 
 function cinatra_rest_list_webhooks(WP_REST_Request $request): WP_REST_Response {
     return rest_ensure_response(cinatra_get_webhook_subscriptions());
