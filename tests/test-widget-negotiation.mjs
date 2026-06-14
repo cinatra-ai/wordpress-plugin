@@ -39,7 +39,7 @@ function check(label, cond) {
 // Minimal DOM/window shim that records whether attachShadow ran and whether
 // data-cinatra-mounted was set. Just enough for the IIFE to boot through
 // negotiation; once attachShadow returns a stub the rest of mountWidget runs.
-function makeEnv(fetchImpl, sharedRoot) {
+function makeEnv(fetchImpl, sharedRoot, captured) {
   let attachShadowCount = 0;
 
   function makeStubEl(isRoot) {
@@ -50,10 +50,26 @@ function makeEnv(fetchImpl, sharedRoot) {
       classList: { add() {}, remove() {}, contains() { return false; } },
       attributes: {},
       children: [],
+      // `_pendingClick` lets the optional `captured` harness drive a real send:
+      // any click handler registered on this element is remembered and exposed
+      // via captured.clickHandlers (see createElement below).
+      _clickHandlers: [],
+      set placeholder(v) {
+        this._placeholder = v;
+        // The widget's prompt textarea is the only element with a placeholder;
+        // remember it so a test can set .value and trigger a send.
+        if (captured) { captured.textarea = this; }
+      },
+      get placeholder() { return this._placeholder; },
       setAttribute(k, v) { this.attributes[k] = v; },
       getAttribute(k) { return this.attributes[k]; },
       appendChild(c) { this.children.push(c); return c; },
-      addEventListener() {},
+      addEventListener(type, handler) {
+        if (type === "click") {
+          this._clickHandlers.push(handler);
+          if (captured) { captured.clickHandlers.push(handler); }
+        }
+      },
       removeEventListener() {},
       querySelector() { return null; },
       attachShadow() {
@@ -119,6 +135,7 @@ function makeEnv(fetchImpl, sharedRoot) {
     Date,
     Math,
     String,
+    URL, // WHATWG URL — used by the widget's same-origin streamPath resolution.
     TextDecoder: class { decode() { return ""; } },
   };
   sandbox.window.document = documentStub;
@@ -200,6 +217,162 @@ async function main() {
     delete body.capabilities.streamPath;
     const r = await boot(() => jsonResponse(200, body));
     check("missing required field (streamPath) -> INCOMPATIBLE (no mount)", !r.mounted && !r.attachShadow);
+  }
+
+  // SECURITY regression: an otherwise-healthy /capabilities whose streamPath is
+  // OFF-ORIGIN must NEVER mount. /capabilities is auth-free, so a hostile/
+  // compromised instance must not be able to steer the Bearer stream token to a
+  // foreign origin. Each off-origin form -> negotiate false -> NO mount (the
+  // marker stays unset AND attachShadow is never called -> fallback chrome).
+  {
+    const offOrigin = [
+      "@evil.example/stream",          // userinfo trick
+      "//evil.example/stream",         // protocol-relative
+      "https://evil.example/stream",   // absolute foreign URL
+      "/\\evil.example/stream",        // backslash form
+      "http://instance.example.evil/stream", // host-suffix lookalike
+    ];
+    for (const sp of offOrigin) {
+      const body = JSON.parse(JSON.stringify(HEALTHY));
+      body.capabilities.streamPath = sp;
+      const r = await boot(() => jsonResponse(200, body));
+      check(
+        `off-origin streamPath ${JSON.stringify(sp)} -> NO MOUNT (no attachShadow)`,
+        !r.mounted && !r.attachShadow,
+      );
+    }
+  }
+
+  // SECURITY regression (defense-in-depth): DOT-SEGMENT streamPath forms PASS
+  // the raw-input charAt check (charAt(0)==='/', charAt(1)==='.') but WHATWG
+  // normalization collapses them to a protocol-relative authority in the
+  // RESOLVED pathname ("//evil.example/stream"). The resolved ORIGIN is still
+  // the configured instance (the authority only re-materializes when the stored
+  // pathname is resolved AGAIN at the fetch site), so the origin assertion alone
+  // would let these through — the widget would MOUNT and getStreamToken() would
+  // mint a short-lived token BEFORE the fetch-site re-assertion throws. The
+  // negotiation guard must reject the RESOLVED pathname too, so these forms =>
+  // negotiate() false => NO mount (no attachShadow) AND no token mint (the
+  // same-origin token broker endpoint is never POSTed).
+  {
+    const dotSegmentForms = [
+      "/..//evil.example/stream",      // dot-dot then protocol-relative authority
+      "/.//evil.example/stream",       // single-dot then protocol-relative authority
+      "/%2e%2e//evil.example/stream",  // percent-encoded dot-dot variant
+    ];
+    const TOKEN_ENDPOINT = "https://site.example/wp-json/cinatra/v1/token";
+    for (const sp of dotSegmentForms) {
+      const body = JSON.parse(JSON.stringify(HEALTHY));
+      body.capabilities.streamPath = sp;
+      // Fetch tracker: record every URL the widget fetches. /capabilities must
+      // be hit (negotiation), but the token endpoint must NEVER be POSTed.
+      const fetched = [];
+      const fetchImpl = (url, opts) => {
+        fetched.push(String(url));
+        return jsonResponse(200, body);
+      };
+      const r = await boot(fetchImpl);
+      const tokenMinted = fetched.some((u) => u === TOKEN_ENDPOINT);
+      check(
+        `dot-segment streamPath ${JSON.stringify(sp)} -> NO MOUNT (no attachShadow)`,
+        !r.mounted && !r.attachShadow,
+      );
+      check(
+        `dot-segment streamPath ${JSON.stringify(sp)} -> NO token mint (token endpoint never POSTed)`,
+        !tokenMinted,
+      );
+    }
+  }
+
+  // Control for the no-token-mint assertion: a HEALTHY same-origin instance
+  // mounts, and the token endpoint is still NOT minted at NEGOTIATION time
+  // (tokens are minted lazily on the first user message, never at mount). This
+  // pins the "no token before a real stream" property the dot-segment cases rely
+  // on as their negative space.
+  {
+    const TOKEN_ENDPOINT = "https://site.example/wp-json/cinatra/v1/token";
+    const fetched = [];
+    const fetchImpl = (url, opts) => {
+      fetched.push(String(url));
+      return jsonResponse(200, HEALTHY);
+    };
+    const r = await boot(fetchImpl);
+    const tokenMinted = fetched.some((u) => u === TOKEN_ENDPOINT);
+    check(
+      "healthy same-origin -> MOUNTS and no token minted at negotiation (control)",
+      r.mounted && r.attachShadow && !tokenMinted,
+    );
+  }
+
+  // SEND-SITE ORDERING (defense-in-depth, source-level): in sendMessage() the
+  // rebuilt stream URL's origin MUST be re-asserted === base origin BEFORE
+  // getStreamToken() is called, so a malformed/smuggled negotiated.streamPath
+  // can never even cause a short-lived token to be minted (the throw is the last
+  // line of defense). negotiated.streamPath is closure-private and unreachable
+  // from this sandbox, so we pin the security-relevant ORDER directly against
+  // the widget source: within sendMessage(), the off-origin `throw` appears
+  // before the `getStreamToken()` call. (The behavioral happy-path send through
+  // this reordered code is exercised by the next case.)
+  {
+    const sendIdx = WIDGET_SRC.indexOf("async function sendMessage");
+    const region = sendIdx === -1 ? "" : WIDGET_SRC.slice(sendIdx);
+    const throwIdx = region.indexOf("Refusing to stream to an off-origin endpoint");
+    const mintIdx = region.indexOf("await getStreamToken()");
+    check(
+      "send-site: off-origin re-assertion precedes getStreamToken() (no mint on bad path)",
+      sendIdx !== -1 && throwIdx !== -1 && mintIdx !== -1 && throwIdx < mintIdx,
+    );
+  }
+
+  // SEND-SITE HAPPY PATH (behavioral): a healthy same-origin instance, after
+  // mounting, drives a real user message through the reordered send code:
+  // origin re-assertion passes -> getStreamToken() mints once -> the stream URL
+  // (same instance origin) is POSTed with the Bearer token. This proves the
+  // reordering did not regress the working path.
+  {
+    const TOKEN_ENDPOINT = "https://site.example/wp-json/cinatra/v1/token";
+    const STREAM_URL = "https://instance.example/api/agents/wordpress-content-editor/stream";
+    const fetched = [];
+    // /capabilities + /token => JSON; the stream POST => an empty SSE body.
+    const fetchImpl = (url, opts) => {
+      const u = String(url);
+      fetched.push({ url: u, method: (opts && opts.method) || "GET", headers: (opts && opts.headers) || {} });
+      if (u.indexOf("/capabilities") !== -1) { return jsonResponse(200, HEALTHY); }
+      if (u === TOKEN_ENDPOINT) { return jsonResponse(200, { token: "stream-tok", expiresIn: 300 }); }
+      // The stream response: ok + a reader that immediately reports done.
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        body: { getReader() { return { read() { return Promise.resolve({ done: true }); } }; } },
+        text: () => Promise.resolve(""),
+        headers: { get() { return null; } },
+      });
+    };
+
+    // Capture the submit click handler + the textarea so we can drive a send.
+    const captured = { clickHandlers: [], textarea: null };
+    const env = makeEnv(fetchImpl, undefined, captured);
+    vm.runInNewContext(WIDGET_SRC, env.sandbox, { filename: "cinatra-widget.js" });
+    for (let i = 0; i < 20; i++) { await Promise.resolve(); }
+    const mounted = env.rootEl.dataset.cinatraMounted === "true";
+
+    let sent = false;
+    if (mounted && captured.textarea && captured.clickHandlers.length) {
+      captured.textarea.value = "hello";
+      // Fire every captured click handler; doSubmit() reads textarea.value and
+      // calls sendMessage(). Only the submit button's handler will send.
+      for (const h of captured.clickHandlers) { try { h({ stopPropagation() {} }); } catch (_) {} }
+      for (let i = 0; i < 30; i++) { await Promise.resolve(); }
+      sent = true;
+    }
+
+    const tokenMints = fetched.filter((f) => f.url === TOKEN_ENDPOINT).length;
+    const streamPost = fetched.find((f) => f.url === STREAM_URL && f.method === "POST");
+    const bearerOk = !!streamPost && /^Bearer stream-tok$/.test(String(streamPost.headers.Authorization || ""));
+    check(
+      "send happy path: healthy mount -> token minted exactly once + same-origin stream POST with Bearer",
+      mounted && sent && tokenMints === 1 && bearerOk,
+    );
   }
 
   // supportsTokenExchange !== true -> incompatible, no mount (legacy path is gone).
