@@ -31,15 +31,26 @@
 		}
 		var mounted = false;
 
+		function markMounted() {
+			btn.style.display = 'none';
+			box.style.display = 'none';
+			mounted = true;
+		}
+
 		if (root) {
-			new MutationObserver(function (_, o) {
-				if (root.dataset.cinatraMounted === 'true') {
-					btn.style.display = 'none';
-					box.style.display = 'none';
-					mounted = true;
-					o.disconnect();
-				}
-			}).observe(root, { attributes: true });
+			// Check the CURRENT state first — the widget may have already mounted
+			// before this script ran (load-order is not guaranteed), in which case
+			// a future-only MutationObserver would never fire.
+			if (root.dataset.cinatraMounted === 'true') {
+				markMounted();
+			} else {
+				new MutationObserver(function (_, o) {
+					if (root.dataset.cinatraMounted === 'true') {
+						markMounted();
+						o.disconnect();
+					}
+				}).observe(root, { attributes: true });
+			}
 		}
 
 		btn.addEventListener('click', function () {
@@ -51,18 +62,24 @@
 				box.style.display = 'block';
 				return;
 			}
+			// Bounded-timeout probe via a guarded AbortController (AbortSignal.timeout
+			// is not universal and can throw synchronously on older browsers).
+			var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+			var timer = controller ? setTimeout(function () { try { controller.abort(); } catch (e) {} }, 4000) : null;
 			fetch(cu + '/api/agents/wordpress-content-editor/capabilities', {
 				method: 'GET',
 				cache: 'no-store',
-				signal: AbortSignal.timeout(4000)
+				signal: controller ? controller.signal : undefined
 			})
 				.then(function (r) {
+					if (timer) { clearTimeout(timer); }
 					msg.textContent = r.ok
 						? (i18n.reachableNoWidget || 'Cinatra is reachable but the widget has not loaded yet. Try refreshing the page.')
 						: format(i18n.httpStatus || 'Cinatra returned HTTP %s. Check your instance.', r.status);
 					box.style.display = 'block';
 				})
 				.catch(function () {
+					if (timer) { clearTimeout(timer); }
 					msg.textContent = format(i18n.unreachable || 'Cannot reach %s. Check that your Cinatra instance is running.', cu);
 					box.style.display = 'block';
 				});

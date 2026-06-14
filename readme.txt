@@ -3,7 +3,7 @@ Contributors: cinatra
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.2.0
+Stable tag: 0.2.1
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -68,10 +68,15 @@ Deleting the plugin runs its uninstall routine, which removes all of the plugin'
 3. The assistant chat panel open, ready to draft or revise content.
 
 == Upgrade Notice ==
+= 0.2.1 =
+The assistant now requires a Cinatra instance that supports the capabilities endpoint and short-lived token exchange. The legacy long-lived-key path has been removed. Against an older or unreachable instance the widget no longer loads; the fallback button shows a diagnostic instead.
 = 0.2.0 =
 Widget JavaScript now ships locally (no remote code), the long-lived credential stays server-side behind a short-lived-token broker, and one-click "Connect with Cinatra" replaces manual key entry. Requires the matching Cinatra instance update.
 
 == Changelog ==
+= 0.2.1 =
+* Capability/version negotiation against the instance /capabilities endpoint is now a hard prerequisite for the widget to load. Any failure (unreachable instance, 404/5xx, timeout, malformed response, or no mutually-supported contract version) leaves the fallback button in place instead of loading a non-functional widget.
+* Removed the legacy long-lived-key path and the associated deprecation notice. The same-origin token broker is the only stream path; the browser never holds a long-lived key.
 = 0.2.0 =
 * Widget JavaScript is now shipped locally inside the plugin instead of being loaded from the Cinatra instance — no remote code execution in wp-admin.
 * The long-lived integration credential is no longer exposed to the browser. A new server-side REST endpoint (cinatra/v1/token, manage_options + nonce) exchanges it for a short-lived stream token; the browser streams with that token only.

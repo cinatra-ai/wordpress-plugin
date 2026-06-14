@@ -12,8 +12,15 @@
 //   * The long-lived `apiKey` is removed from the browser. The widget exchanges
 //     a short-lived, origin/audience/scope-bound token via the same-origin
 //     WordPress REST broker (`CinatraConfig.tokenEndpoint`) and streams with it.
+//     The browser NEVER holds a long-lived key and NEVER direct-stream-auths.
 //   * Capability + contract-version negotiation against the instance
-//     `/capabilities` endpoint at boot, with graceful fallback.
+//     `/capabilities` endpoint at boot is a HARD PREREQUISITE: any failure
+//     (HTTP error / 404 / 5xx / network / timeout / malformed JSON / invalid
+//     schema / missing required field / no mutually-supported contract version)
+//     ABORTS the mount — the widget never attaches its Shadow DOM and never sets
+//     `data-cinatra-mounted`, so the always-visible fallback button stays put as
+//     the "instance unavailable / incompatible" chrome. There is NO old-instance
+//     fallback and NO optimistic defaults.
 //   * Brand-token / logo `${...}` interpolations resolved to literal values
 //     (the canonical source is cinatra-ai/cinatra: src/lib/cinatra-brand.ts).
 //
@@ -54,24 +61,119 @@
   var rootEl = document.getElementById('cinatra-root');
   if (!rootEl) { console.warn('[cinatra] #cinatra-root not found'); return; }
   if (rootEl.dataset.cinatraMounted === 'true') return;
-  rootEl.dataset.cinatraMounted = 'true';
+  // NOTE: data-cinatra-mounted is set ONLY after capability negotiation succeeds
+  // (see boot() at the bottom). Setting it earlier would hide the fallback chrome
+  // even when the instance is unavailable/incompatible.
 
   var AGENT_SLUG = 'wordpress-content-editor';
   // Contract versions this vendored widget understands, newest first.
   var CLIENT_CONTRACT_VERSIONS = ['v2', 'v1'];
 
-  // Negotiated state (resolved by negotiateCapabilities() at boot).
+  // Negotiated state — populated ONLY by a SUCCESSFUL negotiateCapabilities().
+  // No optimistic defaults: if negotiation fails the widget never mounts.
   var negotiated = {
-    contractVersion: config.contractVersion || 'v2',
-    supportsTokenExchange: true,
-    supportsChangesFrame: true,
-    streamPath: '/api/agents/' + AGENT_SLUG + '/stream',
+    contractVersion: null,
+    supportsChangesFrame: false,
+    supportsMarkdown: false,
+    streamPath: null,
   };
 
   // ---------------------------------------------------------------------------
-  // Shadow DOM
+  // Bounded-timeout fetch helper. AbortSignal.timeout() is not universal, so we
+  // drive an AbortController ourselves; the timer is always cleared.
   // ---------------------------------------------------------------------------
+  function fetchWithTimeout(url, opts, timeoutMs) {
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = null;
+    var options = opts || {};
+    if (controller) {
+      options = Object.assign({}, options, { signal: controller.signal });
+      timer = setTimeout(function () { try { controller.abort(); } catch (_) {} }, timeoutMs);
+    }
+    var p;
+    try {
+      p = fetch(url, options);
+    } catch (err) {
+      // fetch threw synchronously (very rare) — clear the timer and propagate.
+      if (timer) clearTimeout(timer);
+      return Promise.reject(err);
+    }
+    return p.then(
+      function (resp) { if (timer) clearTimeout(timer); return resp; },
+      function (err) { if (timer) clearTimeout(timer); throw err; }
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Capability + contract-version negotiation (HARD PREREQUISITE).
+  //
+  // The /capabilities endpoint is auth-free and returns only static contract
+  // metadata. It MUST succeed and validate before the widget mounts. Any
+  // failure — HTTP not-ok (incl. 404 / 5xx), network error, timeout, non-JSON
+  // body, missing `capabilities` object, missing/empty supportedContractVersions,
+  // no mutually-supported contract version, missing required capability fields,
+  // or supportsTokenExchange !== true — returns false, and the caller aborts the
+  // mount. There are NO optimistic defaults and NO legacy long-lived fallback.
+  // ---------------------------------------------------------------------------
+  function pickContractVersion(serverVersions) {
+    if (!Array.isArray(serverVersions)) { return null; }
+    for (var ci = 0; ci < CLIENT_CONTRACT_VERSIONS.length; ci++) {
+      if (serverVersions.indexOf(CLIENT_CONTRACT_VERSIONS[ci]) !== -1) {
+        return CLIENT_CONTRACT_VERSIONS[ci];
+      }
+    }
+    return null;
+  }
+
+  function negotiateCapabilities() {
+    return fetchWithTimeout(
+      config.cinatraUrl + '/api/agents/' + AGENT_SLUG + '/capabilities',
+      { method: 'GET', cache: 'no-store' },
+      5000
+    ).then(function (resp) {
+      if (!resp || !resp.ok) { return false; }
+      return resp.json().then(function (data) {
+        if (!data || typeof data !== 'object') { return false; }
+        var caps = data.capabilities;
+        if (!caps || typeof caps !== 'object') { return false; }
+        // Required: a mutually-supported contract version.
+        var version = pickContractVersion(data.supportedContractVersions);
+        if (!version) { return false; }
+        // Required: the broker token-exchange path is the ONLY client stream
+        // auth model. An instance that cannot mint short-lived tokens is
+        // incompatible — there is no long-lived key in the browser to fall back
+        // to. tokenPath must also be advertised (the same-origin broker uses it).
+        if (caps.supportsTokenExchange !== true) { return false; }
+        if (typeof caps.tokenPath !== 'string' || !caps.tokenPath) { return false; }
+        // Required: the stream path the client POSTs the short-lived token to.
+        if (typeof caps.streamPath !== 'string' || !caps.streamPath) { return false; }
+        negotiated.contractVersion = version;
+        negotiated.streamPath = caps.streamPath;
+        // Forward flags: a behavior is enabled ONLY when explicitly advertised.
+        negotiated.supportsChangesFrame = caps.supportsChangesFrame === true;
+        negotiated.supportsMarkdown = caps.supportsMarkdown === true;
+        return true;
+      }).catch(function () { return false; });
+    }).catch(function () {
+      // Network error, timeout (abort), or transport failure.
+      return false;
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // mountWidget() — builds the Shadow DOM + wires the assistant. Called ONLY
+  // after negotiateCapabilities() has resolved true.
+  // ---------------------------------------------------------------------------
+  function mountWidget() {
+  // Re-check after the async negotiation gap: a second copy of this IIFE could
+  // have mounted while we awaited /capabilities. Bail if a Shadow DOM already
+  // exists or the marker is already set (defense against duplicate includes).
+  if (rootEl.dataset.cinatraMounted === 'true' || rootEl.shadowRoot) { return; }
   var shadow = rootEl.attachShadow({ mode: 'open' });
+  // The data-cinatra-mounted marker (which hides the fallback chrome) is set at
+  // the very END of synchronous mount construction — see the bottom of this
+  // function. A throw at any point during mount therefore leaves the fallback
+  // visible rather than hiding it over a half-built / dead widget.
 
   // ---------------------------------------------------------------------------
   // CSS
@@ -247,13 +349,6 @@
     '}',
     '.cw-flyout-item:hover { background: #e8e8e3; }',
 
-    /* Deprecation notice banner (surfaced when the instance reports the legacy path). */
-    '.cw-deprecation {',
-    '  margin: 8px 16px 0; padding: 8px 12px; border-radius: 8px;',
-    '  background: #fdf3da; border: 1px solid #e7c878; color: #6b531a;',
-    '  font: 12px/1.45 system-ui, sans-serif;',
-    '}',
-
     /* Diff card */
     '.cw-diff-card { align-self: flex-start; flex-shrink: 0; max-width: 88%; margin-top: 4px; margin-bottom: 4px; border: 1px solid #15213a14; border-radius: 10px; overflow: hidden; font: 13px system-ui, sans-serif; }',
     '.cw-diff-card-header { padding: 6px 12px; background: #f7f7f3; border-bottom: 1px solid #15213a14; font-weight: 600; color: #5a6477; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }',
@@ -403,13 +498,6 @@
   closeBtn.textContent = '×';
   panelHeader.appendChild(closeBtn);
 
-  // Deprecation notice — shown only when the instance reports the legacy path
-  // is in use (Deprecation/Sunset response headers). Hidden by default.
-  var deprecationEl = document.createElement('div');
-  deprecationEl.className = 'cw-deprecation';
-  deprecationEl.style.display = 'none';
-  panel.appendChild(deprecationEl);
-
   var messagesEl = document.createElement('div');
   messagesEl.className = 'cw-messages';
   messagesEl.setAttribute('role', 'log');
@@ -472,7 +560,6 @@
   var hadChanges = false;
   var diffCardEl = null;
   var pendingDiff = null;
-  var deprecationShown = false;
 
   function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
 
@@ -514,15 +601,6 @@
       card.appendChild(row);
     }
     return card;
-  }
-
-  function showDeprecationNotice() {
-    if (deprecationShown) return;
-    deprecationShown = true;
-    deprecationEl.textContent =
-      'Your Cinatra instance accepted a deprecated long-lived integration key directly. ' +
-      'Ask your administrator to update Cinatra so the assistant uses short-lived tokens.';
-    deprecationEl.style.display = 'block';
   }
 
   // ---------------------------------------------------------------------------
@@ -585,13 +663,21 @@
     return html;
   }
 
+  // Render assistant content into an element. Markdown is used ONLY when the
+  // instance advertised supportsMarkdown; otherwise the text is rendered as
+  // plain text (absent forward flag => the behavior is disabled).
+  function renderAssistantInto(el, content) {
+    if (negotiated.supportsMarkdown) { el.innerHTML = renderMd(content); }
+    else { el.textContent = content || ''; }
+  }
+
   // ---------------------------------------------------------------------------
   // Render message bubble
   // ---------------------------------------------------------------------------
-  function renderMessage(role, content, asMarkdown) {
+  function renderMessage(role, content, asAssistant) {
     var el = document.createElement('div');
     el.className = 'cw-msg cw-msg-' + role;
-    if (asMarkdown) el.innerHTML = renderMd(content);
+    if (asAssistant) renderAssistantInto(el, content);
     else el.textContent = content;
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -767,50 +853,6 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Capability + contract-version negotiation (once at boot).
-  // The /capabilities endpoint is auth-free and returns only static contract
-  // metadata. A 404 (older instance) falls back to v1 + the long-lived flow.
-  // ---------------------------------------------------------------------------
-  function pickContractVersion(serverVersions) {
-    for (var ci = 0; ci < CLIENT_CONTRACT_VERSIONS.length; ci++) {
-      if (serverVersions.indexOf(CLIENT_CONTRACT_VERSIONS[ci]) !== -1) {
-        return CLIENT_CONTRACT_VERSIONS[ci];
-      }
-    }
-    return 'v1';
-  }
-
-  async function negotiateCapabilities() {
-    try {
-      var resp = await fetch(config.cinatraUrl + '/api/agents/' + AGENT_SLUG + '/capabilities', {
-        method: 'GET',
-        cache: 'no-store',
-        signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(5000) : undefined,
-      });
-      if (resp.status === 404) {
-        // Older instance with no capabilities endpoint.
-        negotiated.supportsTokenExchange = false;
-        negotiated.contractVersion = 'v1';
-        return;
-      }
-      if (!resp.ok) return; // keep optimistic defaults
-      var data = await resp.json();
-      var caps = (data && data.capabilities) || {};
-      var serverVersions = (data && data.supportedContractVersions) || ['v1'];
-      negotiated.contractVersion = pickContractVersion(serverVersions);
-      negotiated.supportsTokenExchange = caps.supportsTokenExchange !== false;
-      negotiated.supportsChangesFrame = caps.supportsChangesFrame !== false;
-      if (typeof caps.streamPath === 'string' && caps.streamPath) {
-        negotiated.streamPath = caps.streamPath;
-      }
-    } catch (_) {
-      // Network error — keep optimistic defaults; the broker call will surface
-      // any real failure with an actionable message.
-    }
-  }
-  var capabilitiesReady = negotiateCapabilities();
-
-  // ---------------------------------------------------------------------------
   // Short-lived token exchange via the same-origin WordPress REST broker.
   // The browser never holds the long-lived integration key; the broker (PHP)
   // holds it and performs the server-to-server exchange with the instance.
@@ -875,22 +917,9 @@
     submitBtn.disabled = true;
 
     try {
-      // Ensure capability negotiation has resolved, then mint a short-lived token.
-      try { await capabilitiesReady; } catch (_) {}
-
-      // Un-upgraded instance: no token-exchange endpoint. The browser never holds
-      // the long-lived key (that is the whole point of the broker), so we cannot
-      // silently fall back to it client-side. Surface an actionable message
-      // instead of firing a broker call that is guaranteed to fail.
-      if (!negotiated.supportsTokenExchange) {
-        showDeprecationNotice();
-        assistantEl.classList.remove('cw-thinking');
-        assistantEl.textContent =
-          'This assistant needs a newer Cinatra instance (short-lived token support). ' +
-          'Ask your administrator to update Cinatra, then reload this page.';
-        return;
-      }
-
+      // Capabilities are already negotiated (mount is gated on success), so the
+      // broker token-exchange path is guaranteed available. Mint a short-lived
+      // token; the browser never holds the long-lived key.
       var token = await getStreamToken();
 
       var response = await fetch(config.cinatraUrl + negotiated.streamPath, {
@@ -902,12 +931,6 @@
           context: buildContentContext(),
         }),
       });
-
-      // Surface the instance's deprecation signal (long-lived key used somewhere
-      // in the chain) so an admin can act. Frame format itself is unchanged.
-      if (response.headers && response.headers.get && response.headers.get('Deprecation')) {
-        showDeprecationNotice();
-      }
 
       if (!response.ok || !response.body) {
         var errText = 'Error ' + response.status;
@@ -946,7 +969,7 @@
           if (eventName === 'text' && data && typeof data.content === 'string') {
             if (!streamingStarted) { streamingStarted = true; assistantEl.classList.remove('cw-thinking'); }
             assistantText += data.content;
-            assistantEl.innerHTML = renderMd(assistantText);
+            renderAssistantInto(assistantEl, assistantText);
             messagesEl.scrollTop = messagesEl.scrollHeight;
           } else if (eventName === 'error' && data && data.message) {
             assistantEl.classList.remove('cw-thinking');
@@ -963,7 +986,7 @@
             messagesEl.appendChild(diffCardEl);
             messagesEl.scrollTop = messagesEl.scrollHeight;
           } else if (eventName === 'done') {
-            if (assistantText) assistantEl.innerHTML = renderMd(assistantText);
+            if (assistantText) renderAssistantInto(assistantEl, assistantText);
             if (data && data.fallback) { assistantText = ''; }
             if (hadChanges && !(data && data.fallback)) {
               if (diffCardEl) {
@@ -991,6 +1014,10 @@
     }
   }
 
+  // Synchronous mount construction is complete: mark mounted (this hides the
+  // fallback chrome). Set LAST so any throw above leaves the fallback visible.
+  rootEl.dataset.cinatraMounted = 'true';
+
   // Reopen widget after an auto-reload triggered by a content edit.
   try {
     if (window.sessionStorage.getItem('cinatra-reopen') === '1') {
@@ -998,5 +1025,22 @@
       openWidget();
     }
   } catch (_) {}
+
+  } // end mountWidget()
+
+  // ---------------------------------------------------------------------------
+  // Boot: capabilities is a HARD PREREQUISITE. Negotiate FIRST; mount ONLY on
+  // success. On any failure we never attachShadow and never set
+  // data-cinatra-mounted, so the always-visible fallback button remains as the
+  // "instance unavailable / incompatible" chrome.
+  // ---------------------------------------------------------------------------
+  negotiateCapabilities().then(function (ok) {
+    if (ok) { mountWidget(); }
+    else {
+      console.warn('[cinatra] capability negotiation failed — instance unavailable or incompatible; widget not mounted');
+    }
+  }).catch(function () {
+    console.warn('[cinatra] capability negotiation error — instance unavailable; widget not mounted');
+  });
 
 })();
