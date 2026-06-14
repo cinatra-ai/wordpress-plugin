@@ -11,26 +11,26 @@
  */
 
 // Exit if not called by WordPress during plugin uninstall.
-if (!defined('WP_UNINSTALL_PLUGIN')) {
-    exit;
+if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
+	exit;
 }
 
 /**
  * Every option key this plugin (and its predecessor) may have created.
  */
 function cinatra_uninstall_option_keys(): array {
-    return [
-        // Current keys.
-        'cinatra_url',
-        'cinatra_api_key',
-        'cinatra_instance_id',
-        'cinatra_webhook_secret',
-        'cinatra_webhook_subscriptions',
-        // Legacy keys from the pre-rename plugin (cinatra-widget.php).
-        'cinatra_widget_url',
-        'cinatra_widget_api_key',
-        'cinatra_widget_instance_id',
-    ];
+	return array(
+		// Current keys.
+		'cinatra_url',
+		'cinatra_api_key',
+		'cinatra_instance_id',
+		'cinatra_webhook_secret',
+		'cinatra_webhook_subscriptions',
+		// Legacy keys from the pre-rename plugin (cinatra-widget.php).
+		'cinatra_widget_url',
+		'cinatra_widget_api_key',
+		'cinatra_widget_instance_id',
+	);
 }
 
 /**
@@ -38,46 +38,51 @@ function cinatra_uninstall_option_keys(): array {
  * context.
  */
 function cinatra_uninstall_cleanup_current_site(): void {
-    foreach (cinatra_uninstall_option_keys() as $key) {
-        delete_option($key);
-    }
+	foreach ( cinatra_uninstall_option_keys() as $key ) {
+		delete_option( $key );
+	}
 
-    // Per-user connect result + per-state connect transients. WordPress has no
-    // wildcard transient delete, so sweep the options table for our prefixes.
-    global $wpdb;
-    $prefixes = [
-        '_transient_cinatra_connect_result_',
-        '_transient_timeout_cinatra_connect_result_',
-        '_transient_cinatra_connect_state_',
-        '_transient_timeout_cinatra_connect_state_',
-    ];
-    foreach ($prefixes as $prefix) {
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-        $names = $wpdb->get_col(
-            $wpdb->prepare(
-                "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
-                $wpdb->esc_like($prefix) . '%'
-            )
-        );
-        if (is_array($names)) {
-            foreach ($names as $option_name) {
-                delete_option($option_name);
-            }
-        }
-    }
+	// Per-user connect result + per-state connect transients. WordPress has no
+	// wildcard transient delete, so sweep the options table for our prefixes.
+	global $wpdb;
+	$prefixes = array(
+		'_transient_cinatra_connect_result_',
+		'_transient_timeout_cinatra_connect_result_',
+		'_transient_cinatra_connect_state_',
+		'_transient_timeout_cinatra_connect_state_',
+	);
+	foreach ( $prefixes as $prefix ) {
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Uninstall cleanup must wildcard-delete plugin-owned transients/options; no cacheable WP API covers a LIKE prefix sweep, and caching is moot at uninstall time.
+		$names = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$wpdb->esc_like( $prefix ) . '%'
+			)
+		);
+		if ( is_array( $names ) ) {
+			foreach ( $names as $option_name ) {
+				delete_option( $option_name );
+			}
+		}
+	}
 }
 
-if (is_multisite()) {
-    // Multisite: clean each site, plus any network-level options.
-    $site_ids = get_sites(['fields' => 'ids', 'number' => 0]);
-    foreach ((array) $site_ids as $site_id) {
-        switch_to_blog((int) $site_id);
-        cinatra_uninstall_cleanup_current_site();
-        restore_current_blog();
-    }
-    foreach (cinatra_uninstall_option_keys() as $key) {
-        delete_site_option($key);
-    }
+if ( is_multisite() ) {
+	// Multisite: clean each site, plus any network-level options.
+	$site_ids = get_sites(
+		array(
+			'fields' => 'ids',
+			'number' => 0,
+		)
+	);
+	foreach ( (array) $site_ids as $site_id ) {
+		switch_to_blog( (int) $site_id );
+		cinatra_uninstall_cleanup_current_site();
+		restore_current_blog();
+	}
+	foreach ( cinatra_uninstall_option_keys() as $key ) {
+		delete_site_option( $key );
+	}
 } else {
-    cinatra_uninstall_cleanup_current_site();
+	cinatra_uninstall_cleanup_current_site();
 }
