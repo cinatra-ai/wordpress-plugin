@@ -90,7 +90,16 @@ const lockSrc = readFileSync(
   join(DESIGN, "assets/logo/cinatra-lockup-horizontal.svg"),
   "utf8"
 );
-const lockVb = lockSrc.match(/viewBox="([\d. ]+)"/)[1].split(" ").map(Number);
+const lockVbMatch = lockSrc.match(/viewBox="([\d.\- ]+)"/);
+if (!lockVbMatch)
+  throw new Error(
+    `No viewBox in ${join(DESIGN, "assets/logo/cinatra-lockup-horizontal.svg")}`
+  );
+const lockVb = lockVbMatch[1].trim().split(/\s+/).map(Number);
+if (lockVb.length !== 4 || lockVb.some(Number.isNaN))
+  throw new Error(
+    `Malformed viewBox in ${join(DESIGN, "assets/logo/cinatra-lockup-horizontal.svg")}`
+  );
 const LOCK = { w: lockVb[2], h: lockVb[3] };
 const lockContent = lockSrc
   .replace(/<!--[\s\S]*?-->\n/, "")
@@ -188,7 +197,6 @@ async function emit(name, svg, w, h, meta) {
     tokensVersion: TOKENS_VERSION,
     sha256: createHash("sha256").update(data).digest("hex"),
     generatedBy: "node tools/generate-wordpress-org-assets.mjs",
-    generatedAt: new Date().toISOString().slice(0, 10),
   });
   console.log("wrote", name, `${w}x${h}`, `${(data.length / 1024).toFixed(1)}KB`);
 }
