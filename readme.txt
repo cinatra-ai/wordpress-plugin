@@ -3,7 +3,7 @@ Contributors: cinatra
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.2.2
+Stable tag: 0.2.3
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -68,6 +68,8 @@ Deleting the plugin runs its uninstall routine, which removes all of the plugin'
 3. The assistant chat panel open, ready to draft or revise content.
 
 == Upgrade Notice ==
+= 0.2.3 =
+Security hardening (defense-in-depth): the negotiated stream path is now rejected at negotiation if it smuggles a foreign authority that only appears after URL normalization (dot-segment forms such as "/..//host"), so the widget never mounts and no short-lived stream token is minted for such a path. Recommended update.
 = 0.2.2 =
 Security hardening: the assistant now resolves and verifies the negotiated stream path against the configured Cinatra instance origin, so a compromised or hostile instance can no longer steer the short-lived stream token to a foreign host. Any off-origin stream path leaves the fallback button in place instead of loading the widget. Recommended update.
 = 0.2.1 =
@@ -76,6 +78,8 @@ The assistant now requires a Cinatra instance that supports the capabilities end
 Widget JavaScript now ships locally (no remote code), the long-lived credential stays server-side behind a short-lived-token broker, and one-click "Connect with Cinatra" replaces manual key entry. Requires the matching Cinatra instance update.
 
 == Changelog ==
+= 0.2.3 =
+* Security (defense-in-depth): the stream-path same-origin guard now also rejects authority smuggling that only materializes after WHATWG URL normalization. Dot-segment forms ("/..//host", "/.//host", "/%2e%2e//host") previously passed the negotiation-time guard (their raw input looks like a root-absolute path) and only failed at the fetch site, after the widget had mounted and a short-lived token had been minted. Negotiation now also asserts the resolved pathname is a clean single-slash root-absolute path, so such forms are rejected before mount and no token is minted; the fetch site additionally re-asserts the origin before minting a token, keeping the existing throw as the last line of defense.
 = 0.2.2 =
 * Security: the widget now resolves the negotiated stream path and asserts it stays same-origin with the configured Cinatra instance URL before sending the short-lived Bearer stream token. Because the /capabilities endpoint is unauthenticated, this prevents a compromised or hostile instance from steering the stream token to a foreign origin (userinfo "@host", protocol-relative "//host", absolute foreign URLs, and backslash forms are all rejected). An off-origin stream path now aborts the mount and leaves the fallback button in place.
 = 0.2.1 =

@@ -166,6 +166,18 @@
           var base = new URL(config.cinatraUrl);
           var u = new URL(caps.streamPath, base.origin + '/');
           if (u.origin !== base.origin) { return false; }
+          // DEFENSE-IN-DEPTH: the raw-input charAt check above only inspects the
+          // unresolved string. Dot-segment forms ("/..//host", "/.//host",
+          // "/%2e%2e//host") pass that check yet WHATWG-normalize the resolved
+          // PATHNAME to "//host/..." — a protocol-relative authority smuggled
+          // PAST the origin assertion (the resolved origin is still the instance,
+          // because the authority only re-materializes when this pathname is
+          // resolved AGAIN at the fetch site). Re-assert that the RESOLVED
+          // pathname is a clean single-slash root-absolute path and store only
+          // that validated pathname+search; reject anything that re-smuggles an
+          // authority post-normalization. So such forms are rejected HERE, at
+          // negotiation -> NO mount -> getStreamToken() never mints a token.
+          if (u.pathname.charAt(0) !== '/' || u.pathname.charAt(1) === '/') { return false; }
           negotiated.streamPath = u.pathname + u.search;
         } catch (_) { return false; }
         negotiated.contractVersion = version;
@@ -937,21 +949,30 @@
     submitBtn.disabled = true;
 
     try {
-      // Capabilities are already negotiated (mount is gated on success), so the
-      // broker token-exchange path is guaranteed available. Mint a short-lived
-      // token; the browser never holds the long-lived key.
-      var token = await getStreamToken();
-
       // SECURITY: build the stream URL from the SAME base origin against the
       // already-validated, same-origin negotiated.streamPath (pathname+search).
       // Do NOT re-introduce raw `config.cinatraUrl + negotiated.streamPath`
       // concatenation — re-resolving + re-asserting origin keeps the Bearer
       // token from ever leaving the configured instance origin.
+      //
+      // Re-assert the rebuilt URL origin === base origin BEFORE minting the
+      // token, so a malformed/smuggled path never even causes getStreamToken()
+      // to mint a short-lived credential. negotiated.streamPath is already a
+      // validated single-slash root-absolute path (negotiation rejects authority
+      // smuggling, including post-normalization dot-segment forms), so this
+      // re-resolution must reconstruct the SAME instance origin; this check is
+      // the last line of defense.
       var streamBase = new URL(config.cinatraUrl);
       var streamUrl = new URL(negotiated.streamPath, streamBase.origin + '/');
       if (streamUrl.origin !== streamBase.origin) {
         throw new Error('Refusing to stream to an off-origin endpoint.');
       }
+
+      // Capabilities are already negotiated (mount is gated on success), so the
+      // broker token-exchange path is guaranteed available. Mint a short-lived
+      // token only AFTER the origin re-assertion above; the browser never holds
+      // the long-lived key.
+      var token = await getStreamToken();
 
       var response = await fetch(streamUrl.href, {
         method: 'POST',
