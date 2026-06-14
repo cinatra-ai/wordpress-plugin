@@ -602,8 +602,13 @@ add_action('admin_post_cinatra_connect_callback', function () {
         wp_die(esc_html__('You do not have permission to do this.', 'cinatra'), '', ['response' => 403]);
     }
 
+    // CSRF for this OAuth callback is the single-use `state` (validated against
+    // a per-state transient bound to the current user below) — a WP nonce
+    // cannot survive the external redirect round-trip. Inputs ARE sanitized.
+    // phpcs:disable WordPress.Security.NonceVerification.Recommended
     $code  = isset($_GET['code']) ? sanitize_text_field(wp_unslash($_GET['code'])) : '';
     $state = isset($_GET['state']) ? sanitize_text_field(wp_unslash($_GET['state'])) : '';
+    // phpcs:enable WordPress.Security.NonceVerification.Recommended
     if ($code === '' || $state === '') {
         cinatra_set_connect_result('error', __('Cinatra did not return an authorization code. Connection cancelled.', 'cinatra'));
         cinatra_connect_redirect_to_settings();
