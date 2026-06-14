@@ -146,9 +146,29 @@
         if (caps.supportsTokenExchange !== true) { return false; }
         if (typeof caps.tokenPath !== 'string' || !caps.tokenPath) { return false; }
         // Required: the stream path the client POSTs the short-lived token to.
+        //
+        // SECURITY: streamPath is later combined with config.cinatraUrl in the
+        // Bearer-authenticated stream fetch. /capabilities is auth-free, so a
+        // hostile/compromised instance must NOT be able to steer that token to a
+        // foreign origin. Resolve streamPath and ASSERT it stays same-origin with
+        // the configured cinatraUrl; reject (=> negotiate false => no mount =>
+        // fallback chrome) anything off-origin. We first require a single-slash
+        // absolute path with no backslashes — this rejects userinfo ("@host"),
+        // protocol-relative ("//host"), absolute foreign URLs ("https://host"),
+        // and backslash forms ("/\\host", "\\host") that WHATWG resolution would
+        // otherwise normalize to a same-origin-looking or foreign path — then
+        // resolve against the instance origin and re-check the resolved origin.
         if (typeof caps.streamPath !== 'string' || !caps.streamPath) { return false; }
+        if (caps.streamPath.charAt(0) !== '/' ||
+            caps.streamPath.charAt(1) === '/' ||
+            caps.streamPath.indexOf('\\') !== -1) { return false; }
+        try {
+          var base = new URL(config.cinatraUrl);
+          var u = new URL(caps.streamPath, base.origin + '/');
+          if (u.origin !== base.origin) { return false; }
+          negotiated.streamPath = u.pathname + u.search;
+        } catch (_) { return false; }
         negotiated.contractVersion = version;
-        negotiated.streamPath = caps.streamPath;
         // Forward flags: a behavior is enabled ONLY when explicitly advertised.
         negotiated.supportsChangesFrame = caps.supportsChangesFrame === true;
         negotiated.supportsMarkdown = caps.supportsMarkdown === true;
@@ -922,7 +942,18 @@
       // token; the browser never holds the long-lived key.
       var token = await getStreamToken();
 
-      var response = await fetch(config.cinatraUrl + negotiated.streamPath, {
+      // SECURITY: build the stream URL from the SAME base origin against the
+      // already-validated, same-origin negotiated.streamPath (pathname+search).
+      // Do NOT re-introduce raw `config.cinatraUrl + negotiated.streamPath`
+      // concatenation — re-resolving + re-asserting origin keeps the Bearer
+      // token from ever leaving the configured instance origin.
+      var streamBase = new URL(config.cinatraUrl);
+      var streamUrl = new URL(negotiated.streamPath, streamBase.origin + '/');
+      if (streamUrl.origin !== streamBase.origin) {
+        throw new Error('Refusing to stream to an off-origin endpoint.');
+      }
+
+      var response = await fetch(streamUrl.href, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
         body: JSON.stringify({

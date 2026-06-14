@@ -3,7 +3,7 @@ Contributors: cinatra
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.2.1
+Stable tag: 0.2.2
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -68,12 +68,16 @@ Deleting the plugin runs its uninstall routine, which removes all of the plugin'
 3. The assistant chat panel open, ready to draft or revise content.
 
 == Upgrade Notice ==
+= 0.2.2 =
+Security hardening: the assistant now resolves and verifies the negotiated stream path against the configured Cinatra instance origin, so a compromised or hostile instance can no longer steer the short-lived stream token to a foreign host. Any off-origin stream path leaves the fallback button in place instead of loading the widget. Recommended update.
 = 0.2.1 =
 The assistant now requires a Cinatra instance that supports the capabilities endpoint and short-lived token exchange. The legacy long-lived-key path has been removed. Against an older or unreachable instance the widget no longer loads; the fallback button shows a diagnostic instead.
 = 0.2.0 =
 Widget JavaScript now ships locally (no remote code), the long-lived credential stays server-side behind a short-lived-token broker, and one-click "Connect with Cinatra" replaces manual key entry. Requires the matching Cinatra instance update.
 
 == Changelog ==
+= 0.2.2 =
+* Security: the widget now resolves the negotiated stream path and asserts it stays same-origin with the configured Cinatra instance URL before sending the short-lived Bearer stream token. Because the /capabilities endpoint is unauthenticated, this prevents a compromised or hostile instance from steering the stream token to a foreign origin (userinfo "@host", protocol-relative "//host", absolute foreign URLs, and backslash forms are all rejected). An off-origin stream path now aborts the mount and leaves the fallback button in place.
 = 0.2.1 =
 * Capability/version negotiation against the instance /capabilities endpoint is now a hard prerequisite for the widget to load. Any failure (unreachable instance, 404/5xx, timeout, malformed response, or no mutually-supported contract version) leaves the fallback button in place instead of loading a non-functional widget.
 * Removed the legacy long-lived-key path and the associated deprecation notice. The same-origin token broker is the only stream path; the browser never holds a long-lived key.

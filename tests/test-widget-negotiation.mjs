@@ -119,6 +119,7 @@ function makeEnv(fetchImpl, sharedRoot) {
     Date,
     Math,
     String,
+    URL, // WHATWG URL — used by the widget's same-origin streamPath resolution.
     TextDecoder: class { decode() { return ""; } },
   };
   sandbox.window.document = documentStub;
@@ -200,6 +201,30 @@ async function main() {
     delete body.capabilities.streamPath;
     const r = await boot(() => jsonResponse(200, body));
     check("missing required field (streamPath) -> INCOMPATIBLE (no mount)", !r.mounted && !r.attachShadow);
+  }
+
+  // SECURITY regression: an otherwise-healthy /capabilities whose streamPath is
+  // OFF-ORIGIN must NEVER mount. /capabilities is auth-free, so a hostile/
+  // compromised instance must not be able to steer the Bearer stream token to a
+  // foreign origin. Each off-origin form -> negotiate false -> NO mount (the
+  // marker stays unset AND attachShadow is never called -> fallback chrome).
+  {
+    const offOrigin = [
+      "@evil.example/stream",          // userinfo trick
+      "//evil.example/stream",         // protocol-relative
+      "https://evil.example/stream",   // absolute foreign URL
+      "/\\evil.example/stream",        // backslash form
+      "http://instance.example.evil/stream", // host-suffix lookalike
+    ];
+    for (const sp of offOrigin) {
+      const body = JSON.parse(JSON.stringify(HEALTHY));
+      body.capabilities.streamPath = sp;
+      const r = await boot(() => jsonResponse(200, body));
+      check(
+        `off-origin streamPath ${JSON.stringify(sp)} -> NO MOUNT (no attachShadow)`,
+        !r.mounted && !r.attachShadow,
+      );
+    }
   }
 
   // supportsTokenExchange !== true -> incompatible, no mount (legacy path is gone).
