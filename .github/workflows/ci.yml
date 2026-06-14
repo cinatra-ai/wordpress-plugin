@@ -66,3 +66,11 @@ jobs:
         uses: WordPress/plugin-check-action@18573eb38f13543484a1f095672dae3849a4fbb0 # v1.1.6
         with:
           build-dir: "./"
+          # The plugin slug is `cinatra` (the repo dir is `wordpress-plugin`);
+          # pin it so Plugin Check evaluates against the intended slug.
+          slug: cinatra
+          # The action writes `core: null` (which fails wp-env init) for every
+          # wp-version except `trunk`, where it writes a real core ref
+          # (WordPress/WordPress#master) and the env boots. Use trunk so the
+          # check actually runs; this exercises current/next WordPress.
+          wp-version: trunk

@@ -19,6 +19,10 @@ $GLOBALS['cinatra_test'] = [
     'valid_nonces'         => ['wp_rest'],
     'home_url'             => 'https://blog.example',
     'enqueued_scripts'     => [],   // handle => [src, deps, ver, in_footer]
+    'enqueued_styles'      => [],   // handle => [src, deps, ver, media]
+    'inline_styles'        => [],   // handle => [css, ...]
+    'inline_scripts'       => [],   // handle => [js, ...]
+    'transients'           => [],   // key => value
     'localized'            => [],   // handle => [object_name => data]
     'remote_post'          => null, // canned wp_remote_post response/WP_Error
     'remote_post_calls'    => [],   // captured wp_remote_post args
@@ -39,14 +43,22 @@ function add_filter($hook, $cb, $priority = 10, $args = 1) { return true; }
 function register_setting() { return true; }
 function register_rest_route() { return true; }
 function __($text, $domain = 'default') { return $text; }
+function esc_html__($text, $domain = 'default') { return $text; }
+function esc_attr__($text, $domain = 'default') { return $text; }
+function esc_html($t) { return $t; }
 function esc_url($url) { return $url; }
-function esc_url_raw($url) { return $url; }
+function esc_url_raw($url, $protocols = null) { return $url; }
 function esc_attr($t) { return $t; }
 function esc_js($t) { return $t; }
 function admin_url($path = '') { return 'https://blog.example/wp-admin/' . ltrim($path, '/'); }
 function plugin_basename($f) { return basename($f); }
 function settings_fields() {}
-function submit_button() {}
+function submit_button($text = '', $type = 'primary', $name = 'submit', $wrap = true) {}
+function wp_nonce_field($action = -1) {}
+function sanitize_hex_color($color) {
+    return (is_string($color) && preg_match('/^#([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6})$/', $color)) ? $color : '';
+}
+function post_type_exists($pt) { return in_array($pt, ['post', 'page'], true); }
 
 // ---------------------------------------------------------------------------
 // Options
@@ -77,6 +89,22 @@ function wp_verify_nonce($nonce, $action = -1) {
         ? 1 : false;
 }
 function wp_generate_uuid4() { return '00000000-0000-4000-8000-000000000000'; }
+function wp_unslash($v) { return is_string($v) ? stripslashes($v) : $v; }
+
+// ---------------------------------------------------------------------------
+// Transients (in-memory)
+// ---------------------------------------------------------------------------
+function set_transient($key, $value, $ttl = 0) {
+    $GLOBALS['cinatra_test']['transients'][$key] = $value;
+    return true;
+}
+function get_transient($key) {
+    return $GLOBALS['cinatra_test']['transients'][$key] ?? false;
+}
+function delete_transient($key) {
+    unset($GLOBALS['cinatra_test']['transients'][$key]);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // URLs
@@ -107,6 +135,19 @@ function wp_localize_script($handle, $object_name, $data) {
     $GLOBALS['cinatra_test']['localized'][$handle][$object_name] = $data;
     return true;
 }
+function wp_enqueue_style($handle, $src = '', $deps = [], $ver = false, $media = 'all') {
+    $GLOBALS['cinatra_test']['enqueued_styles'][$handle] = [
+        'src' => $src, 'deps' => $deps, 'ver' => $ver, 'media' => $media,
+    ];
+}
+function wp_add_inline_style($handle, $data) {
+    $GLOBALS['cinatra_test']['inline_styles'][$handle][] = $data;
+    return true;
+}
+function wp_add_inline_script($handle, $data, $position = 'after') {
+    $GLOBALS['cinatra_test']['inline_scripts'][$handle][] = $data;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // HTTP
@@ -115,6 +156,9 @@ function wp_remote_post($url, $args = []) {
     $GLOBALS['cinatra_test']['remote_post_calls'][] = ['url' => $url, 'args' => $args];
     $canned = $GLOBALS['cinatra_test']['remote_post'];
     return $canned instanceof Closure ? $canned($url, $args) : $canned;
+}
+function wp_safe_remote_post($url, $args = []) {
+    return wp_remote_post($url, $args);
 }
 function is_wp_error($thing) { return $thing instanceof WP_Error; }
 function wp_remote_retrieve_response_code($resp) { return $resp['response']['code'] ?? 0; }

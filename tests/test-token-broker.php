@@ -175,6 +175,77 @@ check('CinatraConfig points the browser at the same-origin token broker',
 check('CinatraConfig carries a nonce for the broker call', !empty($cfg['nonce']));
 
 // ---------------------------------------------------------------------------
+// Connect provisioning (cinatra#221): server-side code exchange stores the
+// credential and never returns it to the browser.
+// ---------------------------------------------------------------------------
+echo "Test: connect exchange stores the provisioned credential server-side\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['options'] = []; // start unconfigured
+$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) {
+    return [
+        'response' => ['code' => 200],
+        'body'     => json_encode([
+            'url'               => 'https://app.cinatra.ai',
+            'siteId'            => 'site_123',
+            'cinatraInstanceId' => 'wp-prod',
+            'credential'        => 'cnx_site_123_PROVISIONED-SECRET',
+            'credentialVersion' => 1,
+            'webhookSecret'     => 'WH-SECRET',
+            'contractVersion'   => 'v1',
+            'capabilities'      => ['tokenBroker' => false, 'supportedContractVersions' => ['v1']],
+        ]),
+    ];
+};
+$res = cinatra_connect_exchange('https://app.cinatra.ai', [
+    'grant_type'    => 'authorization_code',
+    'code'          => 'abc',
+    'client'        => 'wordpress',
+    'redirect_uri'  => 'https://blog.example/wp-admin/admin-post.php?action=cinatra_connect_callback',
+    'code_verifier' => str_repeat('v', 64),
+]);
+check('exchange reports ok', !empty($res['ok']));
+$call = end($GLOBALS['cinatra_test']['remote_post_calls']);
+check('exchange POSTs to /api/connect/token', strpos($call['url'], '/api/connect/token') !== false);
+check('exchange sends grant_type=authorization_code',
+    strpos($call['args']['body'], 'authorization_code') !== false);
+cinatra_connect_apply_result($res);
+check('credential stored server-side in cinatra_api_key',
+    get_option('cinatra_api_key', '') === 'cnx_site_123_PROVISIONED-SECRET');
+check('instance URL stored', get_option('cinatra_url', '') === 'https://app.cinatra.ai');
+check('instance id stored', get_option('cinatra_instance_id', '') === 'wp-prod');
+
+echo "Test: connect exchange rejects an http (non-loopback) instance URL\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['options'] = [];
+$bad = cinatra_connect_exchange('http://evil.example', ['grant_type' => 'install_code', 'install_code' => 'x', 'client' => 'wordpress']);
+check('http non-loopback instance rejected before any request', empty($bad['ok']));
+
+echo "Test: instance URL validator enforces https / no userinfo\n";
+check('https accepted', cinatra_validate_instance_url('https://app.cinatra.ai/') === 'https://app.cinatra.ai');
+check('http non-loopback rejected', cinatra_validate_instance_url('http://app.cinatra.ai') === '');
+check('http loopback allowed', cinatra_validate_instance_url('http://localhost:3000') === 'http://localhost:3000');
+check('userinfo rejected', cinatra_validate_instance_url('https://user:pass@app.cinatra.ai') === '');
+check('non-url rejected', cinatra_validate_instance_url('not a url') === '');
+
+echo "Test: secret sanitizer preserves token chars but strips control chars\n";
+check('printable token preserved', cinatra_sanitize_secret("tok-EN_123.abc") === 'tok-EN_123.abc');
+check('control chars stripped', cinatra_sanitize_secret("tok\r\n123") === 'tok123');
+check('blank keep-existing returns stored', (function () {
+    update_option('cinatra_api_key', 'STORED');
+    return cinatra_sanitize_secret_keep_existing('', 'cinatra_api_key') === 'STORED';
+})());
+
+echo "Test: subscriptions sanitizer drops malformed rows and caps count\n";
+$rows = [];
+for ($i = 0; $i < 60; $i++) {
+    $rows[] = ['event_type' => "e$i", 'target_url' => "https://h$i.example/hook"];
+}
+$rows[] = ['event_type' => '', 'target_url' => 'https://bad.example']; // dropped (no event)
+$clean = json_decode(cinatra_sanitize_subscriptions_json(json_encode($rows)), true);
+check('subscriptions capped at the configured max',
+    is_array($clean) && count($clean) === CINATRA_MAX_WEBHOOK_SUBSCRIPTIONS);
+
+// ---------------------------------------------------------------------------
 echo "\n";
 if ($failures === 0) {
     echo "ALL TESTS PASSED\n";
