@@ -35,24 +35,27 @@ repo's logo masters, brand tokens, pinned fonts, and the same `conform()`
 brand-rule gate as `cinatra-ai/design` `scripts/generate-assets.mjs`, so a
 brand-rule violation fails the build instead of shipping.
 
-## Screenshots — PLAN (placeholders pending live capture)
+## Screenshots
 
-`screenshot-1.png … screenshot-4.png` are **not yet committed**. They require the
-running widget UI rendered in a real wp-admin, which is being captured by a
-separate local end-to-end (E2E) run. The captions are already authored in
-`readme.txt` under `== Screenshots ==`; the matching PNGs land once the E2E
-confirms the rendered widget. Capture plan:
+`screenshot-1.png … screenshot-3.png` are **committed** — captured from the live
+widget UI rendered in a real wp-admin (headless Chromium against a running
+Cinatra dev instance, with the widget mounted via successful capabilities
+negotiation). The captions in `readme.txt` under `== Screenshots ==` are kept in
+ordinal sync. Captured shots:
 
 1. **`screenshot-1.png`** — Settings → Cinatra page: instance-URL field +
-   one-click "Connect with Cinatra"; manual/advanced fields below.
+   one-click "Connect with Cinatra"; manual/advanced fields below. (2560×1920)
 2. **`screenshot-2.png`** — the floating Cinatra assistant button at the
-   bottom-right of wp-admin.
-3. **`screenshot-3.png`** — the assistant chat panel open over a post editor,
-   drafting/revising content in context.
-4. **`screenshot-4.png`** — the Settings page after the connection is approved,
-   showing a connected instance and its status.
+   bottom-right of wp-admin (the mounted widget launcher). (2560×1920)
+3. **`screenshot-3.png`** — the assistant chat panel open over the post list,
+   showing the Cinatra-branded header and the "Ask Cinatra…" composer. (2560×1920)
 
-Capture spec for the E2E run:
+Follow-up (not yet captured): a `screenshot-4.png` of the Settings page after a
+fresh connection is approved, showing connected-instance status. Deferred — the
+verify instance is already connected, so a clean "just connected" status view
+needs a from-scratch connect flow.
+
+Capture spec (used for the committed shots):
 - PNG, RGB, no alpha border; 1× WordPress.org accepts 1280×960 or larger and
   scales down. Capture at a 2× device pixel ratio for crispness, then export the
   full-width screenshots at a consistent width.
