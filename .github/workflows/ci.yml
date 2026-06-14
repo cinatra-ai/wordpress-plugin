@@ -204,14 +204,25 @@ jobs:
           # file ("Hidden files are not permitted."), and the real wp.org build
           # (.distignore / svn export) drops them — so shipping them here would be
           # a CI-only false positive. The leading-dot glob covers future dotfiles.
+          # Keep these excludes in lockstep with .distignore: the build script
+          # (bin/build-wporg.sh) and the 10up deploy action both honour
+          # .distignore, so this rsync must drop the SAME dev/CI/docs cruft or
+          # Plugin Check would validate a tree that differs from what actually
+          # ships to WordPress.org (README.md/docs are GitHub repo docs; the
+          # wp.org-facing readme is readme.txt, which DOES ship).
           rsync -a --delete \
             --exclude='.*' \
             --exclude='vendor' \
             --exclude='node_modules' \
+            --exclude='build' \
+            --exclude='bin' \
             --exclude='tests' \
+            --exclude='docs' \
             --exclude='composer.json' \
             --exclude='composer.lock' \
             --exclude='phpcs.xml.dist' \
+            --exclude='README.md' \
+            --exclude='*.log' \
             "$GITHUB_WORKSPACE/src/" "$DEST/"
           ls -la "$DEST"
       - name: Install + activate Plugin Check

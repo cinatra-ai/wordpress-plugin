@@ -1,0 +1,70 @@
+# wporg-deploy — DORMANT publish to the WordPress.org plugin SVN.
+#
+# This workflow is intentionally PARKED. It does not run on normal development:
+# it triggers ONLY on a pushed `wporg-v*` release tag, or on an explicit manual
+# `workflow_dispatch`. It deliberately does NOT trigger on:
+#   * push to any branch (no `push.branches`),
+#   * pull_request,
+#   * the generic `v*` tags used by github-release.yml (which decorate GitHub
+#     Releases). `wporg-v*` is a distinct, opt-in publish tag so an ordinary
+#     `v0.2.4` release tag can never push to WordPress.org by accident.
+#
+# It is also gated by the `wporg` Environment, which can require manual
+# approval and scopes the SVN secrets, so a stray `wporg-v*` tag still cannot
+# publish without the configured approval.
+#
+# Required repository (or `wporg` Environment) secrets — these do NOT exist yet
+# and are only read at runtime, so this file is inert until they are added:
+#   SVN_USERNAME — the WordPress.org plugin-committer username
+#   SVN_PASSWORD — that committer's WordPress.org password
+#
+# The 10up deploy action honours `.distignore`, so the published trunk matches
+# the artifact produced offline by bin/build-wporg.sh and validated by the CI
+# plugin-check job. Listing assets are taken from .wordpress-org/ (see ASSETS_DIR).
+#
+# To publish (once the secrets exist):
+#   git tag -a wporg-v0.2.3 -m "wp.org 0.2.3" && git push origin wporg-v0.2.3
+# The action derives the wp.org version (SLUG + readme Stable tag / header) from
+# the checked-out tree.
+name: wporg-deploy
+
+on:
+  push:
+    tags:
+      - "wporg-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Stage only; do not commit to SVN (action DRY_RUN)."
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wporg-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to WordPress.org SVN
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: wporg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: WordPress.org plugin deploy
+        uses: 10up/action-wordpress-plugin-deploy@54bd289b8525fd23a5c365ec369185f2966529c2 # 2.3.0
+        env:
+          SVN_USERNAME: ${{ secrets.SVN_USERNAME }}
+          SVN_PASSWORD: ${{ secrets.SVN_PASSWORD }}
+          SLUG: cinatra
+          # Listing graphics (icons/banners/screenshots) staged into SVN assets/.
+          ASSETS_DIR: .wordpress-org
+          # workflow_dispatch defaults to a stage-only dry run; a pushed
+          # wporg-v* tag publishes for real (no dry_run input on the tag event).
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}

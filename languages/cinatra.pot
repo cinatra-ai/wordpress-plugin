@@ -1,0 +1,236 @@
+# Copyright (C) 2026 Cinatra
+# This file is distributed under the GPL-2.0-or-later.
+msgid ""
+msgstr ""
+"Project-Id-Version: Cinatra 0.2.3\n"
+"Report-Msgid-Bugs-To: https://cinatra.ai\n"
+"Last-Translator: Cinatra <support@cinatra.ai>\n"
+"Language-Team: Cinatra <support@cinatra.ai>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"POT-Creation-Date: 2026-06-14T13:20:04+00:00\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"X-Generator: WP-CLI 2.12.0\n"
+"X-Domain: cinatra\n"
+
+#. Plugin Name of the plugin
+#. Author of the plugin
+#: cinatra.php
+#: cinatra.php:237
+msgid "Cinatra"
+msgstr ""
+
+#. Plugin URI of the plugin
+#: cinatra.php
+msgid "https://cinatra.ai"
+msgstr ""
+
+#. Description of the plugin
+#: cinatra.php
+msgid "Embeds the Cinatra AI assistant chat widget in WordPress admin. Floating button bottom-right; opens chat panel on click."
+msgstr ""
+
+#: cinatra.php:236
+#: cinatra.php:287
+msgid "Cinatra Settings"
+msgstr ""
+
+#: cinatra.php:248
+msgid "Settings"
+msgstr ""
+
+#: cinatra.php:290
+msgid "Connect to Cinatra"
+msgstr ""
+
+#: cinatra.php:292
+msgid "Enter your Cinatra instance URL and click Connect. You will be sent to Cinatra to approve the connection; the integration credential is then provisioned automatically and stored on this server. You never copy or paste a key."
+msgstr ""
+
+#: cinatra.php:298
+msgid "Cinatra instance URL"
+msgstr ""
+
+#: cinatra.php:311
+msgid "Connect with Cinatra"
+msgstr ""
+
+#: cinatra.php:314
+msgid "Currently connected. Reconnecting replaces the stored credential."
+msgstr ""
+
+#: cinatra.php:320
+msgid "No browser redirect? Use a connection string instead"
+msgstr ""
+
+#: cinatra.php:325
+msgid "Connection string from Cinatra"
+msgstr ""
+
+#: cinatra.php:335
+msgid "Connect with code"
+msgstr ""
+
+#: cinatra.php:340
+msgid "Advanced / manual configuration"
+msgstr ""
+
+#: cinatra.php:341
+msgid "Most sites should use Connect above. These fields let you set or override the connection manually."
+msgstr ""
+
+#: cinatra.php:346
+msgid "Cinatra URL"
+msgstr ""
+
+#. translators: %s: example URL
+#: cinatra.php:361
+#, php-format
+msgid "Base URL of your Cinatra instance (e.g. %s)."
+msgstr ""
+
+#: cinatra.php:369
+msgid "API Key"
+msgstr ""
+
+#: cinatra.php:378
+#: cinatra.php:412
+msgid "(stored — leave blank to keep)"
+msgstr ""
+
+#: cinatra.php:381
+msgid "Bearer token from Cinatra at"
+msgstr ""
+
+#: cinatra.php:383
+#: cinatra.php:416
+msgid "Leave blank to keep the stored value."
+msgstr ""
+
+#: cinatra.php:388
+msgid "Agent Instance ID"
+msgstr ""
+
+#: cinatra.php:399
+msgid "WordPress instance ID copied from Cinatra. Required for the agent to resolve which WordPress site to edit."
+msgstr ""
+
+#: cinatra.php:403
+msgid "Webhook Secret"
+msgstr ""
+
+#: cinatra.php:415
+msgid "A shared secret stored here and on your Cinatra instance. Cinatra uses it on its own side to sign the requests it makes; this plugin only stores the value and maintains a subscription registry. It does not receive or verify inbound signed webhooks."
+msgstr ""
+
+#: cinatra.php:480
+#: cinatra.php:489
+msgid "Cinatra:"
+msgstr ""
+
+#: cinatra.php:481
+msgid "Install the WordPress MCP Adapter plugin to enable AI tool access from the chat widget. The widget will still work without it."
+msgstr ""
+
+#: cinatra.php:490
+msgid "The Agent Instance ID is not set — the AI assistant will not be able to edit content. Set it in the manual configuration below."
+msgstr ""
+
+#: cinatra.php:622
+#: cinatra.php:692
+#: cinatra.php:742
+msgid "You do not have permission to do this."
+msgstr ""
+
+#: cinatra.php:629
+msgid "Enter a valid https Cinatra instance URL."
+msgstr ""
+
+#: cinatra.php:703
+msgid "Cinatra did not return an authorization code. Connection cancelled."
+msgstr ""
+
+#: cinatra.php:715
+msgid "This connection request expired or did not match. Please try again."
+msgstr ""
+
+#: cinatra.php:749
+msgid "That connection string is not valid."
+msgstr ""
+
+#: cinatra.php:865
+msgid "Could not complete the connection. Check the URL and try again, or contact your administrator."
+msgstr ""
+
+#: cinatra.php:880
+msgid "Connected to Cinatra. The integration credential is stored on this server."
+msgstr ""
+
+#: cinatra.php:946
+msgid "No Cinatra instance URL is configured."
+msgstr ""
+
+#: cinatra.php:947
+msgid "Cinatra is reachable but the widget has not loaded yet. Try refreshing the page."
+msgstr ""
+
+#. translators: %s: HTTP status code
+#: cinatra.php:949
+#, php-format
+msgid "Cinatra returned HTTP %s. Check your instance."
+msgstr ""
+
+#. translators: %s: instance URL
+#: cinatra.php:951
+#, php-format
+msgid "Cannot reach %s. Check that your Cinatra instance is running."
+msgstr ""
+
+#: cinatra.php:1002
+msgid "Cinatra AI Assistant"
+msgstr ""
+
+#: cinatra.php:1010
+msgid "Cinatra is unavailable"
+msgstr ""
+
+#: cinatra.php:1011
+msgid "Close"
+msgstr ""
+
+#: cinatra.php:1013
+msgid "Could not connect to your Cinatra instance."
+msgstr ""
+
+#: cinatra.php:1161
+msgid "Invalid or missing nonce."
+msgstr ""
+
+#: cinatra.php:1168
+msgid "Cinatra URL or API key is not configured."
+msgstr ""
+
+#: cinatra.php:1181
+msgid "Could not derive this site origin."
+msgstr ""
+
+#: cinatra.php:1222
+msgid "Could not reach the Cinatra instance. Check the connector URL, or contact your administrator."
+msgstr ""
+
+#: cinatra.php:1242
+msgid "Cinatra could not issue a session token. Check the connector settings, or contact your administrator."
+msgstr ""
+
+#: cinatra.php:1285
+msgid "event_type and target_url are required."
+msgstr ""
+
+#: cinatra.php:1295
+msgid "Maximum number of webhook subscriptions reached."
+msgstr ""
+
+#: cinatra.php:1341
+msgid "Subscription not found."
+msgstr ""
