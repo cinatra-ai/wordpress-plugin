@@ -1,0 +1,50 @@
+# .distignore — files excluded from the WordPress.org-shipped artifact.
+#
+# This is the single source of truth for what is dropped from the build:
+# `bin/build-wporg.sh` reads it, and the 10up deploy action reads it too
+# (it honours .distignore when staging trunk/). It MUST stay in sync with the
+# CI plugin-check rsync excludes in .github/workflows/ci.yml — if the shipped
+# tree diverges from what Plugin Check validates, CI can pass while wp.org
+# rejects (or vice versa).
+#
+# What DOES ship: cinatra.php, uninstall.php, assets/* (the runtime widget JS
+# and settings/fallback assets), languages/cinatra.pot, readme.txt, LICENSE,
+# NOTICE. The repo's GitHub-facing README.md does NOT ship (readme.txt is the
+# wp.org-facing readme). The WordPress.org listing assets (icons/banners/
+# screenshots) live in .wordpress-org/ and are staged into the SVN assets/
+# directory by the build script — never into trunk/ — so .wordpress-org is
+# dropped from the shipped plugin tree here.
+
+# Version control / dotfiles (Plugin Check rejects hidden files in the tree).
+.git
+.github
+.gitignore
+.gitattributes
+.distignore
+.editorconfig
+.planning
+.wordpress-org
+.DS_Store
+.idea
+.vscode
+
+# Dev dependencies / build output / build tooling.
+vendor
+node_modules
+build
+bin
+
+# Tests (never shipped to wp.org).
+tests
+
+# Tooling / dev config (not part of the runtime plugin).
+composer.json
+composer.lock
+phpcs.xml.dist
+
+# Repo docs that are not the wp.org readme (readme.txt DOES ship).
+README.md
+docs
+
+# Logs / scratch.
+*.log
