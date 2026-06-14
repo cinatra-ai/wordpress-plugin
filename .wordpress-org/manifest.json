@@ -1,0 +1,50 @@
+{
+  "meta": {
+    "name": "Cinatra WordPress.org directory asset manifest",
+    "description": "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the cinatra-ai/design repo (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
+    "designRepo": "cinatra-ai/design",
+    "note": "Screenshots (screenshot-N.png) are captured separately from the live widget UI and are not listed here."
+  },
+  "entries": [
+    {
+      "path": ".wordpress-org/icon-128x128.png",
+      "source": "design assets/logo/cinatra-mark.svg",
+      "colorway": "app icon (mustard fedora on navy)",
+      "dimensions": "128x128",
+      "tokensVersion": "0.1.0",
+      "sha256": "e9c89bd3ec550a8bcf745be79ea74980ad8c2edf7485522a1473bbea0e445504",
+      "generatedBy": "node tools/generate-wordpress-org-assets.mjs",
+      "generatedAt": "2026-06-14"
+    },
+    {
+      "path": ".wordpress-org/icon-256x256.png",
+      "source": "design assets/logo/cinatra-mark.svg",
+      "colorway": "app icon (mustard fedora on navy)",
+      "dimensions": "256x256",
+      "tokensVersion": "0.1.0",
+      "sha256": "8c692f456005ba2e2f81ce5d4a1885ad0c8b15bf6914c70c7b9e5bc69c52003e",
+      "generatedBy": "node tools/generate-wordpress-org-assets.mjs",
+      "generatedAt": "2026-06-14"
+    },
+    {
+      "path": ".wordpress-org/banner-772x250.png",
+      "source": "design assets/logo/cinatra-lockup-horizontal.svg",
+      "colorway": "mustard on paper + slate tagline",
+      "dimensions": "772x250",
+      "tokensVersion": "0.1.0",
+      "sha256": "5b6d963383248fc94db74ddaa68c0b1e4b6ff9e30e2433bf958b8d48e325232d",
+      "generatedBy": "node tools/generate-wordpress-org-assets.mjs",
+      "generatedAt": "2026-06-14"
+    },
+    {
+      "path": ".wordpress-org/banner-1544x500.png",
+      "source": "design assets/logo/cinatra-lockup-horizontal.svg",
+      "colorway": "mustard on paper + slate tagline",
+      "dimensions": "1544x500",
+      "tokensVersion": "0.1.0",
+      "sha256": "03420f3724259b30efff47b3844578eefe5a965ecf1a545da1b1c1cc77f3b4bc",
+      "generatedBy": "node tools/generate-wordpress-org-assets.mjs",
+      "generatedAt": "2026-06-14"
+    }
+  ]
+}

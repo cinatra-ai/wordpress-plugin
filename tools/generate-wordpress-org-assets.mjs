@@ -1,0 +1,225 @@
+#!/usr/bin/env node
+// Generates the WordPress.org plugin-directory assets under .wordpress-org/.
+//
+// DERIVED FROM the cinatra-ai/design repo (spec wins over artifacts):
+//   - brand constants  -> design tokens/brand.json (mustard/navy/cream)
+//   - logo geometry     -> design assets/logo/cinatra-mark.svg (fedora paths)
+//                          design assets/logo/cinatra-lockup-horizontal.svg
+//   - colourway rules   -> design assets/logo/variants.json + specs/brand.html §I
+//   - composer logic    -> mirrors design scripts/generate-assets.mjs
+//                          (appIconSvg / bannerSvg / conform brand-rule gate)
+//
+// The four WordPress.org directory dimensions have NO bespoke recipe in the
+// design repo, so each asset is derived by applying the established brand
+// rules to the WordPress.org canvas:
+//   icon-128 / icon-256  -> app-icon recipe: mustard fedora on a navy rounded
+//        square (the sanctioned icon-ground exception; WordPress masks the
+//        directory icon to a circle, so the fedora is kept clear of corners).
+//   banner-772 / banner-1544 -> light banner: paper ground + mustard
+//        horizontal lockup + tagline in slate ("mustard on paper", the Primary
+//        colourway; fits the WordPress.org light directory chrome).
+//
+// Screenshots (screenshot-N.png) are NOT generated here: they require the live
+// rendered widget UI and land via the separate E2E capture run (see readme.txt
+// "Screenshots" plan).
+//
+// Run from the wordpress-plugin repo root (no deps to install here — the script
+// resolves sharp + opentype.js from the design repo's node_modules):
+//   DESIGN_REPO=/path/to/cinatra-ai/design node tools/generate-wordpress-org-assets.mjs
+// Defaults DESIGN_REPO to a sibling ../design checkout (run `npm install` there once).
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { join, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const here = dirname(fileURLToPath(import.meta.url));
+// This repo (wordpress-plugin) carries no JS deps. The rendering deps
+// (sharp, opentype.js) and the brand masters both live in the cinatra-ai/design
+// repo, so we resolve them from DESIGN_REPO/node_modules at runtime — the script
+// is self-contained against a design checkout and needs nothing installed here.
+const root = process.env.WP_PLUGIN_ROOT || join(here, "..");
+const DESIGN = process.env.DESIGN_REPO || join(root, "..", "design");
+if (!existsSync(join(DESIGN, "assets/logo/cinatra-lockup-horizontal.svg"))) {
+  console.error(
+    `Design repo not found at ${DESIGN}. Set DESIGN_REPO=/path/to/cinatra-ai/design`
+  );
+  process.exit(1);
+}
+
+// Resolve sharp + opentype.js from the design repo's node_modules. ESM bare
+// imports resolve relative to THIS file (which has no node_modules), so we go
+// through createRequire anchored at the design repo and import the resolved
+// absolute path.
+const designRequire = createRequire(join(DESIGN, "package.json"));
+async function fromDesign(pkg) {
+  let resolved;
+  try {
+    resolved = designRequire.resolve(pkg);
+  } catch {
+    console.error(
+      `Cannot resolve "${pkg}" from ${DESIGN}. Run \`npm install\` in the design repo first.`
+    );
+    process.exit(1);
+  }
+  return (await import(pathToFileURL(resolved).href)).default;
+}
+const sharp = await fromDesign("sharp");
+const opentype = await fromDesign("opentype.js");
+
+// ---- brand constants (tokens/brand.json color + variants.json colourways) ---
+const tokens = JSON.parse(readFileSync(join(DESIGN, "tokens/brand.json"), "utf8"));
+const TOKENS_VERSION = tokens.meta.version;
+const MUSTARD = tokens.color.mustard.value; // #c79545
+const NAVY = tokens.color.navy.value; // #15213a
+const CREAM = tokens.color.cream.value; // #f1f1ed
+const PAPER = CREAM; // paper ground == cream (per brand tokens)
+const MUTED = "#5a6477"; // slate caption colour (matches design generate-assets.mjs)
+
+// ---- fedora paths (canonical mark geometry, 72 64 368 192 ink box) ----------
+const markSvg = readFileSync(join(DESIGN, "assets/logo/cinatra-mark.svg"), "utf8");
+const FEDORA_PATHS = markSvg
+  .replace(/<!--[\s\S]*?-->\n/, "")
+  .replace(/<svg[^>]*>/, "")
+  .replace("</svg>", "")
+  .trim();
+
+// ---- lockup master ----------------------------------------------------------
+const lockSrc = readFileSync(
+  join(DESIGN, "assets/logo/cinatra-lockup-horizontal.svg"),
+  "utf8"
+);
+const lockVb = lockSrc.match(/viewBox="([\d. ]+)"/)[1].split(" ").map(Number);
+const LOCK = { w: lockVb[2], h: lockVb[3] };
+const lockContent = lockSrc
+  .replace(/<!--[\s\S]*?-->\n/, "")
+  .replace(/<svg[^>]*>/, "")
+  .replace("</svg>", "");
+
+// ---- fonts (caption / tagline -> outlined JetBrains Mono bold) --------------
+const toAB = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+const mono = opentype.parse(
+  toAB(readFileSync(join(DESIGN, "scripts/.fontcache/JetBrainsMono-700.ttf")))
+);
+function outlined(font, text, size, { letterSpacing = 0 } = {}) {
+  const p = font.getPath(text, 0, 0, size, { kerning: true, letterSpacing });
+  const b = p.getBoundingBox();
+  return { d: p.toPathData(2), w: b.x2 - b.x1, x1: b.x1, y1: b.y1, y2: b.y2 };
+}
+const r2 = (n) => Math.round(n * 100) / 100;
+
+// ---- brand-rule conformance gate (mirrors design scripts/generate-assets.mjs)
+// 1. Mustard is reserved for the mark/wordmark — never caption/tagline text.
+// 2. No mustard on the navy ground — except sanctioned icon grounds.
+function conform(svg, { iconGround = false } = {}) {
+  const navyGround = new RegExp(`<rect[^>]+fill="${NAVY}"`).test(svg);
+  if (navyGround && svg.includes(`fill="${MUSTARD}"`) && !iconGround)
+    throw new Error(
+      "brand-rule violation: mustard on the navy ground outside an icon ground"
+    );
+  return svg;
+}
+function caption(text, size, fill, letterSpacing = 0.18) {
+  if (fill === MUSTARD)
+    throw new Error(
+      "brand-rule violation: mustard is reserved for the mark/wordmark — captions use cream or slate"
+    );
+  const o = outlined(mono, text.toUpperCase(), size, { letterSpacing });
+  return {
+    ...o,
+    path: (x, y) =>
+      `<path fill="${fill}" transform="translate(${r2(x)} ${r2(y)})" d="${o.d}"/>`,
+  };
+}
+
+// ---- icon (WordPress.org directory icon) ------------------------------------
+// App-icon recipe: mustard fedora on a navy rounded square. ~60% fedora width
+// (scale 0.835, matching the design app icon) with a corner-safe margin so the
+// fedora survives the circular mask WordPress applies in some surfaces. The
+// fedora ink box is "72 64 368 192" -> centre at (256,160) in the 512 canvas.
+function iconSvg() {
+  return conform(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">` +
+      `<rect width="512" height="512" rx="72" fill="${NAVY}"/>` +
+      `<g transform="translate(256 256) scale(0.835) translate(-256 -160)" fill="${MUSTARD}">${FEDORA_PATHS}</g>` +
+      `</svg>`,
+    { iconGround: true }
+  );
+}
+
+// ---- banner (WordPress.org directory banner) --------------------------------
+// Light banner: paper ground + mustard horizontal lockup + tagline in slate.
+// Mirrors design bannerSvg(...,"light"): lockup height capped, tagline tracked.
+function placeLockup(fill, x, y, h) {
+  const s = h / LOCK.h;
+  return `<g transform="translate(${x} ${y}) scale(${r2(s)})" fill="${fill}">${lockContent}</g>`;
+}
+function bannerSvg(W, H) {
+  const tagline = tokens.voice.tagline; // "The open source AI workspace"
+  const lockH = Math.min(H * 0.34, 120);
+  const lockW = LOCK.w * (lockH / LOCK.h);
+  const x = (W - lockW) / 2;
+  const y = (H - lockH) / 2 - H * 0.06;
+  const cap = caption(tagline, Math.max(16, H * 0.052), MUTED, 0.22);
+  const tag = cap.path((W - cap.w) / 2, y + lockH + H * 0.14);
+  return conform(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">` +
+      `<rect width="${W}" height="${H}" fill="${PAPER}"/>` +
+      `${placeLockup(MUSTARD, r2(x), r2(y), lockH)}${tag}` +
+      `</svg>`
+  );
+}
+
+// ---- emit + provenance ------------------------------------------------------
+const OUT = join(root, ".wordpress-org");
+mkdirSync(OUT, { recursive: true });
+const entries = [];
+async function png(svg, w, h) {
+  return sharp(Buffer.from(svg), { density: 300 }).resize(w, h).png().toBuffer();
+}
+async function emit(name, svg, w, h, meta) {
+  const data = await png(svg, w, h);
+  writeFileSync(join(OUT, name), data);
+  entries.push({
+    path: `.wordpress-org/${name}`,
+    ...meta,
+    dimensions: `${w}x${h}`,
+    tokensVersion: TOKENS_VERSION,
+    sha256: createHash("sha256").update(data).digest("hex"),
+    generatedBy: "node tools/generate-wordpress-org-assets.mjs",
+    generatedAt: new Date().toISOString().slice(0, 10),
+  });
+  console.log("wrote", name, `${w}x${h}`, `${(data.length / 1024).toFixed(1)}KB`);
+}
+
+const icon = iconSvg();
+await emit("icon-128x128.png", icon, 128, 128, {
+  source: "design assets/logo/cinatra-mark.svg",
+  colorway: "app icon (mustard fedora on navy)",
+});
+await emit("icon-256x256.png", icon, 256, 256, {
+  source: "design assets/logo/cinatra-mark.svg",
+  colorway: "app icon (mustard fedora on navy)",
+});
+await emit("banner-772x250.png", bannerSvg(772, 250), 772, 250, {
+  source: "design assets/logo/cinatra-lockup-horizontal.svg",
+  colorway: "mustard on paper + slate tagline",
+});
+await emit("banner-1544x500.png", bannerSvg(1544, 500), 1544, 500, {
+  source: "design assets/logo/cinatra-lockup-horizontal.svg",
+  colorway: "mustard on paper + slate tagline",
+});
+
+const manifest = {
+  meta: {
+    name: "Cinatra WordPress.org directory asset manifest",
+    description:
+      "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the cinatra-ai/design repo (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
+    designRepo: "cinatra-ai/design",
+    note: "Screenshots (screenshot-N.png) are captured separately from the live widget UI and are not listed here.",
+  },
+  entries,
+};
+writeFileSync(join(OUT, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+console.log(`\nOK — ${entries.length} WordPress.org assets generated; manifest written.`);
