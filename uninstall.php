@@ -69,19 +69,19 @@ function cinatra_uninstall_cleanup_current_site(): void {
 
 if ( is_multisite() ) {
 	// Multisite: clean each site, plus any network-level options.
-	$site_ids = get_sites(
+	$cinatra_site_ids = get_sites(
 		array(
 			'fields' => 'ids',
 			'number' => 0,
 		)
 	);
-	foreach ( (array) $site_ids as $site_id ) {
-		switch_to_blog( (int) $site_id );
+	foreach ( (array) $cinatra_site_ids as $cinatra_site_id ) {
+		switch_to_blog( (int) $cinatra_site_id );
 		cinatra_uninstall_cleanup_current_site();
 		restore_current_blog();
 	}
-	foreach ( cinatra_uninstall_option_keys() as $key ) {
-		delete_site_option( $key );
+	foreach ( cinatra_uninstall_option_keys() as $cinatra_site_option_key ) {
+		delete_site_option( $cinatra_site_option_key );
 	}
 } else {
 	cinatra_uninstall_cleanup_current_site();
