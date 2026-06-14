@@ -53,6 +53,71 @@ jobs:
           echo "readme Stable tag = $stable ; plugin header Version = $header"
           test "$stable" = "$header"
 
+  yaml-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Explicit dependency: yaml.safe_load_all comes from PyYAML, which is NOT
+      # in the stdlib. The ubuntu-latest image ships yamllint via pipx (isolated
+      # from the system python3), so a bare `import yaml` is not a guaranteed
+      # runner contract — install it explicitly so the dependency is not
+      # silently load-bearing. (Parity note: drupal-module relies on the runner;
+      # we diverge intentionally to make the dep explicit.)
+      - name: Install PyYAML
+        run: python3 -m pip install --user pyyaml
+      - name: Parse-validate every YAML file (gating)
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+          from pathlib import Path
+          # Path.rglob descends into hidden dirs (e.g. .github/), unlike
+          # glob.glob('**', recursive=True) which skips dotted directories and
+          # would make this job pass while scanning nothing.
+          root = Path('.')
+          files = sorted({
+              p for pat in ('*.yml', '*.yaml') for p in root.rglob(pat)
+              if 'vendor' not in p.parts and '.git' not in p.parts
+          })
+          if not files:
+              print('No YAML files found — refusing to pass vacuously.')
+              sys.exit(1)
+          bad = 0
+          for p in files:
+              try:
+                  with p.open('r') as fh:
+                      list(yaml.safe_load_all(fh))
+                  print(f'ok   {p}')
+              except Exception as e:
+                  print(f'BAD  {p}: {e}')
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+
+  phpcs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Informational until initial findings are triaged, mirroring how
+    # plugin-check was introduced and the drupal-module sibling's phpcs job.
+    # The ratchet to gating is tracked in the follow-up issue #36.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Set up PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: "8.2"
+          tools: composer
+      - name: Install PHPCS + WPCS + PHPCompatibilityWP
+        run: composer install --no-interaction --no-progress
+      - name: Run PHPCS (WordPress + PHPCompatibilityWP, testVersion 7.4-)
+        run: |
+          vendor/bin/phpcs --standard=WordPress,PHPCompatibilityWP \
+            --runtime-set testVersion 7.4- \
+            cinatra.php uninstall.php
+
   plugin-check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
