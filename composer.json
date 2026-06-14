@@ -18,6 +18,6 @@
         }
     },
     "scripts": {
-        "lint": "phpcs --standard=WordPress,PHPCompatibilityWP --runtime-set testVersion 7.4- cinatra.php uninstall.php"
+        "lint": "phpcs"
     }
 }

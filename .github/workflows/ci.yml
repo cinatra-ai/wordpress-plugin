@@ -111,10 +111,8 @@ jobs:
   phpcs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Informational until initial findings are triaged, mirroring how
-    # plugin-check was introduced and the drupal-module sibling's phpcs job.
-    # The ratchet to gating is tracked in the follow-up issue #36.
-    continue-on-error: true
+    # GATING (#8): the WPCS backlog is triaged and cinatra.php + uninstall.php
+    # are clean, so a new WPCS regression now fails the job red.
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Set up PHP
@@ -124,30 +122,161 @@ jobs:
           tools: composer
       - name: Install PHPCS + WPCS + PHPCompatibilityWP
         run: composer install --no-interaction --no-progress
-      - name: Run PHPCS (WordPress + PHPCompatibilityWP, testVersion 7.4-)
-        run: |
-          vendor/bin/phpcs --standard=WordPress,PHPCompatibilityWP \
-            --runtime-set testVersion 7.4- \
-            cinatra.php uninstall.php
+      - name: Run PHPCS (phpcs.xml.dist ruleset)
+        # Use the committed phpcs.xml.dist (no --standard) so the ruleset is the
+        # single source of truth: it sets WordPress + PHPCompatibilityWP,
+        # testVersion 7.4-, the cinatra text_domain (so the WP.I18n sniff catches
+        # missing-text-domain errors the same way the official Plugin Check does),
+        # and scopes to the tracked first-party files.
+        run: vendor/bin/phpcs
 
   plugin-check:
+    name: plugin-check
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Informational until initial findings are triaged (WPD-EXTRACT-03:
-    # "Optional WPCS once initial noisy findings are triaged"). The gating jobs
-    # are php-lint + readme-validate.
-    continue-on-error: true
+    timeout-minutes: 15
+    # GATING (#8, #16): runs the OFFICIAL WordPress Plugin Check (the
+    # plugin-check plugin) against the plugin in a real WordPress + WP-CLI
+    # environment. Replaces WordPress/plugin-check-action, whose bundled `wp-env`
+    # silently fails to boot on GitHub-hosted runners ("Environment not
+    # initialized. Run `wp-env start` first.") — an upstream infra bug, not a
+    # plugin finding. This MySQL-service + WP-CLI path is hermetic and reliable.
+    services:
+      mysql:
+        # Service-container images are not `uses:` lines, so the actions-pinned
+        # gate does not cover them; a version tag is the correct pin here.
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: wordpress
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=30s
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: WordPress plugin check
-        uses: WordPress/plugin-check-action@18573eb38f13543484a1f095672dae3849a4fbb0 # v1.1.6
+      - name: Checkout plugin
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          build-dir: "./"
-          # The plugin slug is `cinatra` (the repo dir is `wordpress-plugin`);
-          # pin it so Plugin Check evaluates against the intended slug.
-          slug: cinatra
-          # The action writes `core: null` (which fails wp-env init) for every
-          # wp-version except `trunk`, where it writes a real core ref
-          # (WordPress/WordPress#master) and the env boots. Use trunk so the
-          # check actually runs; this exercises current/next WordPress.
-          wp-version: trunk
+          path: src
+      - name: Set up PHP 8.3 + WP-CLI
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: "8.3"
+          extensions: mysqli, zip, gd, mbstring, curl, dom, xml
+          coverage: none
+          tools: wp-cli
+          ini-values: memory_limit=512M
+      - name: Wait for MySQL
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -proot --silent; then
+              echo "MySQL is up."; exit 0
+            fi
+            echo "Waiting for MySQL... ($i)"; sleep 2
+          done
+          echo "MySQL did not become ready in time." >&2; exit 1
+      - name: Download + install WordPress
+        run: |
+          set -euo pipefail
+          WP="$GITHUB_WORKSPACE/wp"
+          mkdir -p "$WP"
+          wp core download --path="$WP" --version=latest
+          wp config create --path="$WP" \
+            --dbname=wordpress --dbuser=root --dbpass=root \
+            --dbhost=127.0.0.1:3306 --skip-check
+          wp core install --path="$WP" \
+            --url=http://localhost --title="PCP CI" \
+            --admin_user=admin --admin_password=pcp-ci-throwaway \
+            --admin_email=ci@example.com --skip-email
+      - name: Place plugin at wp-content/plugins/cinatra
+        run: |
+          set -euo pipefail
+          DEST="$GITHUB_WORKSPACE/wp/wp-content/plugins/cinatra"
+          mkdir -p "$DEST"
+          # Mirror the checked-out repo (so any NEW shipped file is auto-included
+          # — no manual allowlist to drift), excluding dev/CI/build cruft that
+          # never ships to WordPress.org. Hidden/dotfiles (.git, .gitignore, …)
+          # MUST be excluded: Plugin Check's file_type check fails on any hidden
+          # file ("Hidden files are not permitted."), and the real wp.org build
+          # (.distignore / svn export) drops them — so shipping them here would be
+          # a CI-only false positive. The leading-dot glob covers future dotfiles.
+          rsync -a --delete \
+            --exclude='.*' \
+            --exclude='vendor' \
+            --exclude='node_modules' \
+            --exclude='tests' \
+            --exclude='composer.json' \
+            --exclude='composer.lock' \
+            --exclude='phpcs.xml.dist' \
+            "$GITHUB_WORKSPACE/src/" "$DEST/"
+          ls -la "$DEST"
+      - name: Install + activate Plugin Check
+        run: |
+          set -euo pipefail
+          WP="$GITHUB_WORKSPACE/wp"
+          wp plugin install plugin-check --activate --path="$WP"
+          echo "plugin-check version: $(wp plugin get plugin-check --field=version --path="$WP")"
+      - name: Run Plugin Check (gating; fail on any ERROR)
+        run: |
+          set -euo pipefail
+          WP="$GITHUB_WORKSPACE/wp"
+          # Load the plugin-check CLI bootstrap so RUNTIME checks run too (not
+          # just static checks — WP-CLI runs static-only without this).
+          REQUIRE="$WP/wp-content/plugins/plugin-check/cli.php"
+
+          echo "::group::Plugin Check (human-readable)"
+          # NOTE: `wp plugin check` exits 0 EVEN WITH errors (verified), so the
+          # exit code is never trusted — findings are detected explicitly below.
+          wp plugin check cinatra --path="$WP" --require="$REQUIRE" 2>&1 || true
+          echo "::endgroup::"
+
+          # ERROR detection: run with --ignore-warnings so the JSON carries ONLY
+          # error rows (the per-row `type` field is omitted when a file has only
+          # one severity, so filtering on type is unsafe — any row here == error).
+          # Capture stdout AND stderr and the command status: a clean run emits a
+          # NON-EMPTY success sentinel, so empty/unexpected output is an INFRA
+          # failure (wp missing, fatal, bad option) and must FAIL, never pass.
+          set +e
+          OUT="$(wp plugin check cinatra --path="$WP" --require="$REQUIRE" --format=json --ignore-warnings 2>&1)"
+          STATUS=$?
+          set -e
+
+          # Trim leading/trailing whitespace for exact-sentinel comparison.
+          TRIMMED="$(printf '%s' "$OUT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ "$TRIMMED" = "Success: Checks complete. No errors found." ]; then
+            echo "Plugin Check: no errors found."
+            exit 0
+          fi
+
+          # Not the clean sentinel: must be a parseable findings payload, else
+          # treat as an infra failure (do NOT silently pass).
+          if [ -z "$TRIMMED" ]; then
+            echo "::error::Plugin Check produced NO output (status=$STATUS) — treating as infra failure, not a pass."
+            exit 1
+          fi
+          BODY="$(printf '%s\n' "$OUT" | grep -v '^FILE:' || true)"
+          # Count rows ONLY across actual finding arrays (objects {.. } inside
+          # [ .. ]); `select(type=="array")` rejects degenerate JSON like [], {}
+          # or null so a CLI error that emits those cannot read as zero findings.
+          ERROR_COUNT="$(printf '%s' "$BODY" | jq -s '[ .[] | select(type=="array") ] | reduce .[] as $a (0; . + ($a | length))' 2>/dev/null || echo "PARSE_FAIL")"
+          if [ "$ERROR_COUNT" = "PARSE_FAIL" ]; then
+            echo "::error::Plugin Check output was neither the clean sentinel nor parseable findings JSON (status=$STATUS). Output above. Failing closed."
+            exit 1
+          fi
+          echo "ERROR findings: ${ERROR_COUNT}"
+          if [ "${ERROR_COUNT:-0}" -gt 0 ]; then
+            echo "::error::Plugin Check reported ${ERROR_COUNT} ERROR finding(s). See the human-readable output above."
+            exit 1
+          fi
+          # Fail-closed guard: a clean result is the exact sentinel handled above,
+          # so reaching here with zero rows AND a non-zero CLI status means the
+          # check did not run cleanly (degenerate/error output) — never pass it.
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Plugin Check exited non-zero (status=$STATUS) without the clean sentinel. Failing closed."
+            exit 1
+          fi
+          echo "Plugin Check passed: no blocking findings."
