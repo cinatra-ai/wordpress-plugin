@@ -1,0 +1,78 @@
+/*
+ * Cinatra — fallback button + unavailable-notice chrome.
+ * Theme colors are injected as CSS custom properties via wp_add_inline_style
+ * (see cinatra.php) so no per-request inline <style> block is emitted.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#cw-fallback-btn {
+	position: fixed;
+	bottom: 66px;
+	right: 36px;
+	width: 32px;
+	height: 32px;
+	border-radius: 9999px;
+	background: var(--cinatra-accent-soft, #e6ede7);
+	border: 1.5px solid var(--cinatra-logo-color, #7a2e3a);
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-shadow: 0 4px 16px rgba(0, 0, 0, .18);
+	z-index: 9999999;
+	transition: background .15s;
+	padding: 0;
+}
+
+#cw-fallback-btn:hover {
+	background: var(--cinatra-accent-soft-hover, #d8e7db);
+}
+
+#cw-fallback-error {
+	position: fixed;
+	bottom: 110px;
+	right: 24px;
+	width: 280px;
+	background: #fff;
+	color: #18181b;
+	border: 1px solid #e4e4e7;
+	border-radius: 16px;
+	box-shadow: 0 16px 48px rgba(0, 0, 0, .2);
+	padding: 16px;
+	z-index: 9999999;
+	font: 14px/1.5 -apple-system, sans-serif;
+	display: none;
+}
+
+#cw-fallback-error .cw-fe-header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	margin: 0 0 6px;
+}
+
+#cw-fallback-error .cw-fe-title {
+	font-weight: 600;
+	margin: 0;
+}
+
+#cw-fallback-error .cw-fe-close {
+	background: none;
+	border: none;
+	cursor: pointer;
+	font-size: 18px;
+	line-height: 1;
+	color: #71717a;
+	padding: 0 0 0 8px;
+	flex-shrink: 0;
+}
+
+#cw-fallback-error .cw-fe-close:hover {
+	color: #18181b;
+}
+
+#cw-fallback-error .cw-fe-msg {
+	margin: 0;
+	color: #52525b;
+	font-size: 13px;
+}
