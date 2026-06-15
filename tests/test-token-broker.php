@@ -43,7 +43,11 @@ function reset_fixture() {
         'localized'         => [],
         'remote_post'       => null,
         'remote_post_calls' => [],
+        'filters'           => [],
+        'filter_cbs'        => [],
     ];
+    // Each fixture reset starts from a clean env: no server-to-server override.
+    putenv('CINATRA_BASE_URL');
 }
 
 function make_request_with_nonce($nonce, $body = ['contractVersion' => 'v2']) {
@@ -244,6 +248,128 @@ $rows[] = ['event_type' => '', 'target_url' => 'https://bad.example']; // droppe
 $clean = json_decode(cinatra_sanitize_subscriptions_json(json_encode($rows)), true);
 check('subscriptions capped at the configured max',
     is_array($clean) && count($clean) === CINATRA_MAX_WEBHOOK_SUBSCRIPTIONS);
+
+// ---------------------------------------------------------------------------
+// Server-to-server base URL override (CINATRA_BASE_URL) — browser-vs-server
+// URL conflation fix. Production (env unset) must be unchanged; only a
+// validated container-host override may redirect the TRANSPORT, behind a
+// request-scoped SSRF relaxation.
+// ---------------------------------------------------------------------------
+$ok_remote = function () {
+    return [
+        'response' => ['code' => 200],
+        'body' => json_encode([
+            'token'     => 'cit_envoverride0123456789',
+            'tokenType' => 'Bearer',
+            'expiresIn' => 300,
+        ]),
+    ];
+};
+
+echo "Test: env unset -> mint posts to the configured cinatra_url (production unchanged)\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
+$resp = cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
+$call = $GLOBALS['cinatra_test']['remote_post_calls'][0] ?? null;
+check('env unset -> posts to configured cinatra_url host',
+    $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
+check('env unset -> NO host-allowlist filter active during the call (full SSRF guard)',
+    $call && $call['host_filter_active'] === 0);
+
+echo "Test: CINATRA_BASE_URL override redirects the mint TRANSPORT to the container host\n";
+reset_fixture();
+putenv('CINATRA_BASE_URL=http://host.docker.internal:3000');
+$GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
+$resp = cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
+$call = $GLOBALS['cinatra_test']['remote_post_calls'][0] ?? null;
+check('override -> posts to host.docker.internal transport base',
+    $call && $call['url'] === 'http://host.docker.internal:3000/api/agents/wordpress-content-editor/token');
+check('override -> request-scoped host-allowlist filter ACTIVE during the call',
+    $call && $call['host_filter_active'] === 1);
+check('override -> request-scoped safe-port filter ACTIVE during the call',
+    $call && $call['port_filter_active'] === 1);
+check('override -> BOTH filters REMOVED after the call (no leaked relaxation)',
+    (int) ($GLOBALS['cinatra_test']['filters']['http_request_host_is_external'] ?? 0) === 0
+    && (int) ($GLOBALS['cinatra_test']['filters']['http_allowed_safe_ports'] ?? 0) === 0);
+check('override -> redirection disabled on the internal call',
+    $call && (int) ($call['args']['redirection'] ?? -1) === 0);
+check('override -> still sends the long-lived Bearer key server-to-server',
+    $call && ($call['args']['headers']['Authorization'] ?? '') === 'Bearer LONG-LIVED-SECRET-KEY-uuid-uuid');
+$sent = $call ? json_decode($call['args']['body'], true) : [];
+check('override -> origin bound stays the BROWSER admin origin (not the env host)',
+    ($sent['origin'] ?? '') === 'https://blog.example');
+putenv('CINATRA_BASE_URL');
+
+echo "Test: a non-allowlisted CINATRA_BASE_URL is IGNORED (falls back, no SSRF relaxation)\n";
+foreach (['http://evil.example', 'https://10.0.0.5', 'ftp://host.docker.internal', 'http://host.docker.internal@evil.example'] as $bad_env) {
+    reset_fixture();
+    putenv('CINATRA_BASE_URL=' . $bad_env);
+    $GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
+    cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
+    $call = $GLOBALS['cinatra_test']['remote_post_calls'][0] ?? null;
+    check("bad env '$bad_env' -> falls back to configured cinatra_url",
+        $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
+    check("bad env '$bad_env' -> NO host-allowlist filter active (SSRF guard intact)",
+        $call && $call['host_filter_active'] === 0);
+    putenv('CINATRA_BASE_URL');
+}
+
+echo "Test: server-base validator allowlist (loopback + host.docker.internal only)\n";
+check('http host.docker.internal allowed', cinatra_validate_server_base_url('http://host.docker.internal:3000') === 'http://host.docker.internal:3000');
+check('https host.docker.internal allowed', cinatra_validate_server_base_url('https://host.docker.internal') === 'https://host.docker.internal');
+check('http localhost allowed', cinatra_validate_server_base_url('http://localhost:3000') === 'http://localhost:3000');
+check('http 127.0.0.1 allowed', cinatra_validate_server_base_url('http://127.0.0.1:3000') === 'http://127.0.0.1:3000');
+check('arbitrary https host rejected', cinatra_validate_server_base_url('https://app.cinatra.ai') === '');
+check('private ip rejected', cinatra_validate_server_base_url('http://10.0.0.5') === '');
+check('userinfo rejected', cinatra_validate_server_base_url('http://host.docker.internal@evil.example') === '');
+check('non-http(s) scheme rejected', cinatra_validate_server_base_url('ftp://localhost') === '');
+
+echo "Test: relaxation is bound to the EXACT override origin (same host, different port is NOT relaxed)\n";
+reset_fixture();
+putenv('CINATRA_BASE_URL=http://host.docker.internal:3000');
+$GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
+// Endpoint host matches the override host but the PORT differs -> must NOT get
+// the host/port relaxation, so the safe-request gate blocks it (WP_Error, no call).
+$res_wrongport = cinatra_server_post('http://host.docker.internal:8080/x', []);
+check('same-host wrong-port endpoint is NOT relaxed (blocked by safe-request gate)',
+    is_wp_error($res_wrongport));
+check('same-host wrong-port made NO recorded network call', count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
+// The exact override origin IS relaxed.
+$res_right = cinatra_server_post('http://host.docker.internal:3000/x', []);
+check('exact override origin IS relaxed (request proceeds)', !is_wp_error($res_right));
+putenv('CINATRA_BASE_URL');
+
+echo "Test: SSRF gate model — host.docker.internal:3000 is BLOCKED without the request-scoped filters\n";
+// Sanity-check the stub models real WP: a private host on a non-default port is
+// rejected by wp_safe_remote_post unless the plugin's filters are active. This
+// is the bug codex flagged (filter must return true; :3000 must be safe-listed).
+reset_fixture();
+$blocked = wp_safe_remote_post('http://host.docker.internal:3000/x', []);
+check('gate blocks private host:3000 with no override filters (WP_Error)', is_wp_error($blocked));
+$allowed_pub = wp_safe_remote_post('https://app.cinatra.ai/x', ['headers' => []]);
+check('gate allows a normal public https host', !is_wp_error($allowed_pub));
+
+echo "Test: connect exchange honors the override for transport but stores the BROWSER base\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['options'] = [];
+putenv('CINATRA_BASE_URL=http://host.docker.internal:3000');
+$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) {
+    return ['response' => ['code' => 200], 'body' => json_encode([
+        'url' => 'http://localhost:3000', 'credential' => 'cnx_PROVISIONED', 'cinatraInstanceId' => 'wp-dev',
+    ])];
+};
+$res = cinatra_connect_exchange('http://localhost:3000', [
+    'grant_type' => 'install_code', 'install_code' => 'x', 'client' => 'wordpress',
+]);
+$call = end($GLOBALS['cinatra_test']['remote_post_calls']);
+check('connect -> transport redirected to host.docker.internal',
+    $call && $call['url'] === 'http://host.docker.internal:3000/api/connect/token');
+check('connect -> host-allowlist filter active during the call',
+    $call && $call['host_filter_active'] === 1);
+cinatra_connect_apply_result($res);
+check('connect -> stored cinatra_url is the BROWSER base, NEVER the env override',
+    get_option('cinatra_url', '') === 'http://localhost:3000');
+putenv('CINATRA_BASE_URL');
 
 // ---------------------------------------------------------------------------
 echo "\n";

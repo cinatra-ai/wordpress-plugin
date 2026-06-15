@@ -25,7 +25,9 @@ $GLOBALS['cinatra_test'] = [
     'transients'           => [],   // key => value
     'localized'            => [],   // handle => [object_name => data]
     'remote_post'          => null, // canned wp_remote_post response/WP_Error
-    'remote_post_calls'    => [],   // captured wp_remote_post args
+    'remote_post_calls'    => [],   // captured wp_remote_post args (+ filters_active snapshot)
+    'filters'              => [],   // hook => count of currently-registered callbacks
+    'filter_cbs'           => [],   // hook => [live callbacks] (for safe-request replay)
 ];
 
 // ---------------------------------------------------------------------------
@@ -39,7 +41,53 @@ if (!defined('ABSPATH')) {
 // Hook + i18n stubs (no-ops / capture)
 // ---------------------------------------------------------------------------
 function add_action($hook, $cb, $priority = 10, $args = 1) { return true; }
-function add_filter($hook, $cb, $priority = 10, $args = 1) { return true; }
+function add_filter($hook, $cb, $priority = 10, $args = 1) {
+    // Track filters by hook so tests can assert request-scoped add/remove, AND
+    // keep the live callbacks so the HTTP stub can replay WordPress's real
+    // safe-request validation (host-externality + safe-port).
+    $GLOBALS['cinatra_test']['filters'][$hook] = ($GLOBALS['cinatra_test']['filters'][$hook] ?? 0) + 1;
+    $GLOBALS['cinatra_test']['filter_cbs'][$hook][] = $cb;
+    return true;
+}
+function remove_filter($hook, $cb, $priority = 10) {
+    if (!empty($GLOBALS['cinatra_test']['filters'][$hook])) {
+        $GLOBALS['cinatra_test']['filters'][$hook]--;
+    }
+    if (!empty($GLOBALS['cinatra_test']['filter_cbs'][$hook])) {
+        // Remove one matching callback instance (request-scoped add/remove pairs).
+        foreach ($GLOBALS['cinatra_test']['filter_cbs'][$hook] as $i => $stored) {
+            if ($stored === $cb) { unset($GLOBALS['cinatra_test']['filter_cbs'][$hook][$i]); break; }
+        }
+    }
+    return true;
+}
+
+/**
+ * Replay WordPress's safe-request gate the way wp_http_validate_url() does:
+ * a loopback/private host is BLOCKED unless an http_request_host_is_external
+ * filter returns truthy for it, and a non-default port is BLOCKED unless it is
+ * in http_allowed_safe_ports (default 80/443/8080). Returns true if the request
+ * would be permitted, false if WordPress would reject it.
+ */
+function cinatra_test_safe_request_allowed($url) {
+    $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+    $port = (int) parse_url($url, PHP_URL_PORT);
+    $private = in_array($host, ['localhost', '127.0.0.1', '::1', 'host.docker.internal'], true)
+        || (bool) preg_match('/^(10\.|192\.168\.|127\.|169\.254\.|0\.)/', $host);
+    if ($private) {
+        $is_external = false;
+        foreach ($GLOBALS['cinatra_test']['filter_cbs']['http_request_host_is_external'] ?? [] as $cb) {
+            $is_external = $cb($is_external, $host);
+        }
+        if (!$is_external) { return false; }
+    }
+    $safe_ports = [80, 443, 8080];
+    foreach ($GLOBALS['cinatra_test']['filter_cbs']['http_allowed_safe_ports'] ?? [] as $cb) {
+        $safe_ports = $cb($safe_ports);
+    }
+    if ($port > 0 && !in_array($port, $safe_ports, true)) { return false; }
+    return true;
+}
 function register_setting() { return true; }
 function register_rest_route() { return true; }
 function __($text, $domain = 'default') { return $text; }
@@ -153,11 +201,26 @@ function wp_add_inline_script($handle, $data, $position = 'after') {
 // HTTP
 // ---------------------------------------------------------------------------
 function wp_remote_post($url, $args = []) {
-    $GLOBALS['cinatra_test']['remote_post_calls'][] = ['url' => $url, 'args' => $args];
+    // Snapshot the host/port filter state AT call time so tests can prove the
+    // request-scoped SSRF relaxation is active during the request (and the
+    // remove_filter finally restores it to 0 afterwards).
+    $GLOBALS['cinatra_test']['remote_post_calls'][] = [
+        'url'  => $url,
+        'args' => $args,
+        'host_filter_active' => (int) ($GLOBALS['cinatra_test']['filters']['http_request_host_is_external'] ?? 0),
+        'port_filter_active' => (int) ($GLOBALS['cinatra_test']['filters']['http_allowed_safe_ports'] ?? 0),
+    ];
     $canned = $GLOBALS['cinatra_test']['remote_post'];
     return $canned instanceof Closure ? $canned($url, $args) : $canned;
 }
 function wp_safe_remote_post($url, $args = []) {
+    // Model the real wp_safe_remote_post() SSRF/safe-port gate: a request WP
+    // would block never reaches the network, so it returns a WP_Error and we do
+    // NOT record a remote_post_call (matching production). The plugin's
+    // request-scoped filters must make the override host:port pass this gate.
+    if (!cinatra_test_safe_request_allowed($url)) {
+        return new WP_Error('http_request_failed', 'wp_safe_remote_post blocked an unsafe URL (host/port): ' . $url);
+    }
     return wp_remote_post($url, $args);
 }
 function is_wp_error($thing) { return $thing instanceof WP_Error; }

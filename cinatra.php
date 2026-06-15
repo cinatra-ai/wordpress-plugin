@@ -556,6 +556,162 @@ function cinatra_validate_instance_url( string $raw ): string {
 	return $base;
 }
 
+/**
+ * Host allowlist for the OPTIONAL server-to-server base-URL override
+ * (CINATRA_BASE_URL). These are the only hosts a containerized dev topology can
+ * legitimately point the PHP→Cinatra calls at: container IPv4 loopback, or the
+ * Docker host-gateway alias that docker-compose wires via
+ * `extra_hosts: host.docker.internal:host-gateway`.
+ *
+ * IPv6 loopback (::1) is intentionally NOT listed: it would need bracketed-host
+ * normalization (http://[::1]:port) that this validator does not implement, and
+ * docker-compose never targets it. Add it only with proper [::1] handling.
+ */
+const CINATRA_SERVER_BASE_ALLOWED_HOSTS = array( 'localhost', '127.0.0.1', 'host.docker.internal' );
+
+/**
+ * Validate the CINATRA_BASE_URL server-to-server override down to its
+ * scheme://host[:port] origin, or '' if it is unusable / not in the dev-topology
+ * allowlist.
+ *
+ * This is DELIBERATELY separate from cinatra_validate_instance_url() (which
+ * gates admin-entered connect URLs and browser redirects, and intentionally
+ * rejects http://host.docker.internal). This validator exists ONLY for the
+ * trusted, operator-set container override and therefore:
+ *   - allows http OR https, but ONLY for the fixed container host allowlist
+ *     (loopback + host.docker.internal) — never an arbitrary public/private host;
+ *   - rejects userinfo and control characters.
+ * It is never used to widen the shared validator, so production behavior (env
+ * unset) is wholly unaffected.
+ *
+ * @param string $raw Raw CINATRA_BASE_URL value.
+ * @return string Normalized scheme://host[:port] origin, or '' if rejected.
+ */
+function cinatra_validate_server_base_url( string $raw ): string {
+	$raw = trim( $raw );
+	if ( '' === $raw || preg_match( '/[\x00-\x1F\x7F]/', $raw ) ) {
+		return '';
+	}
+	$parts = wp_parse_url( $raw );
+	if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+		return '';
+	}
+	if ( ! empty( $parts['user'] ) || ! empty( $parts['pass'] ) ) {
+		return '';
+	}
+	$scheme = strtolower( $parts['scheme'] );
+	$host   = strtolower( $parts['host'] );
+	if ( ! in_array( $scheme, array( 'http', 'https' ), true ) ) {
+		return '';
+	}
+	// Narrow host allowlist — the override may ONLY target the container's own
+	// loopback or the Docker host-gateway alias, never an arbitrary host.
+	if ( ! in_array( $host, CINATRA_SERVER_BASE_ALLOWED_HOSTS, true ) ) {
+		return '';
+	}
+	$base = $scheme . '://' . $host;
+	if ( ! empty( $parts['port'] ) ) {
+		$base .= ':' . (int) $parts['port'];
+	}
+	return $base;
+}
+
+/**
+ * Resolve the base URL for a server-to-server (PHP→Cinatra) HTTP call.
+ *
+ * Precedence: a VALIDATED CINATRA_BASE_URL env override (containerized dev
+ * topology — docker-compose sets it to the host-gateway base reachable from
+ * inside the container) wins; otherwise the browser-facing base ($browser_base,
+ * e.g. the stored cinatra_url) is used unchanged.
+ *
+ * In production CINATRA_BASE_URL is unset, so this returns $browser_base and the
+ * runtime behavior is identical to before this override existed. The override
+ * ONLY changes the TRANSPORT target of the outbound POST; it is never persisted
+ * and never handed to the browser.
+ *
+ * @param string $browser_base The browser-facing base (validated cinatra_url / instance URL).
+ * @return string The base URL to use for the server-to-server request.
+ */
+function cinatra_server_base_url( string $browser_base ): string {
+	$env = getenv( 'CINATRA_BASE_URL' );
+	if ( is_string( $env ) && '' !== trim( $env ) ) {
+		$override = cinatra_validate_server_base_url( $env );
+		if ( '' !== $override ) {
+			return $override;
+		}
+	}
+	return $browser_base;
+}
+
+/**
+ * Perform a server-to-server (PHP→Cinatra) POST.
+ *
+ * SECURITY: in production (CINATRA_BASE_URL unset, or set to anything outside the
+ * container-host allowlist) this is a plain wp_safe_remote_post — the full
+ * WordPress SSRF protection (loopback/private-host denylist) is retained.
+ *
+ * ONLY when an explicit, VALIDATED CINATRA_BASE_URL override is the target host
+ * do we add two request-scoped filters for the duration of this single call,
+ * then remove them in a finally block:
+ *   - http_request_host_is_external: WordPress's wp_http_validate_url() REJECTS
+ *     a loopback/private host unless this filter returns truthy ("treat as an
+ *     allowed external host"). We return true for EXACTLY the one validated
+ *     override host (and leave WordPress's decision untouched for anything else).
+ *   - http_allowed_safe_ports: safe requests only permit ports 80/443/8080 by
+ *     default, so a dev port like :3000 would otherwise be blocked. We add ONLY
+ *     the override's own port for the duration of the call.
+ * We keep wp_safe_remote_post (never the unguarded wp_remote_post) so every
+ * other safe-request protection still applies; the only things relaxed are the
+ * loopback/host-gateway denylist and the safe-port set, and only for the one
+ * operator-trusted host:port. redirection => 0 prevents a follow-redirect from
+ * escaping the allowlisted host. No browser/user input influences the host.
+ *
+ * @param string $endpoint The full request URL (already built from cinatra_server_base_url()).
+ * @param array  $args     wp_safe_remote_post args.
+ * @return array|WP_Error The wp_safe_remote_post result.
+ */
+function cinatra_server_post( string $endpoint, array $args ) {
+	// Never follow redirects on these internal calls (defense in depth: a 3xx
+	// must not bounce the request — carrying the Bearer key — to another host).
+	$args['redirection'] = 0;
+
+	$host = (string) wp_parse_url( $endpoint, PHP_URL_HOST );
+
+	// Only relax the SSRF denylist when this endpoint's EXACT origin
+	// (scheme://host[:port]) is the validated CINATRA_BASE_URL override (a
+	// trusted, operator-set container signal). Matching the full origin — not
+	// just the host — keeps the relaxation tied to the one host:port we
+	// safe-list below, so a same-host/different-port URL never inherits it.
+	$override = cinatra_server_base_url( '' ); // '' browser-base => non-empty only if env validates.
+	$allow    = ( '' !== $override && cinatra_site_origin( $endpoint ) === $override );
+
+	if ( ! $allow ) {
+		return wp_safe_remote_post( $endpoint, $args );
+	}
+
+	// Request-scoped: treat ONLY this one validated host as an allowed external
+	// target (return true), and allow ONLY its port. Both filters are removed in
+	// the finally no matter how the request returns.
+	$override_port = (int) wp_parse_url( $override, PHP_URL_PORT );
+	$permit_host   = static function ( $is_external, $request_host ) use ( $host ) {
+		return ( strtolower( (string) $request_host ) === strtolower( $host ) ) ? true : $is_external;
+	};
+	$permit_port   = static function ( $ports ) use ( $override_port ) {
+		if ( $override_port > 0 && ! in_array( $override_port, (array) $ports, true ) ) {
+			$ports[] = $override_port;
+		}
+		return $ports;
+	};
+	add_filter( 'http_request_host_is_external', $permit_host, 10, 2 );
+	add_filter( 'http_allowed_safe_ports', $permit_port, 10, 1 );
+	try {
+		return wp_safe_remote_post( $endpoint, $args );
+	} finally {
+		remove_filter( 'http_request_host_is_external', $permit_host, 10 );
+		remove_filter( 'http_allowed_safe_ports', $permit_port, 10 );
+	}
+}
+
 /** The exact, contract-pinned callback redirect_uri for this site. */
 function cinatra_connect_redirect_uri(): string {
 	return admin_url( 'admin-post.php?action=' . CINATRA_CONNECT_CALLBACK_ACTION );
@@ -817,8 +973,13 @@ function cinatra_connect_exchange( string $instance_url, array $body ): array {
 			'response' => null,
 		);
 	}
-	$response = wp_safe_remote_post(
-		$base . '/api/connect/token',
+	// $base is the browser/admin-facing instance origin (it is what we persist as
+	// cinatra_url on success). The TRANSPORT target may be redirected to the
+	// container-reachable base via CINATRA_BASE_URL; the stored value is always
+	// $base, never the override (see cinatra_connect_apply_result()).
+	$server_base = cinatra_server_base_url( $base );
+	$response    = cinatra_server_post(
+		$server_base . '/api/connect/token',
 		array(
 			'timeout' => 15,
 			'headers' => array(
@@ -1193,7 +1354,13 @@ function cinatra_rest_mint_token( WP_REST_Request $request ): WP_REST_Response {
 		}
 	}
 
-	$token_endpoint = $url . '/api/agents/' . CINATRA_AGENT_SLUG . '/token';
+	// The token is minted server-to-server: route the TRANSPORT to the
+	// container-reachable base when CINATRA_BASE_URL is set (dev/container
+	// topology), else to the configured cinatra_url (production, unchanged). The
+	// origin bound into $body above stays the BROWSER origin (admin_url()) — the
+	// instance re-checks that at stream-consume time, so it must NOT be rewritten.
+	$server_base    = cinatra_server_base_url( $url );
+	$token_endpoint = $server_base . '/api/agents/' . CINATRA_AGENT_SLUG . '/token';
 	$body           = array(
 		'contractVersion' => $contract_version,
 		'origin'          => $origin,
@@ -1201,7 +1368,7 @@ function cinatra_rest_mint_token( WP_REST_Request $request ): WP_REST_Response {
 		'scope'           => CINATRA_AGENT_SLUG . '.stream',
 	);
 
-	$response = wp_safe_remote_post(
+	$response = cinatra_server_post(
 		$token_endpoint,
 		array(
 			'timeout' => 10,
