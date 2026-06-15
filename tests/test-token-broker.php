@@ -17,6 +17,24 @@
 require __DIR__ . '/wp-stubs.php';
 require dirname(__DIR__) . '/cinatra.php';
 
+// Route PHP error_log() to a temp file (not stderr) so the plugin's intentional
+// fixed-text warnings don't pollute CI output, and so tests can assert that the
+// fallback warning carries NO secret / raw env value.
+$GLOBALS['cinatra_test_log'] = tempnam(sys_get_temp_dir(), 'cinatra-test-log-');
+ini_set('log_errors', '1');
+ini_set('error_log', $GLOBALS['cinatra_test_log']);
+register_shutdown_function(static function () {
+    if (!empty($GLOBALS['cinatra_test_log']) && is_file($GLOBALS['cinatra_test_log'])) {
+        @unlink($GLOBALS['cinatra_test_log']);
+    }
+});
+function cinatra_test_log_contents(): string {
+    return (string) @file_get_contents($GLOBALS['cinatra_test_log']);
+}
+function cinatra_test_log_reset(): void {
+    @file_put_contents($GLOBALS['cinatra_test_log'], '');
+}
+
 $failures = 0;
 function check($label, $cond) {
     global $failures;
@@ -322,8 +340,37 @@ check('override -> origin bound stays the BROWSER admin origin (not the env host
 putenv('CINATRA_BASE_URL');
 
 echo "Test: a non-allowlisted CINATRA_BASE_URL is IGNORED (falls back, no SSRF relaxation)\n";
-foreach (['http://evil.example', 'https://10.0.0.5', 'ftp://host.docker.internal', 'http://host.docker.internal@evil.example'] as $bad_env) {
+foreach ([
+    // Original wrong-host / wrong-scheme / userinfo rows.
+    'http://evil.example',
+    'https://10.0.0.5',
+    'ftp://host.docker.internal',
+    'http://host.docker.internal@evil.example',
+    // ORIGIN-ONLY must-fix (codex-named): path / query / fragment on an
+    // OTHERWISE-allowlisted host MUST be rejected — the endpoint path is
+    // appended by the plugin, never supplied via the base.
+    'http://host.docker.internal:3000/foo?x#y', // path + query + fragment
+    'http://host.docker.internal:3000/foo',     // path only
+    'http://host.docker.internal:3000/api/agents/x/token',
+    'http://host.docker.internal:3000?x',       // query only
+    'http://host.docker.internal:3000#y',        // fragment only
+    'http://host.docker.internal/foo',           // path only, no port
+    // parse_url-permissiveness rows: malformed port.
+    'http://host.docker.internal:80x',  // junk-suffixed port
+    'http://host.docker.internal:+80',  // signed port
+    'http://host.docker.internal:1.2',  // non-integer port
+    'http://host.docker.internal:0',    // port 0
+    'http://host.docker.internal:65536', // port out of range
+    'http://host.docker.internal:',      // empty port
+    // parse_url-permissiveness rows: malformed host shapes (also not in the
+    // allowlist, but proven rejected at the grammar layer first).
+    'http://[::1]',                       // bracketed IPv6 — valid grammar, not allowlisted
+    'http://::1',                          // unbracketed IPv6 — invalid grammar
+    'http://host.docker.internal\\evil',  // backslash host
+    'http://host:docker:internal',         // extra-colon (multi-colon) host
+] as $bad_env) {
     reset_fixture();
+    cinatra_test_log_reset();
     putenv('CINATRA_BASE_URL=' . $bad_env);
     $GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
     cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
@@ -332,6 +379,16 @@ foreach (['http://evil.example', 'https://10.0.0.5', 'ftp://host.docker.internal
         $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
     check("bad env '$bad_env' -> NO host-allowlist filter active (SSRF guard intact)",
         $call && $call['host_filter_active'] === 0);
+    // The discard warning is fixed-text only: it must NOT echo the raw env value
+    // (so the destination invariant can't be probed via the log), and of course
+    // never any secret.
+    $log = cinatra_test_log_contents();
+    check("bad env '$bad_env' -> a fixed-text discard warning was logged",
+        strpos($log, 'CINATRA_BASE_URL is set but is not a valid container-origin override') !== false);
+    check("bad env '$bad_env' -> warning does NOT leak the raw env value",
+        strpos($log, $bad_env) === false);
+    check("bad env '$bad_env' -> warning does NOT leak the long-lived key",
+        strpos($log, 'LONG-LIVED-SECRET-KEY-uuid-uuid') === false);
     putenv('CINATRA_BASE_URL');
 }
 
@@ -339,11 +396,43 @@ echo "Test: server-base validator allowlist (loopback + host.docker.internal onl
 check('http host.docker.internal allowed', cinatra_validate_server_base_url('http://host.docker.internal:3000') === 'http://host.docker.internal:3000');
 check('https host.docker.internal allowed', cinatra_validate_server_base_url('https://host.docker.internal') === 'https://host.docker.internal');
 check('http localhost allowed', cinatra_validate_server_base_url('http://localhost:3000') === 'http://localhost:3000');
-check('http 127.0.0.1 allowed', cinatra_validate_server_base_url('http://127.0.0.1:3000') === 'http://127.0.0.1:3000');
+check('http 127.0.0.1 allowed (dotted IPv4)', cinatra_validate_server_base_url('http://127.0.0.1:3000') === 'http://127.0.0.1:3000');
 check('arbitrary https host rejected', cinatra_validate_server_base_url('https://app.cinatra.ai') === '');
 check('private ip rejected', cinatra_validate_server_base_url('http://10.0.0.5') === '');
 check('userinfo rejected', cinatra_validate_server_base_url('http://host.docker.internal@evil.example') === '');
 check('non-http(s) scheme rejected', cinatra_validate_server_base_url('ftp://localhost') === '');
+
+echo "Test: server-base validator is strictly ORIGIN-ONLY (path/query/fragment rejected; clean origin accepted)\n";
+// ACCEPT rows (clean origins) — must normalize, NOT fall back.
+check('clean http origin (no port) accepted', cinatra_validate_server_base_url('http://host.docker.internal') === 'http://host.docker.internal');
+check('single trailing slash accepted + stripped', cinatra_validate_server_base_url('http://host.docker.internal:3000/') === 'http://host.docker.internal:3000');
+check('trailing slash, no port accepted + stripped', cinatra_validate_server_base_url('http://localhost/') === 'http://localhost');
+check('mixed-case scheme normalized to lower', cinatra_validate_server_base_url('HTTP://localhost:3000') === 'http://localhost:3000');
+check('IPv4 loopback accepted', cinatra_validate_server_base_url('http://127.0.0.1') === 'http://127.0.0.1');
+// REJECT rows: ANY path/query/fragment, even on an allowlisted host.
+check('path on allowlisted host rejected', cinatra_validate_server_base_url('http://host.docker.internal:3000/foo') === '');
+check('path+query+fragment on allowlisted host rejected', cinatra_validate_server_base_url('http://host.docker.internal:3000/foo?x#y') === '');
+check('endpoint-style path rejected', cinatra_validate_server_base_url('http://host.docker.internal:3000/api/agents/x/token') === '');
+check('query-only rejected', cinatra_validate_server_base_url('http://host.docker.internal:3000?x') === '');
+check('fragment-only rejected', cinatra_validate_server_base_url('http://host.docker.internal:3000#y') === '');
+check('double-slash path rejected', cinatra_validate_server_base_url('http://host.docker.internal:3000//') === '');
+// REJECT rows: parse_url-permissive ports — must be PURE digits, 1-65535.
+check('port :0 rejected', cinatra_validate_server_base_url('http://host.docker.internal:0') === '');
+check('port :80x (junk suffix) rejected', cinatra_validate_server_base_url('http://host.docker.internal:80x') === '');
+check('port :+80 (signed) rejected', cinatra_validate_server_base_url('http://host.docker.internal:+80') === '');
+check('port :1.2 (non-integer) rejected', cinatra_validate_server_base_url('http://host.docker.internal:1.2') === '');
+check('port :65536 (out of range) rejected', cinatra_validate_server_base_url('http://host.docker.internal:65536') === '');
+check('empty port ":" rejected', cinatra_validate_server_base_url('http://host.docker.internal:') === '');
+check('max valid port :65535 grammar-accepted (host not allowlisted -> rejected)', cinatra_validate_server_base_url('http://example.com:65535') === '');
+// REJECT rows: malformed hosts.
+check('unbracketed IPv6 rejected', cinatra_validate_server_base_url('http://::1') === '');
+check('backslash host rejected', cinatra_validate_server_base_url('http://host.docker.internal\\evil') === '');
+check('extra-colon (multi-colon) host rejected', cinatra_validate_server_base_url('http://host:docker:internal') === '');
+check('host with control char rejected', cinatra_validate_server_base_url("http://host.docker.internal\t:3000") === '');
+// GRAMMAR-LEVEL accept for non-allowlisted-but-well-formed hosts (proves the
+// grammar accepts IPv4 / bracketed IPv6 shapes; the allowlist then rejects them).
+check('bracketed IPv6 is valid grammar but not allowlisted -> rejected', cinatra_validate_server_base_url('http://[::1]:3000') === '');
+check('dotted IPv4 (non-loopback) is valid grammar but not allowlisted -> rejected', cinatra_validate_server_base_url('http://192.168.1.5:3000') === '');
 
 echo "Test: relaxation is bound to the EXACT override origin (same host, different port is NOT relaxed)\n";
 reset_fixture();

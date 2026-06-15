@@ -580,7 +580,25 @@ const CINATRA_SERVER_BASE_ALLOWED_HOSTS = array( 'localhost', '127.0.0.1', 'host
  * trusted, operator-set container override and therefore:
  *   - allows http OR https, but ONLY for the fixed container host allowlist
  *     (loopback + host.docker.internal) — never an arbitrary public/private host;
- *   - rejects userinfo and control characters.
+ *   - accepts ONLY a clean ORIGIN (scheme://host[:port], optional single
+ *     trailing '/'): ANY path, query, fragment, or userinfo is rejected. The
+ *     endpoint path is appended by the plugin, never supplied via the base, so
+ *     the API-key-bearing POST can only ever reach the validated origin.
+ *
+ * The accepted shape is decided by an ANCHORED raw-string match BEFORE trusting
+ * PHP's permissive parse_url (which accepts junk hosts/ports): the regex pins
+ * the WHOLE string to ^scheme://host[:port]/?$, so a path/query/fragment or a
+ * malformed host/port can never slip past it. parse_url is then used only to
+ * lower-case + recompose the already-validated pieces.
+ *
+ * Grammar (linear classes only — NO nested quantifiers, ReDoS-safe):
+ *   scheme = https? (case-insensitive)
+ *   host   = DNS hostname  : label('.'label)*  label=[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?
+ *          | dotted IPv4   : octet '.' octet '.' octet '.' octet (each 0-255)
+ *          | bracketed IPv6: '[' [0-9A-Fa-f:]+ ']'
+ *   port   = 1-65535 (validated numerically; ':0', ':80x', ':+80', ':1.2',
+ *            ':65536', and an empty ':' are all rejected)
+ *
  * It is never used to widen the shared validator, so production behavior (env
  * unset) is wholly unaffected.
  *
@@ -592,10 +610,33 @@ function cinatra_validate_server_base_url( string $raw ): string {
 	if ( '' === $raw || preg_match( '/[\x00-\x1F\x7F]/', $raw ) ) {
 		return '';
 	}
+
+	// Origin-only grammar, anchored to the WHOLE string. Each alternative class
+	// is linear (no nested quantifiers, no `(X+)+`) so the match is ReDoS-safe.
+	// - host: DNS hostname OR dotted-quad OR bracketed IPv6.
+	// - an OPTIONAL single trailing '/' is the only path allowed; anything
+	// else after the authority (a real path, '?', '#', userinfo '@') fails.
+	$label     = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
+	$dns       = $label . '(?:\.' . $label . ')*';
+	$ipv4_oct  = '(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
+	$ipv4      = $ipv4_oct . '(?:\.' . $ipv4_oct . '){3}';
+	$ipv6      = '\[[0-9A-Fa-f:]+\]';
+	$host_re   = '(?:' . $dns . '|' . $ipv4 . '|' . $ipv6 . ')';
+	$port_re   = '(?:[0-9]+)';
+	$origin_re = '#^https?://' . $host_re . '(?::' . $port_re . ')?/?$#i';
+	if ( ! preg_match( $origin_re, $raw ) ) {
+		return '';
+	}
+
+	// Grammar passed: parse_url now only LOWER-CASES + recomposes the already
+	// validated pieces. parse_url alone is too permissive to trust for the
+	// accept decision; the anchored regex above is what makes it safe.
 	$parts = wp_parse_url( $raw );
 	if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
 		return '';
 	}
+	// Defense-in-depth: the grammar already excludes userinfo, but never trust a
+	// single layer for the API-key destination.
 	if ( ! empty( $parts['user'] ) || ! empty( $parts['pass'] ) ) {
 		return '';
 	}
@@ -604,14 +645,23 @@ function cinatra_validate_server_base_url( string $raw ): string {
 	if ( ! in_array( $scheme, array( 'http', 'https' ), true ) ) {
 		return '';
 	}
+	// Port must be a real 1-65535 number. The grammar guarantees it is all
+	// digits when present; re-check the numeric range and reject :0.
+	$port = null;
+	if ( isset( $parts['port'] ) && '' !== (string) $parts['port'] ) {
+		$port = (int) $parts['port'];
+		if ( $port < 1 || $port > 65535 ) {
+			return '';
+		}
+	}
 	// Narrow host allowlist — the override may ONLY target the container's own
 	// loopback or the Docker host-gateway alias, never an arbitrary host.
 	if ( ! in_array( $host, CINATRA_SERVER_BASE_ALLOWED_HOSTS, true ) ) {
 		return '';
 	}
 	$base = $scheme . '://' . $host;
-	if ( ! empty( $parts['port'] ) ) {
-		$base .= ':' . (int) $parts['port'];
+	if ( null !== $port ) {
+		$base .= ':' . $port;
 	}
 	return $base;
 }
@@ -639,6 +689,11 @@ function cinatra_server_base_url( string $browser_base ): string {
 		if ( '' !== $override ) {
 			return $override;
 		}
+		// The override was SET but is not a clean, allowlisted ORIGIN — discard it
+		// and fall back to the browser base. Log a FIXED-TEXT warning only: the
+		// raw env value (and never any secret) is intentionally NOT included, so
+		// the destination invariant cannot be probed via the log.
+		error_log( '[cinatra] CINATRA_BASE_URL is set but is not a valid container-origin override; ignoring it and using the configured Cinatra URL.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side warning; fixed text only, never the raw env value or any secret.
 	}
 	return $browser_base;
 }
