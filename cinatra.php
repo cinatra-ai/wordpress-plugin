@@ -655,28 +655,39 @@ function cinatra_server_base_url( string $browser_base ): string {
  * then remove them in a finally block:
  *   - http_request_host_is_external: WordPress's wp_http_validate_url() REJECTS
  *     a loopback/private host unless this filter returns truthy ("treat as an
- *     allowed external host"). We return true for EXACTLY the one validated
- *     override host (and leave WordPress's decision untouched for anything else).
+ *     allowed external host"). WordPress passes ($external, $host, $url); we
+ *     return true for EXACTLY the one validated override host (and leave
+ *     WordPress's decision untouched for any other host).
  *   - http_allowed_safe_ports: safe requests only permit ports 80/443/8080 by
- *     default, so a dev port like :3000 would otherwise be blocked. We add ONLY
- *     the override's own port for the duration of the call.
+ *     default, so a dev port like :3000 would otherwise be blocked. WordPress
+ *     passes ($ports, $host, $url); we add the override's port ONLY when the
+ *     request targets the override host AND port (the exact origin), and return
+ *     $ports unchanged for any other host/port.
  * We keep wp_safe_remote_post (never the unguarded wp_remote_post) so every
  * other safe-request protection still applies; the only things relaxed are the
  * loopback/host-gateway denylist and the safe-port set, and only for the one
- * operator-trusted host:port. redirection => 0 prevents a follow-redirect from
- * escaping the allowlisted host. No browser/user input influences the host.
+ * operator-trusted host:port.
+ *
+ * PRODUCTION PARITY: when there is NO override in effect (CINATRA_BASE_URL unset,
+ * or set to anything outside the container-host allowlist) this is a bare
+ * wp_safe_remote_post( $endpoint, $args ) with the caller's args UNCHANGED — no
+ * forced redirection, no filters — so it is byte-identical to the pre-override
+ * call that used WordPress's default args (which permit redirects). The
+ * redirection => 0 hardening is applied ONLY on the override path, where
+ * disabling redirects is correct: it stops a 3xx from bouncing the request —
+ * carrying the Bearer key — to a host outside the one validated override origin.
+ * No browser/user input influences the host on either path.
+ *
+ * SSRF SCOPE: both request-scoped filters are bound to the EXACT override origin
+ * (scheme+host+port) via the $host/$url args WordPress passes them, so even while
+ * they are installed for the call window they relax NOTHING but that one origin —
+ * any other outbound request during the window sees the unchanged value.
  *
  * @param string $endpoint The full request URL (already built from cinatra_server_base_url()).
  * @param array  $args     wp_safe_remote_post args.
  * @return array|WP_Error The wp_safe_remote_post result.
  */
 function cinatra_server_post( string $endpoint, array $args ) {
-	// Never follow redirects on these internal calls (defense in depth: a 3xx
-	// must not bounce the request — carrying the Bearer key — to another host).
-	$args['redirection'] = 0;
-
-	$host = (string) wp_parse_url( $endpoint, PHP_URL_HOST );
-
 	// Only relax the SSRF denylist when this endpoint's EXACT origin
 	// (scheme://host[:port]) is the validated CINATRA_BASE_URL override (a
 	// trusted, operator-set container signal). Matching the full origin — not
@@ -686,24 +697,49 @@ function cinatra_server_post( string $endpoint, array $args ) {
 	$allow    = ( '' !== $override && cinatra_site_origin( $endpoint ) === $override );
 
 	if ( ! $allow ) {
+		// PRODUCTION PATH: byte-identical to the pre-override call — WordPress's
+		// default args (which permit redirects), no SSRF-filter relaxation.
 		return wp_safe_remote_post( $endpoint, $args );
 	}
 
-	// Request-scoped: treat ONLY this one validated host as an allowed external
-	// target (return true), and allow ONLY its port. Both filters are removed in
-	// the finally no matter how the request returns.
+	// OVERRIDE PATH (hardened): never follow redirects on the internal call so a
+	// 3xx cannot bounce the Bearer-key request off the one validated host.
+	$args['redirection'] = 0;
+
+	// Request-scoped filters bound to the EXACT override origin. WordPress passes
+	// the requested ($host, $url) to BOTH filters; we compare the request URL's
+	// FULL origin (scheme://host[:port]) — via the same cinatra_site_origin()
+	// used for the entry guard above — to the validated override origin, and
+	// relax ONLY on an exact match. Anything else (different host, OR the same
+	// host on a different scheme/port) sees the value WordPress would have used,
+	// so no other outbound request in the window is affected. Note the host
+	// filter MUST also be origin-bound: a same-host/WP-default-safe-port request
+	// (e.g. host.docker.internal:8080 during a :3000 window) is a loopback/private
+	// host that arrives with $is_external=false; returning true for it on a
+	// host-only check would wrongly relax it even though its port never needed
+	// safe-listing. Both filters are removed in the finally no matter how the
+	// request returns.
 	$override_port = (int) wp_parse_url( $override, PHP_URL_PORT );
-	$permit_host   = static function ( $is_external, $request_host ) use ( $host ) {
-		return ( strtolower( (string) $request_host ) === strtolower( $host ) ) ? true : $is_external;
+	$permit_host   = static function ( $is_external, $request_host, $request_url = '' ) use ( $override ) {
+		// Only treat the EXACT override origin as an allowed external host; every
+		// other host (incl. the same host on another scheme/port) keeps WordPress's
+		// own decision unchanged.
+		return ( '' !== (string) $request_url && cinatra_site_origin( (string) $request_url ) === $override )
+			? true
+			: $is_external;
 	};
-	$permit_port   = static function ( $ports ) use ( $override_port ) {
-		if ( $override_port > 0 && ! in_array( $override_port, (array) $ports, true ) ) {
+	$permit_port   = static function ( $ports, $request_host, $request_url = '' ) use ( $override, $override_port ) {
+		// Widen the safe-port set ONLY when this request targets the exact override
+		// origin (scheme+host+port). Any other host/scheme/port sees $ports unchanged.
+		if ( $override_port > 0 && '' !== (string) $request_url
+			&& cinatra_site_origin( (string) $request_url ) === $override
+			&& ! in_array( $override_port, (array) $ports, true ) ) {
 			$ports[] = $override_port;
 		}
 		return $ports;
 	};
-	add_filter( 'http_request_host_is_external', $permit_host, 10, 2 );
-	add_filter( 'http_allowed_safe_ports', $permit_port, 10, 1 );
+	add_filter( 'http_request_host_is_external', $permit_host, 10, 3 );
+	add_filter( 'http_allowed_safe_ports', $permit_port, 10, 3 );
 	try {
 		return wp_safe_remote_post( $endpoint, $args );
 	} finally {

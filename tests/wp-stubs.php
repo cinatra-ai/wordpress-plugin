@@ -76,14 +76,18 @@ function cinatra_test_safe_request_allowed($url) {
         || (bool) preg_match('/^(10\.|192\.168\.|127\.|169\.254\.|0\.)/', $host);
     if ($private) {
         $is_external = false;
+        // WordPress passes ($external, $host, $url) to this filter — replay all
+        // three so the plugin's exact-origin host check sees the real request.
         foreach ($GLOBALS['cinatra_test']['filter_cbs']['http_request_host_is_external'] ?? [] as $cb) {
-            $is_external = $cb($is_external, $host);
+            $is_external = $cb($is_external, $host, $url);
         }
         if (!$is_external) { return false; }
     }
     $safe_ports = [80, 443, 8080];
+    // WordPress passes ($ports, $host, $url) to this filter — replay all three so
+    // the plugin's exact-origin (host+port) port check sees the real request.
     foreach ($GLOBALS['cinatra_test']['filter_cbs']['http_allowed_safe_ports'] ?? [] as $cb) {
-        $safe_ports = $cb($safe_ports);
+        $safe_ports = $cb($safe_ports, $host, $url);
     }
     if ($port > 0 && !in_array($port, $safe_ports, true)) { return false; }
     return true;

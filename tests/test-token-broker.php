@@ -275,6 +275,27 @@ check('env unset -> posts to configured cinatra_url host',
     $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
 check('env unset -> NO host-allowlist filter active during the call (full SSRF guard)',
     $call && $call['host_filter_active'] === 0);
+check('env unset -> NO safe-port filter active during the call (full SSRF guard)',
+    $call && $call['port_filter_active'] === 0);
+
+// MUST-FIX 1 (production parity): on the env-unset/production path the helper
+// must pass the caller's args UNCHANGED to wp_safe_remote_post — it must NOT
+// inject redirection => 0. The mint caller never sets redirection, so the
+// captured args carry NO redirection key, meaning WordPress applies its DEFAULT
+// (which permits redirects) — byte-identical to the pre-override call.
+echo "Test: env unset -> args are byte-identical to the pre-override call (no forced redirection => 0)\n";
+check('env unset -> helper does NOT inject a redirection arg (WP default redirect behavior preserved)',
+    $call && !array_key_exists('redirection', (array) $call['args']));
+// And prove the helper forwards a caller-supplied redirection value verbatim on
+// the production path (it must neither add nor override it).
+reset_fixture();
+$GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
+$res_passthru = cinatra_server_post('https://app.cinatra.ai/api/x', ['redirection' => 5, 'timeout' => 9]);
+$passthru = end($GLOBALS['cinatra_test']['remote_post_calls']);
+check('env unset -> caller redirection arg is forwarded UNCHANGED (not forced to 0)',
+    $passthru && (int) ($passthru['args']['redirection'] ?? -1) === 5);
+check('env unset -> no SSRF filters installed for a plain public-host call',
+    $passthru && $passthru['host_filter_active'] === 0 && $passthru['port_filter_active'] === 0);
 
 echo "Test: CINATRA_BASE_URL override redirects the mint TRANSPORT to the container host\n";
 reset_fixture();
@@ -337,6 +358,94 @@ check('same-host wrong-port made NO recorded network call', count($GLOBALS['cina
 // The exact override origin IS relaxed.
 $res_right = cinatra_server_post('http://host.docker.internal:3000/x', []);
 check('exact override origin IS relaxed (request proceeds)', !is_wp_error($res_right));
+check('exact override origin -> redirects DISABLED on the call (override-path hardening)',
+    (int) (end($GLOBALS['cinatra_test']['remote_post_calls'])['args']['redirection'] ?? -1) === 0);
+putenv('CINATRA_BASE_URL');
+
+// MUST-FIX 2 (relaxation bound to the EXACT override origin): WHILE the
+// request-scoped filters are installed for the override call, a DIFFERENT
+// outbound request (other host, or same host wrong port) that happens during
+// that window must see the UNCHANGED filter value. We capture the live filter
+// callbacks installed during the override window and replay them with foreign
+// args, exactly as WordPress would for any concurrent request in the window.
+echo "Test: during the override window, a DIFFERENT-host/port request is NOT relaxed (filters check host+url)\n";
+reset_fixture();
+putenv('CINATRA_BASE_URL=http://host.docker.internal:3000');
+$captured_filters = [];
+$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) use (&$captured_filters) {
+    // Snapshot the live filter callbacks while they are still installed.
+    $captured_filters = [
+        'host' => ($GLOBALS['cinatra_test']['filter_cbs']['http_request_host_is_external'] ?? [])[0] ?? null,
+        'port' => ($GLOBALS['cinatra_test']['filter_cbs']['http_allowed_safe_ports'] ?? [])[0] ?? null,
+    ];
+    return ['response' => ['code' => 200], 'body' => json_encode(['token' => 'cit_x', 'expiresIn' => 300])];
+};
+$res_win = cinatra_server_post('http://host.docker.internal:3000/api/x', []);
+check('override window: a host externality filter WAS installed', is_callable($captured_filters['host'] ?? null));
+check('override window: a safe-port filter WAS installed', is_callable($captured_filters['port'] ?? null));
+
+$host_cb = $captured_filters['host'];
+$port_cb = $captured_filters['port'];
+// http_request_host_is_external($external, $host, $url): a DIFFERENT host in the
+// window must NOT be treated as external-allowed — the filter returns the
+// original $is_external (false) unchanged, only the override host gets true.
+check('window host-filter: a DIFFERENT host is NOT relaxed (returns original false)',
+    $host_cb(false, 'evil.example', 'http://evil.example/x') === false);
+check('window host-filter: a private third-party host is NOT relaxed (returns original false)',
+    $host_cb(false, '10.0.0.5', 'http://10.0.0.5/x') === false);
+check('window host-filter: the SAME host on a DIFFERENT port is NOT relaxed (origin-bound, returns false)',
+    $host_cb(false, 'host.docker.internal', 'http://host.docker.internal:8080/x') === false);
+check('window host-filter: ONLY the exact override ORIGIN is relaxed (returns true)',
+    $host_cb(false, 'host.docker.internal', 'http://host.docker.internal:3000/x') === true);
+
+// http_allowed_safe_ports($ports, $host, $url): a DIFFERENT host, or the
+// override host on a DIFFERENT port, must NOT widen the port set — the override
+// port (3000) is added ONLY for the exact override origin.
+check('window port-filter: a DIFFERENT host does NOT get the override port added',
+    !in_array(3000, $port_cb([80, 443, 8080], 'evil.example', 'http://evil.example:3000/x'), true));
+check('window port-filter: same override host on a DIFFERENT port does NOT get :3000 added',
+    !in_array(3000, $port_cb([80, 443, 8080], 'host.docker.internal', 'http://host.docker.internal:8080/x'), true));
+check('window port-filter: the EXACT override origin DOES get :3000 added',
+    in_array(3000, $port_cb([80, 443, 8080], 'host.docker.internal', 'http://host.docker.internal:3000/x'), true));
+check('window: filters REMOVED after the override call returns (no leaked relaxation)',
+    (int) ($GLOBALS['cinatra_test']['filters']['http_request_host_is_external'] ?? 0) === 0
+    && (int) ($GLOBALS['cinatra_test']['filters']['http_allowed_safe_ports'] ?? 0) === 0);
+putenv('CINATRA_BASE_URL');
+
+// MUST-FIX 2 (composed decision — the gap a host-only filter would leak): drive
+// REAL concurrent wp_safe_remote_post() calls from INSIDE the override window and
+// assert the full safe-request gate (host-externality + safe-port together)
+// blocks everything but the exact override origin. The dangerous case is the
+// SAME allowlisted host on a WordPress-default-safe port (e.g.
+// host.docker.internal:8080 during a :3000 window): that port never needs
+// safe-listing, so a host-ONLY externality filter would wrongly let it through.
+// Binding the host filter to the full scheme://host:port origin closes it.
+echo "Test: during the override window, concurrent requests are gated by the EXACT origin (composed host+port decision)\n";
+reset_fixture();
+putenv('CINATRA_BASE_URL=http://host.docker.internal:3000');
+$nested = [];
+$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) use (&$nested) {
+    if ($url === 'http://host.docker.internal:3000/api/x') {
+        // Concurrent outbound requests that "happen" while the filters are live:
+        $nested['same_host_default_port'] = wp_safe_remote_post('http://host.docker.internal:8080/other', []);
+        $nested['same_host_other_port']   = wp_safe_remote_post('http://host.docker.internal:9999/other', []);
+        $nested['third_party_public']     = wp_safe_remote_post('https://app.cinatra.ai/other', ['headers' => []]);
+        $nested['third_party_private']    = wp_safe_remote_post('http://10.0.0.5/other', []);
+        $nested['exact_override_again']   = wp_safe_remote_post('http://host.docker.internal:3000/again', []);
+    }
+    return ['response' => ['code' => 200], 'body' => json_encode(['token' => 'cit_x', 'expiresIn' => 300])];
+};
+cinatra_server_post('http://host.docker.internal:3000/api/x', []);
+check('window: SAME host on a WP-default-safe port (:8080) is STILL BLOCKED (not the exact origin)',
+    is_wp_error($nested['same_host_default_port'] ?? null));
+check('window: SAME host on another non-default port (:9999) is STILL BLOCKED',
+    is_wp_error($nested['same_host_other_port'] ?? null));
+check('window: a third-party PRIVATE host (10.0.0.5) is STILL BLOCKED',
+    is_wp_error($nested['third_party_private'] ?? null));
+check('window: a third-party PUBLIC host is unaffected (still allowed, as WP would)',
+    !is_wp_error($nested['third_party_public'] ?? null));
+check('window: the EXACT override origin IS allowed (even nested during the window)',
+    !is_wp_error($nested['exact_override_again'] ?? null));
 putenv('CINATRA_BASE_URL');
 
 echo "Test: SSRF gate model — host.docker.internal:3000 is BLOCKED without the request-scoped filters\n";
