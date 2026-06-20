@@ -63,7 +63,9 @@ It ships inside this plugin and is served locally from your own site. No executa
 Deleting the plugin runs its uninstall routine, which removes all of the plugin's stored options (the instance URL, credential, instance ID, webhook secret, and subscription registry) on both single-site and multisite installs.
 
 == Screenshots ==
-Screenshots are being captured from the live assistant widget and will be added in an upcoming release. The planned shots: the Settings → Cinatra connection page, the floating assistant button in wp-admin, the chat panel open over a post editor, and the connected-instance status view.
+1. Settings → Cinatra: connect to your Cinatra instance, plus the advanced manual-configuration fields.
+2. The floating Cinatra assistant button, shown bottom-right in wp-admin.
+3. The Cinatra assistant chat panel open over the post editor.
 
 == Upgrade Notice ==
 = 0.2.3 =

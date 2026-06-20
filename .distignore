@@ -42,6 +42,10 @@ composer.json
 composer.lock
 phpcs.xml.dist
 
+# Build tooling (the WordPress.org directory-asset generator; not runtime code
+# and not valid plugin source — a stray .mjs would be dev cruft in the zip).
+tools
+
 # Repo docs that are not the wp.org readme (readme.txt DOES ship).
 README.md
 docs
