@@ -3,7 +3,7 @@
     "name": "Cinatra WordPress.org directory asset manifest",
     "description": "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the cinatra-ai/design repo (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
     "designRepo": "cinatra-ai/design",
-    "note": "Screenshots (screenshot-N.png) are captured separately from the live widget UI and are not listed here."
+    "note": "icon/banner derive from the design repo masters; screenshot-N.png are representative mockups of the shipping plugin UI (Settings page copy + the floating button's exact fedora glyph and theme colours), rendered by the same sharp+SVG pipeline. A real browser capture of a live WordPress install can supersede these post-launch."
   },
   "entries": [
     {
@@ -40,6 +40,33 @@
       "dimensions": "1544x500",
       "tokensVersion": "0.1.0",
       "sha256": "03420f3724259b30efff47b3844578eefe5a965ecf1a545da1b1c1cc77f3b4bc",
+      "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
+    },
+    {
+      "path": ".wordpress-org/screenshot-1.png",
+      "source": "plugin UI: cinatra_render_settings_page() in cinatra.php",
+      "colorway": "wp-admin chrome (Settings -> Cinatra)",
+      "dimensions": "1280x800",
+      "tokensVersion": "0.1.0",
+      "sha256": "1d120f17804e33c598a786ab5a3944597bee6ef81519f8443ec952677ba5897f",
+      "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
+    },
+    {
+      "path": ".wordpress-org/screenshot-2.png",
+      "source": "plugin UI: #cw-fallback-btn (assets/cinatra-fallback.css + cinatra.php)",
+      "colorway": "wp-admin chrome + floating assistant button",
+      "dimensions": "1280x800",
+      "tokensVersion": "0.1.0",
+      "sha256": "8563bcfb30c07cc9d1a5b0ac90370bdda97e1f6e13ec77d9f867b6e61e4a0a2e",
+      "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
+    },
+    {
+      "path": ".wordpress-org/screenshot-3.png",
+      "source": "plugin UI: assistant chat panel (assets/cinatra-widget.js .cw-* DOM/CSS)",
+      "colorway": "wp-admin chrome + chat panel open (cream panel, mustard wordmark)",
+      "dimensions": "1280x800",
+      "tokensVersion": "0.1.0",
+      "sha256": "2cadce0e594bb3100ab281a8ad10e22f6d9c424a1ac871b36098949f8e5092eb",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     }
   ]

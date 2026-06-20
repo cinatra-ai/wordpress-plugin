@@ -34,6 +34,10 @@ on:
       - "wporg-v*"
   workflow_dispatch:
     inputs:
+      version:
+        description: "SemVer to publish (e.g. 0.2.3). A manual dispatch has no tag context, so the version must be supplied explicitly."
+        required: true
+        type: string
       dry_run:
         description: "Stage only; do not commit to SVN (action DRY_RUN)."
         required: false
@@ -57,12 +61,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # Resolve the SVN VERSION explicitly. The 10up action defaults VERSION to
+      # the raw tag name and only strips a leading `v`, so a `wporg-vX.Y.Z` tag
+      # would otherwise publish the literal tag as the SVN version. On a tag
+      # push we strip the `wporg-v` prefix (refs/tags/wporg-vX.Y.Z -> X.Y.Z);
+      # on a manual dispatch we take the required `version` input. The value is
+      # written to a step output (consumed by the preflight + deploy steps,
+      # avoiding any GITHUB_ENV step-ordering ambiguity) and fail-closed unless
+      # it is a clean SemVer.
+      - name: Resolve version
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+            case "$tag" in
+              wporg-v*) version="${tag#wporg-v}" ;;
+              *) echo "::error::Unexpected tag '$tag'; this workflow only publishes wporg-v* tags."; exit 1 ;;
+            esac
+          fi
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Resolved version '$version' is not a clean SemVer."; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved publish version: $version"
+
+      # Gate the deploy in THIS workflow (a cross-workflow needs: on ci.yml's
+      # readme-validate does not work across separate files). Assert the
+      # resolved version == readme.txt Stable tag == cinatra.php Version header
+      # before any SVN push; a mismatch fails closed.
+      - name: Preflight version match
+        env:
+          RESOLVED: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          stable="$(grep -E '^Stable tag:[[:space:]]*' readme.txt | head -1 | sed -E 's/^Stable tag:[[:space:]]*//')"
+          header="$(grep -E '^[[:space:]]*\*[[:space:]]*Version:' cinatra.php | head -1 | sed -E 's/.*Version:[[:space:]]*//')"
+          echo "resolved=$RESOLVED  readme Stable tag=$stable  plugin header Version=$header"
+          if [ "$RESOLVED" != "$stable" ] || [ "$RESOLVED" != "$header" ]; then
+            echo "::error::Version mismatch: resolved '$RESOLVED' must equal readme Stable tag '$stable' and plugin header Version '$header'."
+            exit 1
+          fi
+
       - name: WordPress.org plugin deploy
         uses: 10up/action-wordpress-plugin-deploy@54bd289b8525fd23a5c365ec369185f2966529c2 # 2.3.0
         env:
           SVN_USERNAME: ${{ secrets.SVN_USERNAME }}
           SVN_PASSWORD: ${{ secrets.SVN_PASSWORD }}
           SLUG: cinatra
+          # Explicit resolved SemVer (overrides the action's raw-tag default).
+          VERSION: ${{ steps.resolve.outputs.version }}
           # Listing graphics (icons/banners/screenshots) staged into SVN assets/.
           ASSETS_DIR: .wordpress-org
           # workflow_dispatch defaults to a stage-only dry run; a pushed
