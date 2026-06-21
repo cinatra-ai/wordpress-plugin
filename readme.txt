@@ -3,7 +3,7 @@ Contributors: cinatra
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.1.0
+Stable tag: 0.1.1
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -39,5 +39,8 @@ Yes. The assistant connects to your Cinatra account to do its work. Enter your a
 Screenshots of the assistant in WordPress will be added in a later release.
 
 == Changelog ==
+= 0.1.1 =
+* Asset corrections: brand-correct icon, drop fabricated screenshots, simplified readme.
+
 = 0.1.0 =
 * Initial release.
