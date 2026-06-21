@@ -48,6 +48,14 @@ jobs:
           node-version: "20"
       - name: Widget capability-negotiation behavior tests (no bundler required)
         run: node tests/test-widget-negotiation.mjs
+      - name: Widget source-of-truth drift / parity gate (cinatra#411)
+        # Asserts the security-critical invariants on the canonical vendored
+        # widget (assets/cinatra-widget.js): no apiKey in the browser, the
+        # tokenEndpoint broker + short-lived-token Bearer stream, the shared
+        # contract-version set, and NO reintroduction of the dead
+        # /api/{wordpress,drupal}/bundle.js route in shipped/admin/schema strings.
+        # See cinatra docs/widget-source-of-truth.md.
+        run: node tools/widget-parity-check.mjs
 
   readme-validate:
     runs-on: ubuntu-latest
