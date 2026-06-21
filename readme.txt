@@ -8,39 +8,46 @@ Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Adds the Cinatra AI assistant to your WordPress admin so you can draft and revise content with help, right where you work.
+Adds an AI assistant to your WordPress admin, powered by your own Cinatra instance, so you can draft and improve content right where you work.
 
 == Description ==
-Cinatra puts an AI writing assistant inside your WordPress admin. A small button sits in the bottom-right corner of wp-admin; click it to open a chat panel and ask the assistant to help you draft a post, rewrite a paragraph, tighten a headline, or sketch out an idea — without leaving the page you are editing.
+Cinatra puts an AI assistant inside your WordPress admin. A small button sits in the bottom-right corner of wp-admin; click it to open a chat panel and ask the assistant to help you draft a post, rewrite a paragraph, tighten a headline, or answer a question while you work.
 
-The assistant is powered by your own Cinatra account. Once it is connected, anyone who manages your site can use it.
+Because it runs through your own Cinatra instance, it isn't a generic writing tool. It can draw on what your instance is set up to do, including your AI agents and the tools, data, and knowledge you have connected, and bring that capability straight into your CMS. (For the assistant to use WordPress AI tools, also install the companion WordPress MCP Adapter plugin; the assistant still works without it.)
+
+The plugin is built for safe connections: your long-lived integration key stays on the server and is never exposed to the browser — the assistant streams through a short-lived, site-bound token instead.
 
 == Installation ==
 1. Install the plugin from the Plugins screen in WordPress, or upload the plugin folder and activate it from the Plugins menu.
 2. Go to Settings → Cinatra.
-3. Enter the web address (URL) of your Cinatra account and click "Connect with Cinatra".
-4. Approve the connection when Cinatra asks. That's it — the assistant button now appears in your admin.
+3. Enter the web address (URL) of your Cinatra instance and click "Connect with Cinatra".
+4. Approve the connection when Cinatra asks. Once your instance confirms it supports the assistant, the button appears in your admin. (Older or incompatible instances will not load the assistant.)
 
 == Frequently Asked Questions ==
 
 = What does the assistant help me do? =
-It helps you write and edit content in WordPress: drafting new posts, rewriting or shortening text, suggesting headlines, and answering questions as you work.
+It's an AI assistant built right into the editor. It helps you draft, rewrite, shorten, retitle, and improve content and answer questions while you work. Because it runs through your own Cinatra instance, it isn't a generic writing tool — it can draw on what your instance is set up to do, including your AI agents and the tools, data, and knowledge you've connected, and bring that capability straight into your CMS.
 
 = How do I connect it? =
-Go to Settings → Cinatra, enter the web address of your Cinatra account, click "Connect with Cinatra", and approve the connection.
+Go to Settings → Cinatra, enter the web address of your Cinatra instance, click "Connect with Cinatra", and approve the connection.
 
 = Who can use the assistant? =
 Anyone who can manage your WordPress site (site administrators). The assistant and its settings are only shown to those users.
 
 = Do I need a Cinatra account? =
-Yes. The assistant connects to your Cinatra account to do its work. Enter your account's web address on the Settings → Cinatra page to get started.
+You need access to a running Cinatra instance. Cinatra is an open-source AI platform that you or your organisation host and connect the assistant to — learn more and get the source at https://www.cinatra.ai. Once your instance is running, open the Cinatra settings, enter the instance's web address, and connect.
 
 == Screenshots ==
-Screenshots of the assistant in WordPress will be added in a later release.
+1. The Settings → Cinatra page: enter your instance's web address and click "Connect with Cinatra" to provision the connection. No key is copied or pasted.
+2. The assistant in action — the chat panel open over the post editor, asked to make a headline more engaging and tighten the opening paragraph.
 
 == Changelog ==
 = 0.1.1 =
-* Asset corrections: brand-correct icon, drop fabricated screenshots, simplified readme.
+* One-click "Connect with Cinatra": enter your instance's web address and approve a consent screen — no more copying and pasting a key.
+* Safer connections: your long-lived integration key now stays on the server and is never exposed to the browser; the assistant streams through a short-lived, site-bound token.
+* The assistant can use your WordPress AI tools through the chat when the companion WordPress MCP Adapter plugin is installed, so it can do more than plain text editing.
+* More reliable connections to self-hosted Cinatra instances, including instances you run on your own infrastructure.
+* The assistant now requires a Cinatra instance that supports the assistant connection; it no longer loads against older, incompatible instances.
 
 = 0.1.0 =
 * Initial release.
