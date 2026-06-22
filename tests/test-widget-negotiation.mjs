@@ -41,6 +41,11 @@ function check(label, cond) {
 // negotiation; once attachShadow returns a stub the rest of mountWidget runs.
 function makeEnv(fetchImpl, sharedRoot, captured) {
   let attachShadowCount = 0;
+  // Required-login (cinatra#410): the login handshake needs Web Crypto, btoa,
+  // window.open, and a captured window 'message' listener. The send-happy-path
+  // test drives a real login through these before streaming.
+  const messageListeners = [];
+  const openedPopups = [];
 
   function makeStubEl(isRoot) {
     const el = {
@@ -61,6 +66,13 @@ function makeEnv(fetchImpl, sharedRoot, captured) {
         if (captured) { captured.textarea = this; }
       },
       get placeholder() { return this._placeholder; },
+      // Identify the login button by its label so a test can fire ONLY its click
+      // handler (the send-happy-path drives login then send distinctly).
+      set textContent(v) {
+        this._textContent = v;
+        if (captured && v === "Sign in with Cinatra") { captured.loginBtnEl = this; }
+      },
+      get textContent() { return this._textContent; },
       setAttribute(k, v) { this.attributes[k] = v; },
       getAttribute(k) { return this.attributes[k]; },
       appendChild(c) { this.children.push(c); return c; },
@@ -111,19 +123,37 @@ function makeEnv(fetchImpl, sharedRoot, captured) {
       CinatraConfig: {
         cinatraUrl: "https://instance.example",
         tokenEndpoint: "https://site.example/wp-json/cinatra/v1/token",
+        // Required-login broker relays (cinatra#410).
+        authInitEndpoint: "https://site.example/wp-json/cinatra/v1/widget-auth/init",
+        authTokenEndpoint: "https://site.example/wp-json/cinatra/v1/widget-auth/token",
+        nonce: "test-nonce",
         instanceId: "i1",
       },
       sessionStorage: storage,
       innerWidth: 1280,
       innerHeight: 800,
       location: { href: "https://site.example/wp-admin/", reload() {} },
-      addEventListener() {},
+      // Capture 'message' listeners so a test can deliver a hosted-auth postMessage.
+      addEventListener(type, handler) { if (type === "message") { messageListeners.push(handler); } },
+      removeEventListener() {},
+      // window.open returns a fake popup the widget tracks; record it.
+      open(url) { const popup = { url, closed: false, close() { this.closed = true; } }; openedPopups.push(popup); return popup; },
+      // crypto.subtle.digest yields a deterministic 32-byte buffer (the challenge
+      // value is opaque to this test — only the handshake flow matters).
+      crypto: {
+        getRandomValues(arr) { for (let i = 0; i < arr.length; i++) { arr[i] = (i * 7 + 3) & 0xff; } return arr; },
+        subtle: { async digest() { return new ArrayBuffer(32); } },
+      },
     },
     document: documentStub,
     console,
     fetch: fetchImpl,
     setTimeout: (fn) => { return 0; }, // negotiation timer never needs to fire here
     clearTimeout: () => {},
+    setInterval: () => { return 0; },  // popup-close watch never needs to fire here
+    clearInterval: () => {},
+    btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+    TextEncoder,
     AbortController: class {
       constructor() { this.signal = {}; }
       abort() {}
@@ -135,12 +165,19 @@ function makeEnv(fetchImpl, sharedRoot, captured) {
     Date,
     Math,
     String,
+    Uint8Array,
     URL, // WHATWG URL — used by the widget's same-origin streamPath resolution.
     TextDecoder: class { decode() { return ""; } },
   };
+  // The widget references bare `crypto` / `btoa` (not window.*) in places; mirror.
+  sandbox.crypto = sandbox.window.crypto;
   sandbox.window.document = documentStub;
   sandbox.globalThis = sandbox;
-  return { sandbox, rootEl, attachShadowCount: () => attachShadowCount };
+  return {
+    sandbox, rootEl,
+    attachShadowCount: () => attachShadowCount,
+    messageListeners, openedPopups,
+  };
 }
 
 function jsonResponse(status, body) {
@@ -324,20 +361,35 @@ async function main() {
     );
   }
 
-  // SEND-SITE HAPPY PATH (behavioral): a healthy same-origin instance, after
-  // mounting, drives a real user message through the reordered send code:
-  // origin re-assertion passes -> getStreamToken() mints once -> the stream URL
-  // (same instance origin) is POSTed with the Bearer token. This proves the
-  // reordering did not regress the working path.
+  // REQUIRED-LOGIN GATE (cinatra#410, behavioral): a healthy same-origin instance
+  // mounts in LOGIN mode (no per-user token), so a user message must NOT stream
+  // until login completes. This drives the full hosted-PKCE handshake (init via
+  // the broker -> popup -> postMessage -> token via the broker -> opaque cwu_)
+  // and then a real send, asserting:
+  //   * before login: a send attempt does NOT POST the stream (token-less stream
+  //     can never slip through);
+  //   * the login init + token relays are POSTed same-origin to OUR broker (the
+  //     cnx_ never leaves the server) with the X-WP-Nonce CSRF header;
+  //   * after login: the stream POST carries BOTH the cit_ Bearer AND the
+  //     X-Cinatra-Widget-User-Token: cwu_ dual token (#408).
   {
     const TOKEN_ENDPOINT = "https://site.example/wp-json/cinatra/v1/token";
+    const AUTH_INIT = "https://site.example/wp-json/cinatra/v1/widget-auth/init";
+    const AUTH_TOKEN = "https://site.example/wp-json/cinatra/v1/widget-auth/token";
     const STREAM_URL = "https://instance.example/api/agents/wordpress-content-editor/stream";
+    const INSTANCE_ORIGIN = "https://instance.example";
     const fetched = [];
-    // /capabilities + /token => JSON; the stream POST => an empty SSE body.
+    let initState = null;   // capture the `state` the widget sent on init.
     const fetchImpl = (url, opts) => {
       const u = String(url);
-      fetched.push({ url: u, method: (opts && opts.method) || "GET", headers: (opts && opts.headers) || {} });
+      const body = (opts && opts.body) ? JSON.parse(opts.body) : null;
+      fetched.push({ url: u, method: (opts && opts.method) || "GET", headers: (opts && opts.headers) || {}, body });
       if (u.indexOf("/capabilities") !== -1) { return jsonResponse(200, HEALTHY); }
+      if (u === AUTH_INIT) {
+        initState = body && body.state;
+        return jsonResponse(200, { txnId: "txn1", authorizeUrl: INSTANCE_ORIGIN + "/widget-auth?txn=txn1", instanceId: "i1" });
+      }
+      if (u === AUTH_TOKEN) { return jsonResponse(200, { token: "cwu_user-tok", tokenType: "Bearer", expiresIn: 900 }); }
       if (u === TOKEN_ENDPOINT) { return jsonResponse(200, { token: "stream-tok", expiresIn: 300 }); }
       // The stream response: ok + a reader that immediately reports done.
       return Promise.resolve({
@@ -349,29 +401,66 @@ async function main() {
       });
     };
 
-    // Capture the submit click handler + the textarea so we can drive a send.
-    const captured = { clickHandlers: [], textarea: null };
+    const captured = { clickHandlers: [], textarea: null, loginBtnEl: null };
     const env = makeEnv(fetchImpl, undefined, captured);
     vm.runInNewContext(WIDGET_SRC, env.sandbox, { filename: "cinatra-widget.js" });
     for (let i = 0; i < 20; i++) { await Promise.resolve(); }
     const mounted = env.rootEl.dataset.cinatraMounted === "true";
 
-    let sent = false;
-    if (mounted && captured.textarea && captured.clickHandlers.length) {
+    // (1) Pre-login: a send attempt must NOT reach the stream (login gate).
+    let preLoginStreamed = false;
+    if (mounted && captured.textarea) {
       captured.textarea.value = "hello";
-      // Fire every captured click handler; doSubmit() reads textarea.value and
-      // calls sendMessage(). Only the submit button's handler will send.
+      // Fire the submit handler directly (the doSubmit -> sendMessage path).
+      for (const h of captured.clickHandlers) { try { h({ stopPropagation() {} }); } catch (_) {} }
+      for (let i = 0; i < 20; i++) { await Promise.resolve(); }
+      preLoginStreamed = fetched.some((f) => f.url === STREAM_URL && f.method === "POST");
+    }
+    check(
+      "login gate: pre-login send does NOT POST the stream (token-less stream blocked)",
+      mounted && !preLoginStreamed,
+    );
+
+    // (2) Drive the login handshake: click the login button, then deliver the
+    //     hosted popup's postMessage (origin = instance origin, matching state).
+    let loggedIn = false;
+    if (mounted && captured.loginBtnEl && captured.loginBtnEl._clickHandlers.length) {
+      for (const h of captured.loginBtnEl._clickHandlers) { try { h({}); } catch (_) {} }
+      for (let i = 0; i < 20; i++) { await Promise.resolve(); }
+      // Deliver the success postMessage from the popup window.
+      const popup = env.openedPopups[env.openedPopups.length - 1];
+      for (const listener of env.messageListeners) {
+        try { listener({ origin: INSTANCE_ORIGIN, source: popup, data: { type: "cinatra-widget-auth", code: "auth-code-1", state: initState } }); } catch (_) {}
+      }
+      for (let i = 0; i < 30; i++) { await Promise.resolve(); }
+      loggedIn = true;
+    }
+    const initPost = fetched.find((f) => f.url === AUTH_INIT && f.method === "POST");
+    const tokenPost = fetched.find((f) => f.url === AUTH_TOKEN && f.method === "POST");
+    const initNonceOk = !!initPost && initPost.headers["X-WP-Nonce"] === "test-nonce";
+    const tokenNonceOk = !!tokenPost && tokenPost.headers["X-WP-Nonce"] === "test-nonce";
+    const verifierSent = !!tokenPost && tokenPost.body && typeof tokenPost.body.codeVerifier === "string" && tokenPost.body.codeVerifier.length > 0;
+    check(
+      "login handshake: init+token relayed to OUR broker (same-origin) with X-WP-Nonce + PKCE verifier",
+      loggedIn && initNonceOk && tokenNonceOk && verifierSent,
+    );
+
+    // (3) Post-login: a real send streams with BOTH the cit_ Bearer and the
+    //     dual cwu_ user token. Token minted exactly once.
+    let sent = false;
+    if (loggedIn && captured.textarea) {
+      captured.textarea.value = "hello again";
       for (const h of captured.clickHandlers) { try { h({ stopPropagation() {} }); } catch (_) {} }
       for (let i = 0; i < 30; i++) { await Promise.resolve(); }
       sent = true;
     }
-
-    const tokenMints = fetched.filter((f) => f.url === TOKEN_ENDPOINT).length;
     const streamPost = fetched.find((f) => f.url === STREAM_URL && f.method === "POST");
     const bearerOk = !!streamPost && /^Bearer stream-tok$/.test(String(streamPost.headers.Authorization || ""));
+    const dualTokenOk = !!streamPost && streamPost.headers["X-Cinatra-Widget-User-Token"] === "cwu_user-tok";
+    const tokenMints = fetched.filter((f) => f.url === TOKEN_ENDPOINT).length;
     check(
-      "send happy path: healthy mount -> token minted exactly once + same-origin stream POST with Bearer",
-      mounted && sent && tokenMints === 1 && bearerOk,
+      "send happy path: post-login stream POST carries cit_ Bearer + cwu_ dual token; cit_ minted once",
+      mounted && sent && bearerOk && dualTokenOk && tokenMints === 1,
     );
   }
 

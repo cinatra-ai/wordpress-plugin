@@ -1217,13 +1217,18 @@ function cinatra_enqueue_widget(): void {
 		'cinatra',
 		'CinatraConfig',
 		array(
-			'contractVersion' => CINATRA_CONTRACT_VERSION,
-			'cinatraUrl'      => rtrim( $url, '/' ),
+			'contractVersion'   => CINATRA_CONTRACT_VERSION,
+			'cinatraUrl'        => rtrim( $url, '/' ),
 			// No apiKey. The browser obtains a short-lived token from this endpoint.
-			'tokenEndpoint'   => rest_url( 'cinatra/v1/token' ),
-			'nonce'           => wp_create_nonce( 'wp_rest' ),
-			'instanceId'      => $instance_id,
-			'wpAdminUrl'      => admin_url(),
+			'tokenEndpoint'     => rest_url( 'cinatra/v1/token' ),
+			// Required-login (cinatra#410): same-origin broker relays for the
+			// per-user PKCE handshake. The long-lived cnx_ key stays server-side;
+			// these routes present it server-to-server to /api/widget-auth/*.
+			'authInitEndpoint'  => rest_url( 'cinatra/v1/widget-auth/init' ),
+			'authTokenEndpoint' => rest_url( 'cinatra/v1/widget-auth/token' ),
+			'nonce'             => wp_create_nonce( 'wp_rest' ),
+			'instanceId'        => $instance_id,
+			'wpAdminUrl'        => admin_url(),
 		)
 	);
 }
@@ -1289,6 +1294,35 @@ add_action(
 				},
 			)
 		);
+
+			// Required-login (cinatra#410): per-user PKCE handshake relays. The
+			// browser POSTs here (same-origin, wp_rest nonce, manage_options); the
+			// PHP backend presents the long-lived cnx_ key server-to-server to the
+			// instance widget-auth endpoints and returns ONLY the upstream envelope
+			// (no key, no internals). Mirrors /token above.
+			register_rest_route(
+				'cinatra/v1',
+				'/widget-auth/init',
+				array(
+					'methods'             => 'POST',
+					'callback'            => 'cinatra_rest_widget_auth_init',
+					'permission_callback' => function () {
+						return current_user_can( 'manage_options' );
+					},
+				)
+			);
+
+			register_rest_route(
+				'cinatra/v1',
+				'/widget-auth/token',
+				array(
+					'methods'             => 'POST',
+					'callback'            => 'cinatra_rest_widget_auth_token',
+					'permission_callback' => function () {
+						return current_user_can( 'manage_options' );
+					},
+				)
+			);
 
 		register_rest_route(
 			'cinatra/v1',
@@ -1513,6 +1547,189 @@ function cinatra_rest_mint_token( WP_REST_Request $request ): WP_REST_Response {
 			'scope'           => isset( $json['scope'] ) ? (string) $json['scope'] : ( CINATRA_AGENT_SLUG . '.stream' ),
 		),
 		200
+	);
+}
+
+/**
+ * Remove the long-lived integration key from a string before it is logged.
+ *
+ * The widget-auth relays carry the per-user code/codeVerifier outbound and the
+ * long-lived key in the Authorization header; a buggy/proxy/debug upstream could
+ * echo any of those into an error string. We cannot enumerate every transient
+ * secret, but the durable, highest-value one — the long-lived key — is redacted
+ * here so it can never land in a WordPress log. Mirrors the Drupal broker's
+ * scrub(). A blank key returns the text unchanged.
+ *
+ * @param string $text    The text about to be logged.
+ * @param string $api_key The long-lived integration key to redact.
+ * @return string The text with the key replaced by [redacted].
+ */
+function cinatra_scrub_secret( string $text, string $api_key ): string {
+	if ( '' === $api_key ) {
+		return $text;
+	}
+	return str_replace( $api_key, '[redacted]', $text );
+}
+
+/**
+ * Shared server-to-server relay for the per-user widget-auth handshake
+ * (cinatra#410). Validates the wp_rest nonce, presents the long-lived cnx_ key
+ * server-to-server to the instance's /api/widget-auth/{init,token} endpoint with
+ * the caller-whitelisted JSON, and returns ONLY the whitelisted upstream
+ * envelope to the browser. The long-lived key never reaches JS, and upstream
+ * error bodies are never reflected (generic message only). Mirrors the
+ * cinatra_rest_mint_token transport.
+ *
+ * @param WP_REST_Request $request The incoming REST request (wp_rest nonce + JSON params).
+ * @param string          $segment The upstream path segment ('init' or 'token').
+ * @param array           $fields  Whitelisted request-field names to forward.
+ * @param array           $passthrough Whitelisted response-field names to return.
+ * @return WP_REST_Response The upstream envelope (whitelisted), or an error response.
+ */
+function cinatra_rest_widget_auth_relay( WP_REST_Request $request, string $segment, array $fields, array $passthrough ): WP_REST_Response {
+	// CSRF: a valid wp_rest nonce must accompany the cookie-authenticated call.
+	$nonce = $request->get_header( 'X-WP-Nonce' );
+	if ( empty( $nonce ) || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+		return new WP_REST_Response( array( 'error' => __( 'Invalid or missing nonce.', 'cinatra' ) ), 403 );
+	}
+
+	$url     = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
+	$api_key = (string) get_option( 'cinatra_api_key', '' );
+	if ( empty( $url ) || empty( $api_key ) ) {
+		return new WP_REST_Response(
+			array( 'error' => __( 'Cinatra URL or API key is not configured.', 'cinatra' ) ),
+			500
+		);
+	}
+
+	// Forward ONLY whitelisted JSON fields the widget is allowed to set. The
+	// instance derives the rest (txn binding, the agent's instances config key,
+	// the user identity from the authenticated login). We never forward arbitrary
+	// keys, and never echo the long-lived key.
+	$params  = $request->get_json_params();
+	$forward = array();
+	if ( is_array( $params ) ) {
+		foreach ( $fields as $field ) {
+			if ( array_key_exists( $field, $params ) && null !== $params[ $field ] ) {
+				$forward[ $field ] = $params[ $field ];
+			}
+		}
+	}
+
+	// Route the TRANSPORT to the container-reachable base when CINATRA_BASE_URL is
+	// set (dev/container topology), else the configured cinatra_url (production).
+	$server_base = cinatra_server_base_url( $url );
+	$endpoint    = $server_base . '/api/widget-auth/' . $segment;
+
+	// Assert THIS site's own origin on the server-to-server relay. The instance's
+	// /api/widget-auth/{init,token} enforces a paired Origin === the `cnx_`
+	// credential's bound connect-site origin (fail-closed: a missing Origin is
+	// rejected). We derive the origin from admin_url() — the SAME source the
+	// connect handshake used to register this site's `widget_origin` (see the
+	// connect-start payload) — so a split front-end/admin origin install still
+	// asserts the registered origin and matches. The relay cannot spoof another
+	// site because the credential_hash must ALSO match the same connect-site row,
+	// so this header is identity assertion, not a trust grant. The browser never
+	// reaches this endpoint (server-to-server only).
+	$site_origin   = cinatra_site_origin( admin_url() );
+	$relay_headers = array(
+		'Authorization' => 'Bearer ' . $api_key,
+		'Content-Type'  => 'application/json',
+		'Accept'        => 'application/json',
+	);
+	if ( '' !== $site_origin ) {
+		$relay_headers['Origin'] = $site_origin;
+	}
+
+	$response = cinatra_server_post(
+		$endpoint,
+		array(
+			'timeout' => 10,
+			'headers' => $relay_headers,
+			'body'    => wp_json_encode( $forward ),
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		// Log the transport detail server-side; return a generic message so we
+		// never reflect low-level/internal error text to the browser. SCRUB the
+		// long-lived key first: a buggy/proxy upstream error could echo the
+		// outgoing Authorization: Bearer cnx_... back into the message, and these
+		// widget-auth relays carry the per-user code/codeVerifier, so the key must
+		// never reach WP logs.
+		error_log( '[cinatra] widget-auth ' . $segment . ' endpoint unreachable: ' . cinatra_scrub_secret( $response->get_error_message(), $api_key ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; the long-lived key is scrubbed and the detail is never reflected to the browser.
+		return new WP_REST_Response(
+			array( 'error' => __( 'Could not reach the Cinatra instance. Check the connector URL, or contact your administrator.', 'cinatra' ) ),
+			502
+		);
+	}
+
+	$status = (int) wp_remote_retrieve_response_code( $response );
+	$raw    = (string) wp_remote_retrieve_body( $response );
+	$json   = json_decode( $raw, true );
+
+	if ( $status < 200 || $status >= 300 || ! is_array( $json ) ) {
+		// Never reflect the upstream body to the browser. Log server-side (with
+		// the long-lived key scrubbed); return a generic, actionable message.
+		// Always 502 from the browser's view.
+		$detail = ( is_array( $json ) && ! empty( $json['error'] ) ) ? (string) $json['error'] : substr( $raw, 0, 500 );
+		error_log( '[cinatra] widget-auth ' . $segment . ' failed (HTTP ' . $status . '): ' . cinatra_scrub_secret( $detail, $api_key ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; the long-lived key is scrubbed and the detail is never reflected to the browser.
+		return new WP_REST_Response(
+			array( 'error' => __( 'Cinatra could not complete sign-in. Check the connector settings, or contact your administrator.', 'cinatra' ) ),
+			502
+		);
+	}
+
+	// Return ONLY the whitelisted upstream fields to the browser.
+	$out = array();
+	foreach ( $passthrough as $key ) {
+		if ( array_key_exists( $key, $json ) ) {
+			$out[ $key ] = $json[ $key ];
+		}
+	}
+	$resp = new WP_REST_Response( $out, 200 );
+	// The redeem response carries the opaque per-user token; never cache it.
+	$resp->header( 'Cache-Control', 'no-store, private' );
+	return $resp;
+}
+
+/**
+ * REST: start the per-user widget-auth PKCE handshake (cinatra#410).
+ *
+ * Forwards the PKCE challenge + state to /api/widget-auth/init server-to-server
+ * (presenting the long-lived cnx_ key) and returns the {txnId, authorizeUrl,
+ * instanceId} envelope. The browser opens authorizeUrl as the hosted login
+ * popup; raw credentials never touch this CMS DOM.
+ *
+ * @param WP_REST_Request $request The incoming REST request.
+ * @return WP_REST_Response The init envelope, or an error response.
+ */
+function cinatra_rest_widget_auth_init( WP_REST_Request $request ): WP_REST_Response {
+	return cinatra_rest_widget_auth_relay(
+		$request,
+		'init',
+		array( 'client', 'agentSlug', 'codeChallenge', 'codeChallengeMethod', 'state', 'instanceId' ),
+		array( 'txnId', 'authorizeUrl', 'instanceId' )
+	);
+}
+
+/**
+ * REST: redeem the authorization code for the opaque per-user token (cinatra#410).
+ *
+ * Forwards {grantType, client, agentSlug, code, codeVerifier} to
+ * /api/widget-auth/token server-to-server (presenting the long-lived cnx_ key)
+ * and returns the {token: cwu_..., tokenType, expiresIn, scope} envelope. The
+ * browser sends that token on the dual-token stream (cinatra#408).
+ *
+ * @param WP_REST_Request $request The incoming REST request.
+ * @return WP_REST_Response The token envelope, or an error response.
+ */
+function cinatra_rest_widget_auth_token( WP_REST_Request $request ): WP_REST_Response {
+	return cinatra_rest_widget_auth_relay(
+		$request,
+		'token',
+		array( 'grantType', 'client', 'agentSlug', 'code', 'codeVerifier' ),
+		array( 'token', 'tokenType', 'expiresIn', 'scope' )
 	);
 }
 
