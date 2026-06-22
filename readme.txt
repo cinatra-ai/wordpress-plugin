@@ -38,7 +38,7 @@ Anyone who can manage your WordPress site (site administrators). The assistant a
 You need access to a running Cinatra instance. Cinatra is an open source AI platform that you or your organisation host and connect the assistant to — learn more and get the source at https://www.cinatra.ai. Once your instance is running, open the Cinatra settings, enter the instance's web address, and connect.
 
 == Screenshots ==
-1. The Cinatra assistant in action — the chat panel open over the post editor, asked to make a headline more engaging and tighten the opening paragraph.
+1. The Cinatra assistant in action — the chat panel open over the post editor, asked to rewrite the article's title. It shows a clear before-and-after of the headline change it applied.
 2. Sign in with your Cinatra account. The assistant works with your own permissions, so you only do what you are already allowed to do on the site.
 3. Connect the plugin to your Cinatra instance from Settings → Cinatra: enter your instance's web address and click "Connect with Cinatra". No key is copied or pasted.
 
