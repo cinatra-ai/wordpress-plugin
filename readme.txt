@@ -3,7 +3,7 @@ Contributors: ordnas
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.1.1
+Stable tag: 0.1.2
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -40,9 +40,12 @@ You need access to a running Cinatra instance. Cinatra is an open source AI plat
 == Screenshots ==
 1. The Cinatra assistant in action — the chat panel open over the post editor, asked to rewrite the article's title. It shows a clear before-and-after of the headline change it applied.
 2. Sign in with your Cinatra account. The assistant works with your own permissions, so you only do what you are already allowed to do on the site.
-3. Connect the plugin to your Cinatra instance from Settings → Cinatra: enter your instance's web address and click "Connect with Cinatra". No key is copied or pasted.
+3. Connect the plugin to your Cinatra instance from Settings → Cinatra: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
 
 == Changelog ==
+= 0.1.2 =
+* Fix a screenshot caption that broke the plugin page's image rendering.
+
 = 0.1.1 =
 * One-click "Connect with Cinatra": enter your instance's web address and approve a consent screen — no more copying and pasting a key.
 * Safer connections: your long-lived integration key now stays on the server and is never exposed to the browser; the assistant streams through a short-lived, site-bound token.
