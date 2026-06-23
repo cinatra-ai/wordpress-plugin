@@ -1,0 +1,62 @@
+name: wporg-readme-resync
+
+# Resync readme.txt to the WordPress.org plugin SVN (trunk + the current Stable
+# tag) WITHOUT cutting a new version. For readme/caption fixes that must reach
+# the live listing without bumping the plugin version (the 10up deploy action
+# aborts on an existing tag, so a re-deploy can't update an already-published
+# version's readme). Manual trigger only.
+#
+# wp.org renders the readme of the Stable tag for the public page, so both
+# trunk/readme.txt and tags/<stable>/readme.txt are updated to keep them in sync.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: wporg-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Resync readme.txt to trunk + stable tag (no version change)
+        env:
+          SVN_USERNAME: ${{ secrets.WPORG_SVN_USERNAME }}
+          SVN_PASSWORD: ${{ secrets.WPORG_SVN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          SLUG=cinatra
+          STABLE="$(sed -n -E 's/^Stable tag:[[:space:]]*([^[:space:]]+).*/\1/p' readme.txt | head -n1)"
+          if [ -z "$STABLE" ]; then echo "::error::could not read Stable tag from readme.txt"; exit 1; fi
+          echo "stable tag: $STABLE"
+
+          sudo apt-get update -qq && sudo apt-get install -y -qq subversion
+
+          svn checkout "https://plugins.svn.wordpress.org/${SLUG}/trunk" trunk-wc --non-interactive
+          svn checkout "https://plugins.svn.wordpress.org/${SLUG}/tags/${STABLE}" tag-wc --non-interactive
+
+          cp readme.txt trunk-wc/readme.txt
+          cp readme.txt "tag-wc/readme.txt"
+
+          commit_if_changed() {
+            wc="$1"; label="$2"
+            ( cd "$wc"
+              if [ -n "$(svn status)" ]; then
+                svn status
+                svn commit -m "Resync readme.txt: fix screenshot-3 caption rendering (drop arrow char that broke the <img alt>); no version change" \
+                  --no-auth-cache --non-interactive \
+                  --username "$SVN_USERNAME" --password "$SVN_PASSWORD"
+                echo "${label}: committed"
+              else
+                echo "${label}: no change"
+              fi )
+          }
+
+          commit_if_changed trunk-wc trunk
+          commit_if_changed tag-wc "tag/${STABLE}"

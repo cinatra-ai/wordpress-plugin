@@ -40,7 +40,7 @@ You need access to a running Cinatra instance. Cinatra is an open source AI plat
 == Screenshots ==
 1. The Cinatra assistant in action — the chat panel open over the post editor, asked to rewrite the article's title. It shows a clear before-and-after of the headline change it applied.
 2. Sign in with your Cinatra account. The assistant works with your own permissions, so you only do what you are already allowed to do on the site.
-3. Connect the plugin to your Cinatra instance from Settings → Cinatra: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
+3. Connect the plugin to your Cinatra instance from the Cinatra settings page: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
 
 == Changelog ==
 = 0.1.2 =
