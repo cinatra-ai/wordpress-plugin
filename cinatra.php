@@ -3,7 +3,7 @@
  * Plugin Name: Cinatra
  * Plugin URI: https://cinatra.ai
  * Description: Embeds the Cinatra AI assistant chat widget in WordPress admin. Floating button bottom-right; opens chat panel on click.
- * Version: 0.1.1
+ * Version: 0.1.2
  * Author: Cinatra
  * Requires at least: 5.9
  * Tested up to: 7.0
