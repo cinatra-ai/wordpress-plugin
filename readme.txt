@@ -1,5 +1,5 @@
 === Cinatra ===
-Contributors: cinatra
+Contributors: ordnas
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
