@@ -11,9 +11,9 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 Adds an AI assistant to your WordPress admin, powered by your own Cinatra instance, so you can draft and improve content right where you work.
 
 == Description ==
-Cinatra puts an AI assistant inside your WordPress admin. A small button sits in the bottom-right corner of wp-admin; click it to open a chat panel and ask the assistant to help you draft a post, rewrite a paragraph, tighten a headline, or answer a question while you work.
+This plugin puts an AI assistant inside your WordPress admin. A small button sits in the bottom-right corner of wp-admin; click it to open a chat panel and ask the assistant to help you draft a post, rewrite a paragraph, tighten a headline, or answer a question while you work.
 
-Because it runs through your own Cinatra instance, it isn't a generic writing tool. It can draw on what your instance is set up to do, including your AI agents and the tools, data, and knowledge you have connected, and bring that capability straight into your CMS. (For the assistant to use WordPress AI tools, also install the companion WordPress MCP Adapter plugin; the assistant still works without it.)
+Because it runs through your own [Cinatra](https://cinatra.ai) instance, it isn't a generic writing tool. It can draw on what your Cinatra instance is set up to do, including your AI agents and the tools, data, and knowledge you have connected, and bring that capability straight into your CMS. (For the assistant to use WordPress AI tools, also install the companion WordPress MCP Adapter plugin; the assistant still works without it.)
 
 The plugin is built for safe connections: your long-lived integration key stays on the server and is never exposed to the browser — the assistant streams through a short-lived, site-bound token instead.
 
