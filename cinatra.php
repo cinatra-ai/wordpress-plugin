@@ -3,7 +3,7 @@
  * Plugin Name: Cinatra
  * Plugin URI: https://cinatra.ai
  * Description: Embeds the Cinatra AI assistant chat widget in WordPress admin. Floating button bottom-right; opens chat panel on click.
- * Version: 0.1.2
+ * Version: 0.1.3
  * Author: Cinatra
  * Requires at least: 5.9
  * Tested up to: 7.0
@@ -1840,4 +1840,256 @@ function cinatra_get_webhook_subscriptions(): array {
 function cinatra_save_webhook_subscriptions( array $subscriptions ): void {
 	update_option( 'cinatra_webhook_subscriptions', wp_json_encode( array_values( $subscriptions ) ) );
 }
+
+// ---------------------------------------------------------------------------
+// Publish emitter (wp#48). On a post transitioning INTO 'publish' this fires a
+// signed server-to-server webhook to the connected Cinatra instance so the
+// agent can react to newly-published content.
+//
+// WIRE CONTRACT — pinned to the MERGED host bridge
+// (cinatra: src/app/api/webhooks/wordpress/route.ts +
+// packages/webhooks/src/verify.ts `verifyLegacyHmac`):
+// - TARGET   : {cinatra_url}/api/webhooks/wordpress — the simple per-site
+// shared-secret route. The transport base is resolved through
+// cinatra_server_base_url() and the POST goes via the SSRF-safe
+// cinatra_server_post(); the plugin never posts to an operator-entered
+// target_url (that would be an SSRF surface) and never to the generic
+// webhook/.../<bindingId> bridge (needs a server-issued opaque binding id
+// the plugin does not hold).
+// - SIGNING  : a bespoke legacy HMAC — header `X-Cinatra-Sig-256: sha256=<hex>`
+// where <hex> = hash_hmac('sha256', $raw_body, $secret) over the EXACT bytes
+// posted. The body is JSON-encoded ONCE and the same string is both signed
+// and sent. (The issue TITLE says "Standard-Webhooks"; the merged host
+// bridge verifies this legacy HMAC, so we follow the merged contract. See
+// the PR for the discrepancy note.)
+// - PAYLOAD  : the exact strict host Zod schema —
+// { event:"post_published", postId:int>0, postType:string, title:string,
+// url?:string, siteUrl:string, issuedAt:string }.
+// - IDEMPOTENCY: `X-Cinatra-Webhook-Id` is STABLE per publish event (derived
+// from the site instance id + post id + post_modified_gmt) so a retried
+// delivery carries the same id and the host can dedupe.
+//
+// SAFETY: emission is fire-and-forget — it NEVER blocks or fails a publish, only
+// ever posts to the operator-configured cinatra_url via the SSRF-safe helper
+// (no arbitrary host), and logs only fixed text + an HTTP status on failure
+// (never the secret, signature, raw body, title, or any upstream response body).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the publish-webhook endpoint URL for the configured Cinatra instance.
+ *
+ * Resolves the transport base through cinatra_server_base_url() (so a validated
+ * CINATRA_BASE_URL container override redirects the TRANSPORT in dev, while
+ * production uses the configured cinatra_url unchanged) and appends the fixed
+ * simple-route path. Returns '' when no instance URL is configured.
+ *
+ * @return string The full endpoint URL, or '' when cinatra_url is unset.
+ */
+function cinatra_publish_webhook_endpoint(): string {
+	$base = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
+	if ( '' === $base ) {
+		return '';
+	}
+	$transport = cinatra_server_base_url( $base );
+	return rtrim( $transport, '/' ) . '/api/webhooks/wordpress';
+}
+
+/**
+ * Whether a stored webhook subscription enables 'post_published' emission for
+ * the given post.
+ *
+ * Returns true iff a subscription row has event_type === 'post_published' AND
+ * its post_types filter is either empty (all post types) or includes the post's
+ * type. The subscription registry stays the enable + post-type filter (its
+ * existing purpose); the network destination is ALWAYS the fixed simple route,
+ * so the operator-entered (free-form) target_url is intentionally NOT matched
+ * here — normalizing it against the host route would be brittle and could
+ * silently drop legitimate publishes.
+ *
+ * @param WP_Post $post The post being published.
+ * @return bool True when at least one matching subscription enables emission.
+ */
+function cinatra_publish_emit_enabled_for_post( WP_Post $post ): bool {
+	$post_type = (string) $post->post_type;
+	foreach ( cinatra_get_webhook_subscriptions() as $subscription ) {
+		if ( 'post_published' !== ( $subscription['event_type'] ?? '' ) ) {
+			continue;
+		}
+		$post_types = (array) ( $subscription['post_types'] ?? array() );
+		if ( array() === $post_types || in_array( $post_type, $post_types, true ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Whether a value is a well-formed ABSOLUTE http(s) URL with a host.
+ *
+ * Used to gate the optional `url` payload field so it satisfies the host
+ * schema's Zod .url() (which rejects relative URLs); a permalink that is not a
+ * clean absolute URL is omitted rather than sent.
+ *
+ * @param string $url Candidate URL.
+ * @return bool True when $url is an absolute http/https URL with a host.
+ */
+function cinatra_is_absolute_http_url( string $url ): bool {
+	if ( '' === $url ) {
+		return false;
+	}
+	$scheme = wp_parse_url( $url, PHP_URL_SCHEME );
+	$host   = wp_parse_url( $url, PHP_URL_HOST );
+	return ( 'http' === $scheme || 'https' === $scheme )
+		&& is_string( $host ) && '' !== $host;
+}
+
+/**
+ * Build the strict publish-webhook payload for a post (exactly the host schema).
+ *
+ * @param WP_Post $post The published post.
+ * @return array The payload array: event, postId, postType, title, url, siteUrl, issuedAt.
+ */
+function cinatra_build_publish_payload( WP_Post $post ): array {
+	$payload = array(
+		'event'    => 'post_published',
+		'postId'   => (int) $post->ID,
+		'postType' => (string) $post->post_type,
+		'title'    => (string) get_the_title( $post ),
+		'siteUrl'  => home_url(),
+		'issuedAt' => gmdate( 'c' ),
+	);
+	// The host schema validates `url` as an ABSOLUTE URL (Zod .url()). Include it
+	// ONLY when get_permalink() yields a well-formed absolute http(s) URL; a
+	// relative/custom-filtered permalink would otherwise fail the host's strict
+	// parse and reject the whole payload. `url` is optional, so omit it instead.
+	$permalink = get_permalink( $post );
+	if ( is_string( $permalink ) && cinatra_is_absolute_http_url( $permalink ) ) {
+		$payload['url'] = $permalink;
+	}
+	return $payload;
+}
+
+/**
+ * Build the STABLE per-publish-event idempotency id.
+ *
+ * Stable across retries of the SAME publish event (so the host can dedupe a
+ * re-delivered webhook): derived from the site instance id, the post id, and
+ * the post's last-modified GMT timestamp. NOT random per send.
+ *
+ * @param WP_Post $post The published post.
+ * @return string The webhook id (e.g. "wp-<instance>-<postId>-<modified-epoch>").
+ */
+function cinatra_publish_webhook_id( WP_Post $post ): string {
+	$instance_id = (string) get_option( 'cinatra_instance_id', '' );
+	if ( '' === $instance_id ) {
+		// Fall back to the site home so the id is still stable + site-scoped when
+		// no instance id is configured.
+		$instance_id = (string) wp_parse_url( home_url(), PHP_URL_HOST );
+	}
+	// Stable revision component from the post's last-modified GMT. Prefer the
+	// parsed epoch; if the stored timestamp is unparseable (strtotime false),
+	// fall back to a sanitized form of the raw value so the id is still stable
+	// and NEVER ends in an empty suffix.
+	$modified = (string) $post->post_modified_gmt;
+	$epoch    = strtotime( $modified . ' UTC' );
+	if ( false !== $epoch ) {
+		$revision = (string) $epoch;
+	} else {
+		$revision = preg_replace( '/[^0-9A-Za-z]+/', '', $modified );
+		if ( '' === (string) $revision ) {
+			$revision = '0';
+		}
+	}
+	return 'wp-' . $instance_id . '-' . (int) $post->ID . '-' . $revision;
+}
+
+/**
+ * Emit a signed 'post_published' webhook when a post transitions INTO publish.
+ *
+ * Bound to transition_post_status. Fire-and-forget and fully non-fatal: every
+ * bail is quiet and nothing here can block or fail the publish itself.
+ *
+ * @param string  $new_status The new post status.
+ * @param string  $old_status The previous post status.
+ * @param WP_Post $post       The post object (transition_post_status passes it third).
+ * @return void
+ */
+function cinatra_emit_post_published( $new_status, $old_status, $post ): void {
+	// Only a genuine transition INTO publish (skip publish->publish edits and
+	// any non-publish status change).
+	if ( 'publish' !== $new_status || 'publish' === $old_status ) {
+		return;
+	}
+	if ( ! $post instanceof WP_Post ) {
+		return;
+	}
+	// Never fire for revisions / autosaves.
+	if ( wp_is_post_revision( $post ) || wp_is_post_autosave( $post ) ) {
+		return;
+	}
+	// Attachments are a public post type but represent media, not editorial
+	// content — never emit for them even if a subscription matches all types.
+	if ( 'attachment' === $post->post_type ) {
+		return;
+	}
+	// Only public post types (skip revisions and internal/non-public types).
+	$type_object = get_post_type_object( $post->post_type );
+	if ( null === $type_object || empty( $type_object->public ) ) {
+		return;
+	}
+
+	// Quiet bails: no instance configured, no signing secret, or no subscription
+	// enabling this post's type.
+	$endpoint = cinatra_publish_webhook_endpoint();
+	$secret   = (string) get_option( 'cinatra_webhook_secret', '' );
+	if ( '' === $endpoint || '' === $secret ) {
+		return;
+	}
+	if ( ! cinatra_publish_emit_enabled_for_post( $post ) ) {
+		return;
+	}
+
+	// Encode the body ONCE; sign and send the SAME exact bytes. Bail quietly if
+	// encoding fails (an empty signed body would only be rejected by the host).
+	$raw_body = wp_json_encode( cinatra_build_publish_payload( $post ) );
+	if ( ! is_string( $raw_body ) || '' === $raw_body ) {
+		return;
+	}
+	$signature = 'sha256=' . hash_hmac( 'sha256', $raw_body, $secret );
+
+	// Blocking with a short timeout. We deliberately keep blocking => true: a
+	// non-blocking request can drop the request BODY in some WordPress HTTP
+	// transports, which would invalidate the signed delivery. The short timeout
+	// caps the worst-case added publish latency when the instance is slow/down.
+	// Delivery is best-effort — a failure is logged (fixed text) and NEVER blocks
+	// or fails the publish. Durable retry/queueing is intentionally out of scope
+	// here; the STABLE X-Cinatra-Webhook-Id is what lets the host dedupe a future
+	// re-delivery if a retry path is added later.
+	$response = cinatra_server_post(
+		$endpoint,
+		array(
+			'timeout'  => 4,
+			'blocking' => true,
+			'headers'  => array(
+				'Content-Type'         => 'application/json',
+				'Accept'               => 'application/json',
+				'X-Cinatra-Sig-256'    => $signature,
+				'X-Cinatra-Webhook-Id' => cinatra_publish_webhook_id( $post ),
+			),
+			'body'     => $raw_body,
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		// Fixed text only — never the secret, signature, body, title, or upstream
+		// detail.
+		error_log( '[cinatra] publish webhook transport failed.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional fixed-text server-side warning; never logs any secret, signature, payload, or upstream detail.
+		return;
+	}
+	$code = (int) wp_remote_retrieve_response_code( $response );
+	if ( $code < 200 || $code >= 300 ) {
+		error_log( '[cinatra] publish webhook rejected: HTTP ' . $code ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional fixed-text + status-only server-side warning; never logs any secret, signature, payload, or upstream body.
+	}
+}
+add_action( 'transition_post_status', 'cinatra_emit_post_published', 10, 3 );
 
