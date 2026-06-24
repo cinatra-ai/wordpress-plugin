@@ -63,6 +63,9 @@ function reset_fixture() {
         'remote_post_calls' => [],
         'filters'           => [],
         'filter_cbs'        => [],
+        // MCP Adapter detection: empty by default (adapter absent). Tests that
+        // need the adapter active set this to ['mcp-adapter/mcp-adapter.php'].
+        'active_plugins'    => [],
     ];
     // Each fixture reset starts from a clean env: no server-to-server override.
     putenv('CINATRA_BASE_URL');
@@ -195,6 +198,41 @@ check('CinatraConfig advertises contractVersion v2', ($cfg['contractVersion'] ??
 check('CinatraConfig points the browser at the same-origin token broker',
     ($cfg['tokenEndpoint'] ?? '') === 'https://blog.example/wp-json/cinatra/v1/token');
 check('CinatraConfig carries a nonce for the broker call', !empty($cfg['nonce']));
+
+// ---------------------------------------------------------------------------
+// MCP Adapter detection (#62): mcpAdapterActive feature gate in CinatraConfig.
+// ---------------------------------------------------------------------------
+echo "Test: mcpAdapterActive=false when adapter plugin is absent (default)\n";
+reset_fixture();
+// active_plugins is [] by default (adapter absent).
+cinatra_enqueue_widget();
+$cfg = $GLOBALS['cinatra_test']['localized']['cinatra']['CinatraConfig'] ?? [];
+check('mcpAdapterActive present in CinatraConfig', array_key_exists('mcpAdapterActive', $cfg));
+check('mcpAdapterActive is false when adapter absent', $cfg['mcpAdapterActive'] === false);
+
+echo "Test: mcpAdapterActive=true when adapter plugin is active\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['active_plugins'] = ['mcp-adapter/mcp-adapter.php'];
+$GLOBALS['cinatra_test']['enqueued_scripts'] = [];
+$GLOBALS['cinatra_test']['localized'] = [];
+cinatra_enqueue_widget();
+$cfg = $GLOBALS['cinatra_test']['localized']['cinatra']['CinatraConfig'] ?? [];
+check('mcpAdapterActive is true when adapter active', $cfg['mcpAdapterActive'] === true);
+
+echo "Test: cinatra_mcp_adapter_active() returns false with no active plugins\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['active_plugins'] = [];
+check('cinatra_mcp_adapter_active() false when not in active_plugins', cinatra_mcp_adapter_active() === false);
+
+echo "Test: cinatra_mcp_adapter_active() returns true when adapter plugin file is in active_plugins\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['active_plugins'] = ['mcp-adapter/mcp-adapter.php'];
+check('cinatra_mcp_adapter_active() true when adapter active', cinatra_mcp_adapter_active() === true);
+
+echo "Test: cinatra_mcp_adapter_active() is not tricked by a different plugin with a similar name\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['active_plugins'] = ['other-mcp/mcp-adapter.php', 'mcp-adapter/other.php'];
+check('different plugin file does not trigger cinatra_mcp_adapter_active()', cinatra_mcp_adapter_active() === false);
 
 // ---------------------------------------------------------------------------
 // Connect provisioning (cinatra#221): server-side code exchange stores the

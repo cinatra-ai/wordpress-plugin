@@ -28,6 +28,7 @@ $GLOBALS['cinatra_test'] = [
     'remote_post_calls'    => [],   // captured wp_remote_post args (+ filters_active snapshot)
     'filters'              => [],   // hook => count of currently-registered callbacks
     'filter_cbs'           => [],   // hook => [live callbacks] (for safe-request replay)
+    'active_plugins'       => [],   // active plugin files for is_plugin_active() stub
 ];
 
 // ---------------------------------------------------------------------------
@@ -111,6 +112,16 @@ function sanitize_hex_color($color) {
     return (is_string($color) && preg_match('/^#([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6})$/', $color)) ? $color : '';
 }
 function post_type_exists($pt) { return in_array($pt, ['post', 'page'], true); }
+// MCP Adapter detection: fixture-controlled via $GLOBALS['cinatra_test']['active_plugins'].
+// The cinatra_mcp_adapter_active() function requires is_plugin_active() which normally
+// loads wp-admin/includes/plugin.php; stub it here so tests do not need a real WP install.
+function is_plugin_active($plugin) {
+    return in_array($plugin, (array) ($GLOBALS['cinatra_test']['active_plugins'] ?? []), true);
+}
+// HTML sanitisation stubs (pass-through for tests; the tag/attribute filter is irrelevant
+// in the test harness since no real HTML output is asserted in these tests).
+function wp_kses($text, $allowed_html, $allowed_protocols = []) { return $text; }
+function wp_kses_post($text) { return $text; }
 
 // ---------------------------------------------------------------------------
 // Post / publish-emitter stubs (wp#48). Behavior is driven by the fixture:
