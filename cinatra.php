@@ -37,6 +37,42 @@ define( 'CINATRA_THEME_LOGO_COLOR', '#7a2e3a' );
 define( 'CINATRA_MAX_WEBHOOK_SUBSCRIPTIONS', 50 );
 
 // ---------------------------------------------------------------------------
+// WordPress MCP Adapter (https://github.com/WordPress/mcp-adapter) detection.
+//
+// The adapter is a SOFT / OPTIONAL dependency: the base Cinatra chat widget
+// works without it. The adapter is REQUIRED for the AI-tools path (the ability
+// for the assistant to read and edit WordPress content via MCP). Because the
+// adapter is distributed via GitHub Releases and is not on the wordpress.org
+// directory, a hard `Requires Plugins:` header is intentionally NOT added (it
+// would break wp.org Plugin Review and give users no install link). See #62.
+//
+// Detection strategy: check whether the adapter's known plugin file is active.
+// The adapter registers its own REST routes, so absence is detectable at
+// runtime without requiring the adapter to be installed. The slug
+// `mcp-adapter/mcp-adapter.php` is the adapter's canonical plugin file path
+// (verified from the WordPress/mcp-adapter GitHub repository). If the adapter
+// ever moves to wp.org under a different slug, this constant should be updated.
+define( 'CINATRA_MCP_ADAPTER_PLUGIN_FILE', 'mcp-adapter/mcp-adapter.php' );
+define( 'CINATRA_MCP_ADAPTER_RELEASE_URL', 'https://github.com/WordPress/mcp-adapter/releases/latest' );
+
+/**
+ * Detect whether the WordPress MCP Adapter plugin is installed and active.
+ *
+ * The adapter is the recommended companion for the AI-tools path. When it is
+ * absent the base chat widget still works, but the assistant cannot use
+ * WordPress AI tools (reading/editing content via MCP). This function is the
+ * single source of truth for that state; all notices and config flags read it.
+ *
+ * @return bool True if the adapter plugin is active (AI-tools path enabled).
+ */
+function cinatra_mcp_adapter_active(): bool {
+	if ( ! function_exists( 'is_plugin_active' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+	return (bool) is_plugin_active( CINATRA_MCP_ADAPTER_PLUGIN_FILE );
+}
+
+// ---------------------------------------------------------------------------
 
 add_action(
 	'admin_init',
@@ -337,6 +373,8 @@ function cinatra_render_settings_page() {
 			</details>
 		</div>
 
+		<?php cinatra_render_setup_checklist(); ?>
+
 		<h2><?php echo esc_html__( 'Advanced / manual configuration', 'cinatra' ); ?></h2>
 		<p class="description"><?php echo esc_html__( 'Most sites should use Connect above. These fields let you set or override the connection manually.', 'cinatra' ); ?></p>
 		<form method="post" action="options.php">
@@ -425,6 +463,72 @@ function cinatra_render_settings_page() {
 }
 
 /**
+ * Render a "Setup checklist" card on the settings page. Surfaces the key
+ * optional dependency — the WordPress MCP Adapter — with a clear status
+ * indicator and a direct link to its GitHub release. The checklist makes the
+ * dependency first-class on the settings UI without burying it in prose.
+ *
+ * The card is always rendered (even when everything is configured) so admins
+ * can see at a glance which capabilities are enabled.
+ *
+ * @return void
+ */
+function cinatra_render_setup_checklist(): void {
+	$mcp_active = cinatra_mcp_adapter_active();
+	if ( $mcp_active ) {
+		$mcp_icon   = '&#10003;'; // Unicode U+2713 CHECK MARK.
+		$mcp_class  = 'cinatra-check-ok';
+		$mcp_status = __( 'WordPress MCP Adapter is active — AI tools enabled.', 'cinatra' );
+		$mcp_extra  = '';
+	} else {
+		$mcp_icon   = '&#9679;'; // Unicode U+25CF BLACK CIRCLE, used as a status dot.
+		$mcp_class  = 'cinatra-check-pending';
+		$mcp_status = __( 'WordPress MCP Adapter is not active — AI tools are not available.', 'cinatra' );
+		$mcp_extra  = sprintf(
+			'<br /><a href="%1$s" target="_blank" rel="noopener noreferrer">%2$s</a>',
+			esc_url( CINATRA_MCP_ADAPTER_RELEASE_URL ),
+			esc_html__( 'Download the WordPress MCP Adapter from GitHub', 'cinatra' )
+		);
+	}
+	?>
+	<div class="card" style="max-width:680px;margin-top:24px;">
+		<h2 style="margin-top:0;"><?php echo esc_html__( 'AI tools setup', 'cinatra' ); ?></h2>
+		<p class="description">
+			<?php echo esc_html__( 'The Cinatra assistant works without the adapter below, but installing it unlocks WordPress AI tools — letting the assistant read and edit your site content directly from the chat.', 'cinatra' ); ?>
+		</p>
+		<ul style="list-style:none;margin:0;padding:0;">
+			<li class="<?php echo esc_attr( $mcp_class ); ?>" style="margin-bottom:8px;">
+				<span aria-hidden="true" style="margin-right:6px;"><?php echo wp_kses_post( $mcp_icon ); ?></span>
+				<?php echo esc_html( $mcp_status ); ?>
+				<?php
+				echo wp_kses(
+					$mcp_extra,
+					array(
+						'a'  => array(
+							'href'   => array(),
+							'target' => array(),
+							'rel'    => array(),
+						),
+						'br' => array(),
+					)
+				);
+				?>
+			</li>
+		</ul>
+		<p class="description" style="margin-top:12px;">
+			<?php
+			printf(
+				/* translators: %s: URL to WordPress MCP Adapter releases */
+				esc_html__( 'The WordPress MCP Adapter is distributed via GitHub Releases (%s) and is not in the wordpress.org directory. Install it manually and activate it like any other plugin.', 'cinatra' ),
+				'<a href="' . esc_url( CINATRA_MCP_ADAPTER_RELEASE_URL ) . '" target="_blank" rel="noopener noreferrer">' . esc_html__( 'WordPress/mcp-adapter', 'cinatra' ) . '</a>'
+			);
+			?>
+		</p>
+	</div>
+	<?php
+}
+
+/**
  * Plain-text display of the Cinatra connector path for the settings hints. The
  * JS in cinatra-settings.js upgrades the matching span(s) into a real link via
  * DOM APIs (no innerHTML) once a base URL is present.
@@ -471,14 +575,13 @@ add_action(
 		if ( ! $screen || 'settings_page_cinatra' !== $screen->id ) {
 			return;
 		}
-		if ( ! function_exists( 'is_plugin_active' ) ) {
-			require_once ABSPATH . 'wp-admin/includes/plugin.php';
-		}
-		if ( ! is_plugin_active( 'mcp-adapter/mcp-adapter.php' ) ) {
+		if ( ! cinatra_mcp_adapter_active() ) {
 			printf(
-				'<div class="notice notice-warning"><p><strong>%1$s</strong> %2$s</p></div>',
-				esc_html__( 'Cinatra:', 'cinatra' ),
-				esc_html__( 'Install the WordPress MCP Adapter plugin to enable AI tool access from the chat widget. The widget will still work without it.', 'cinatra' )
+				'<div class="notice notice-warning"><p><strong>%1$s</strong> %2$s <a href="%3$s" target="_blank" rel="noopener noreferrer">%4$s</a></p></div>',
+				esc_html__( 'WordPress AI tools are not enabled:', 'cinatra' ),
+				esc_html__( 'To let the Cinatra assistant read and edit your WordPress content, install and activate the WordPress MCP Adapter. The chat widget works without it.', 'cinatra' ),
+				esc_url( CINATRA_MCP_ADAPTER_RELEASE_URL ),
+				esc_html__( 'Get the WordPress MCP Adapter', 'cinatra' )
 			);
 		}
 		$instance_id = get_option( 'cinatra_instance_id', '' );
@@ -1229,6 +1332,13 @@ function cinatra_enqueue_widget(): void {
 			'nonce'             => wp_create_nonce( 'wp_rest' ),
 			'instanceId'        => $instance_id,
 			'wpAdminUrl'        => admin_url(),
+			// Feature-gate for the AI-tools path. True when the WordPress MCP
+			// Adapter (WordPress/mcp-adapter) is installed and active, giving the
+			// assistant access to WordPress content via MCP. False when the adapter
+			// is absent: the base chat widget still loads, but the widget should
+			// surface a clear "install the adapter to enable tools" state instead
+			// of a silent absence. Implements wordpress-plugin#62.
+			'mcpAdapterActive'  => cinatra_mcp_adapter_active(),
 		)
 	);
 }
