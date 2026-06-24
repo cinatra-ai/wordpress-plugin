@@ -113,6 +113,48 @@ function sanitize_hex_color($color) {
 function post_type_exists($pt) { return in_array($pt, ['post', 'page'], true); }
 
 // ---------------------------------------------------------------------------
+// Post / publish-emitter stubs (wp#48). Behavior is driven by the fixture:
+//   $GLOBALS['cinatra_test']['post_types']   => post_type => ['public' => bool]
+//   $GLOBALS['cinatra_test']['is_revision']  => bool (wp_is_post_revision)
+//   $GLOBALS['cinatra_test']['is_autosave']  => bool (wp_is_post_autosave)
+// A WP_Post stub carries the fields the emitter reads.
+// ---------------------------------------------------------------------------
+class WP_Post {
+    public $ID;
+    public $post_type;
+    public $post_title;
+    public $post_status;
+    public $post_modified_gmt;
+    public $permalink;
+    public function __construct(array $fields = []) {
+        $this->ID = $fields['ID'] ?? 0;
+        $this->post_type = $fields['post_type'] ?? 'post';
+        $this->post_title = $fields['post_title'] ?? '';
+        $this->post_status = $fields['post_status'] ?? 'publish';
+        $this->post_modified_gmt = $fields['post_modified_gmt'] ?? '2026-06-24 12:00:00';
+        $this->permalink = $fields['permalink'] ?? '';
+    }
+}
+function get_the_title($post) {
+    return $post instanceof WP_Post ? (string) $post->post_title : '';
+}
+function get_permalink($post) {
+    return $post instanceof WP_Post ? (string) $post->permalink : '';
+}
+function get_post_type_object($post_type) {
+    $registry = $GLOBALS['cinatra_test']['post_types'] ?? [
+        'post' => ['public' => true],
+        'page' => ['public' => true],
+    ];
+    if (!array_key_exists($post_type, $registry)) {
+        return null;
+    }
+    return (object) $registry[$post_type];
+}
+function wp_is_post_revision($post) { return (bool) ($GLOBALS['cinatra_test']['is_revision'] ?? false); }
+function wp_is_post_autosave($post) { return (bool) ($GLOBALS['cinatra_test']['is_autosave'] ?? false); }
+
+// ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 function get_option($name, $default = false) {
