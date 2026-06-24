@@ -476,12 +476,12 @@ function cinatra_render_settings_page() {
 function cinatra_render_setup_checklist(): void {
 	$mcp_active = cinatra_mcp_adapter_active();
 	if ( $mcp_active ) {
-		$mcp_icon   = '&#10003;'; // checkmark
+		$mcp_icon   = '&#10003;'; // Unicode U+2713 CHECK MARK.
 		$mcp_class  = 'cinatra-check-ok';
 		$mcp_status = __( 'WordPress MCP Adapter is active — AI tools enabled.', 'cinatra' );
 		$mcp_extra  = '';
 	} else {
-		$mcp_icon   = '&#9679;'; // bullet / hollow dot
+		$mcp_icon   = '&#9679;'; // Unicode U+25CF BLACK CIRCLE, used as a status dot.
 		$mcp_class  = 'cinatra-check-pending';
 		$mcp_status = __( 'WordPress MCP Adapter is not active — AI tools are not available.', 'cinatra' );
 		$mcp_extra  = sprintf(
@@ -500,7 +500,19 @@ function cinatra_render_setup_checklist(): void {
 			<li class="<?php echo esc_attr( $mcp_class ); ?>" style="margin-bottom:8px;">
 				<span aria-hidden="true" style="margin-right:6px;"><?php echo wp_kses_post( $mcp_icon ); ?></span>
 				<?php echo esc_html( $mcp_status ); ?>
-				<?php echo wp_kses( $mcp_extra, array( 'a' => array( 'href' => array(), 'target' => array(), 'rel' => array() ), 'br' => array() ) ); ?>
+				<?php
+				echo wp_kses(
+					$mcp_extra,
+					array(
+						'a'  => array(
+							'href'   => array(),
+							'target' => array(),
+							'rel'    => array(),
+						),
+						'br' => array(),
+					)
+				);
+				?>
 			</li>
 		</ul>
 		<p class="description" style="margin-top:12px;">
@@ -1324,8 +1336,8 @@ function cinatra_enqueue_widget(): void {
 			// Adapter (WordPress/mcp-adapter) is installed and active, giving the
 			// assistant access to WordPress content via MCP. False when the adapter
 			// is absent: the base chat widget still loads, but the widget should
-			// surface a clear "install the adapter to enable tools" state rather than
-			// silently missing the capability. (#62)
+			// surface a clear "install the adapter to enable tools" state instead
+			// of a silent absence. Implements wordpress-plugin#62.
 			'mcpAdapterActive'  => cinatra_mcp_adapter_active(),
 		)
 	);
