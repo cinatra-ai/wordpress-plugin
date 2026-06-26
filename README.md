@@ -6,6 +6,14 @@ a chat panel right where they work. The assistant talks to your own Cinatra
 instance — you choose which one, and all traffic runs over HTTP only. Access is
 restricted to WordPress administrators (`manage_options` capability).
 
+## Documentation
+
+The canonical documentation for this integration is the WordPress hub on
+docs.cinatra.ai: **https://docs.cinatra.ai/integrations/wordpress/**. It is the
+six-part hub (Overview, Quick start, Use it, Settings & permissions,
+Troubleshooting, Advanced & reference) and is published from this repository's
+[`docs/`](docs/) folder at each release.
+
 ## Works with
 
 - WordPress (5.9 or later; tested up to 7.0)

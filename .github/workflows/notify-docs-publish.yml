@@ -1,0 +1,98 @@
+name: Notify docs build on release tag
+
+# On a pushed semver `v*` tag, fire repository_dispatch(cinatra-integration-released)
+# at ops so its docs build republishes docs.cinatra.ai with this integration's
+# docs/ at the tagged version. Docs publish ONLY on a new release — a docs-only
+# fix rides a patch release tag. This mirrors the public cinatra-ai/docs
+# notify-ops.yml pattern.
+#
+# The workflow_dispatch path is a manual REPUBLISH of an EXISTING release tag
+# only: the requested ref must be a `v*` tag that already exists, and the commit
+# SHA sent to ops is resolved FROM that tag (not the run commit). It never
+# creates tags and never publishes a non-release ref.
+#
+# Requires the CINATRA_OPS_DISPATCH_TOKEN repo secret (a fine-grained PAT scoped
+# to cinatra-ai/ops with Contents: write). Until that secret is set, this job
+# no-ops gracefully and docs republish via the ops docs-build manual
+# workflow_dispatch / schedule.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to (re)publish docs for. This never creates tags."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notify-docs-publish-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Dispatch cinatra-integration-released
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository (full history + tags)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve and verify the release tag
+        id: tag
+        env:
+          REF: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Normalize a refs/tags/* ref name down to the bare tag.
+          REF="${REF#refs/tags/}"
+          # Publish ONLY for a `v*` release tag — never a branch or arbitrary ref.
+          # Constrain to a strict tag-name grammar so git revision-syntax
+          # characters (`~`, `^`, `:`, `@`, `..`, whitespace) can never slip
+          # through and resolve to a commit other than the tag's own target.
+          if [[ ! "$REF" =~ ^v[A-Za-z0-9._-]+$ ]]; then
+            echo "Ref '$REF' is not a valid v* release tag name — refusing to publish docs."
+            exit 1
+          fi
+          # The tag must already exist as an EXACT tag ref. `show-ref --verify`
+          # does NOT interpret revision syntax (unlike `rev-parse --verify`), so
+          # only a literal `refs/tags/<REF>` is accepted.
+          if ! git show-ref --verify --quiet "refs/tags/$REF"; then
+            echo "Tag '$REF' does not exist — refusing to publish docs."
+            exit 1
+          fi
+          # Resolve the COMMIT the tag points at (peel annotated tags via ^{commit}).
+          SHA="$(git rev-parse "refs/tags/$REF^{commit}")"
+          echo "ref=$REF"  >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"  >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag '$REF' -> $SHA"
+
+      - name: Fire repository_dispatch to ops
+        env:
+          GH_TOKEN: ${{ secrets.CINATRA_OPS_DISPATCH_TOKEN }}
+          REF: ${{ steps.tag.outputs.ref }}
+          SHA: ${{ steps.tag.outputs.sha }}
+          SLUG: wordpress
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "CINATRA_OPS_DISPATCH_TOKEN not set — skipping dispatch."
+            echo "Operator: add the secret to enable auto-republish; until then use the"
+            echo "ops docs-build manual workflow_dispatch / schedule."
+            exit 0
+          fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/cinatra-ai/ops/dispatches \
+            -d "$(jq -nc --arg sha "$SHA" --arg ref "$REF" --arg slug "$SLUG" --arg repo "$REPO" \
+                  '{event_type:"cinatra-integration-released",client_payload:{sha:$sha,ref:$ref,slug:$slug,repo:$repo}}')"
