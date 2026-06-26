@@ -53,6 +53,7 @@ each file matches its caption order there.
 
 Replacing/adding screenshots: file names must be exactly `screenshot-1.png`,
 `screenshot-2.png`, etc., the ordinal must match the caption order in
-`readme.txt`, and each must be a genuine capture of the running plugin — never a
-mockup or placeholder, since WordPress.org serves these verbatim on the
-directory listing.
+`readme.txt`, and each must be a genuine capture of the running plugin.
+WordPress.org serves these images verbatim on the directory listing, so only
+real screenshots of the live plugin are acceptable — no mockups, stand-ins, or
+draft images.
