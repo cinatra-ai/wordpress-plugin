@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Generates the WordPress.org plugin-directory assets under .wordpress-org/.
 //
-// DERIVED FROM the cinatra-ai/design repo (spec wins over artifacts):
+// DERIVED FROM the Cinatra design system (spec wins over artifacts):
 //   - brand constants  -> design tokens/brand.json (mustard/navy/cream)
 //   - logo geometry     -> design assets/logo/cinatra-mark.svg (fedora paths)
 //                          design assets/logo/cinatra-lockup-horizontal.svg
@@ -10,7 +10,7 @@
 //                          (appIconSvg / bannerSvg / conform brand-rule gate)
 //
 // The four WordPress.org directory dimensions have NO bespoke recipe in the
-// design repo, so each asset is derived by applying the established brand
+// design system, so each asset is derived by applying the established brand
 // rules to the WordPress.org canvas:
 //   icon-128 / icon-256  -> favicon recipe: the mustard fedora on a clean
 //        white/paper ground with a hairline border (design variants.json
@@ -26,8 +26,8 @@
 // product, so none are shipped until a real capture exists (later release).
 //
 // Run from the wordpress-plugin repo root (no deps to install here — the script
-// resolves sharp + opentype.js from the design repo's node_modules):
-//   DESIGN_REPO=/path/to/cinatra-ai/design node tools/generate-wordpress-org-assets.mjs
+// resolves sharp + opentype.js from the design system checkout's node_modules):
+//   DESIGN_REPO=/path/to/your/cinatra-design-checkout node tools/generate-wordpress-org-assets.mjs
 // Defaults DESIGN_REPO to a sibling ../design checkout (run `npm install` there once).
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -38,21 +38,22 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // This repo (wordpress-plugin) carries no JS deps. The rendering deps
-// (sharp, opentype.js) and the brand masters both live in the cinatra-ai/design
-// repo, so we resolve them from DESIGN_REPO/node_modules at runtime — the script
-// is self-contained against a design checkout and needs nothing installed here.
+// (sharp, opentype.js) and the brand masters both live in the Cinatra design
+// system checkout, so we resolve them from DESIGN_REPO/node_modules at runtime —
+// the script is self-contained against a design checkout and needs nothing
+// installed here.
 const root = process.env.WP_PLUGIN_ROOT || join(here, "..");
 const DESIGN = process.env.DESIGN_REPO || join(root, "..", "design");
 if (!existsSync(join(DESIGN, "assets/logo/cinatra-lockup-horizontal.svg"))) {
   console.error(
-    `Design repo not found at ${DESIGN}. Set DESIGN_REPO=/path/to/cinatra-ai/design`
+    `Design system checkout not found at ${DESIGN}. Set DESIGN_REPO=/path/to/your/cinatra-design-checkout`
   );
   process.exit(1);
 }
 
-// Resolve sharp + opentype.js from the design repo's node_modules. ESM bare
+// Resolve sharp + opentype.js from the design checkout's node_modules. ESM bare
 // imports resolve relative to THIS file (which has no node_modules), so we go
-// through createRequire anchored at the design repo and import the resolved
+// through createRequire anchored at the design checkout and import the resolved
 // absolute path.
 const designRequire = createRequire(join(DESIGN, "package.json"));
 async function fromDesign(pkg) {
@@ -61,7 +62,7 @@ async function fromDesign(pkg) {
     resolved = designRequire.resolve(pkg);
   } catch {
     console.error(
-      `Cannot resolve "${pkg}" from ${DESIGN}. Run \`npm install\` in the design repo first.`
+      `Cannot resolve "${pkg}" from ${DESIGN}. Run \`npm install\` in the design checkout first.`
     );
     process.exit(1);
   }
@@ -236,9 +237,9 @@ const manifest = {
   meta: {
     name: "Cinatra WordPress.org directory asset manifest",
     description:
-      "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the cinatra-ai/design repo (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
-    designRepo: "cinatra-ai/design",
-    note: "icon + banner derive from the design repo masters. The directory icon follows the brand favicon treatment — the mustard fedora on a clean white/paper ground with a hairline border (design assets/logo/variants.json: 'Mustard on paper or surface ... Never mustard on a coloured chip or on the navy ground'). No screenshots are shipped yet; a real browser capture of a live WordPress install will be added in a later release.",
+      "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the Cinatra design system (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
+    designSource: "Cinatra design system",
+    note: "icon + banner derive from the design system masters. The directory icon follows the brand favicon treatment — the mustard fedora on a clean white/paper ground with a hairline border (design assets/logo/variants.json: 'Mustard on paper or surface ... Never mustard on a coloured chip or on the navy ground'). No screenshots are shipped yet; a real browser capture of a live WordPress install will be added in a later release.",
   },
   entries,
 };

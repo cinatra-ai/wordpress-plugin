@@ -120,7 +120,7 @@ php tests/test-publish-emitter.php             # publish-emitter unit tests
 ### Regenerating WordPress.org assets
 
 The banner and icon images in `.wordpress-org/` are generated deterministically
-from the design repository. See [`.wordpress-org/README.md`](.wordpress-org/README.md)
+from the Cinatra design system. See [`.wordpress-org/README.md`](.wordpress-org/README.md)
 for full instructions.
 
 ### Releasing

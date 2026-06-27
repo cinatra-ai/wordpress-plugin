@@ -1,9 +1,9 @@
 {
   "meta": {
     "name": "Cinatra WordPress.org directory asset manifest",
-    "description": "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the cinatra-ai/design repo (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
-    "designRepo": "cinatra-ai/design",
-    "note": "icon + banner derive from the design repo masters. The directory icon follows the brand favicon treatment — the mustard fedora on a clean white/paper ground with a hairline border (design assets/logo/variants.json: 'Mustard on paper or surface ... Never mustard on a coloured chip or on the navy ground'). screenshot-1.png, screenshot-2.png and screenshot-3.png are real captures of the plugin running in a live wp-admin (assistant in action, account sign-in, and the connect/settings page), not generated assets; their captions live in readme.txt under == Screenshots ==."
+    "description": "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the Cinatra design system (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
+    "designSource": "Cinatra design system",
+    "note": "icon + banner derive from the design system masters. The directory icon follows the brand favicon treatment — the mustard fedora on a clean white/paper ground with a hairline border (design assets/logo/variants.json: 'Mustard on paper or surface ... Never mustard on a coloured chip or on the navy ground'). screenshot-1.png, screenshot-2.png and screenshot-3.png are real captures of the plugin running in a live wp-admin (assistant in action, account sign-in, and the connect/settings page), not generated assets; their captions live in readme.txt under == Screenshots ==."
   },
   "entries": [
     {

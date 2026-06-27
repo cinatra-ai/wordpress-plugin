@@ -5,7 +5,7 @@ These are the assets WordPress.org serves on the plugin's directory listing
 zip — the `.wordpress-org/` directory is read by the WordPress.org plugin SVN
 deploy, not bundled into the plugin.
 
-All artwork is **derived from the `cinatra-ai/design` repo** (the brand source of
+All artwork is **derived from the Cinatra design system** (the brand source of
 truth: `assets/logo/` masters, `tokens/brand.json`, `specs/brand.html`,
 `assets/logo/variants.json`). Spec wins over artifacts: every asset applies the
 established brand rules — never an ad-hoc recolour or layout.
@@ -22,17 +22,17 @@ established brand rules — never an ad-hoc recolour or layout.
 
 ## Regenerating
 
-The assets are deterministic. Regenerate from the design repo — never hand-edit
+The assets are deterministic. Regenerate from the design system — never hand-edit
 the PNGs:
 
 ```sh
-# from the wordpress-plugin repo root, with a cinatra-ai/design checkout available
-DESIGN_REPO=/path/to/cinatra-ai/design node tools/generate-wordpress-org-assets.mjs
+# from the wordpress-plugin repo root, with a Cinatra design system checkout available
+DESIGN_REPO=/path/to/your/cinatra-design-checkout node tools/generate-wordpress-org-assets.mjs
 ```
 
 The generator (`tools/generate-wordpress-org-assets.mjs`) reuses the design
-repo's logo masters, brand tokens, pinned fonts, and the same `conform()`
-brand-rule gate as `cinatra-ai/design` `scripts/generate-assets.mjs`, so a
+system's logo masters, brand tokens, pinned fonts, and the same `conform()`
+brand-rule gate as the design system's `scripts/generate-assets.mjs`, so a
 brand-rule violation fails the build instead of shipping.
 
 ## Screenshots
