@@ -3,7 +3,7 @@ Contributors: ordnas
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.1.3
+Stable tag: 0.1.4
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -59,6 +59,9 @@ WordPress supports plugin-to-plugin dependencies via the `Requires Plugins:` hea
 3. Connect the plugin to your Cinatra instance from the Cinatra settings page: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
 
 == Changelog ==
+= 0.1.4 =
+* Maintenance release tracking the Cinatra v0.1.4 milestone. Documentation and project-page improvements only (new docs/ guides for the Integrations hub, refreshed README); no change to the plugin code or behavior shipped to your site.
+
 = 0.1.3 =
 * New: when you publish a post, the plugin can notify your connected Cinatra instance so the assistant knows about your newly-published content. Turn it on by adding a "post_published" webhook in your Cinatra settings; the notification is signed and sent only to your configured Cinatra address.
 
