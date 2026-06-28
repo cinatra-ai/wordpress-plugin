@@ -3,7 +3,7 @@
  * Plugin Name: Cinatra
  * Plugin URI: https://cinatra.ai
  * Description: Embeds the Cinatra AI assistant chat widget in WordPress admin. Floating button bottom-right; opens chat panel on click.
- * Version: 0.1.3
+ * Version: 0.1.4
  * Author: Cinatra
  * Requires at least: 5.9
  * Tested up to: 7.0
@@ -22,7 +22,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // Bump this version whenever the vendored widget asset or plugin UI changes so
 // browsers and WordPress invalidate their cached copy of cinatra-widget.js.
 // Keep CINATRA_THEME_* values in sync with the canonical Cinatra brand tokens.
-define( 'CINATRA_PLUGIN_VERSION', '0.1.1' );
+define( 'CINATRA_PLUGIN_VERSION', '0.1.4' );
 // Plugin↔core wire-contract version. Cinatra rejects unknown versions with an
 // admin-visible error. See the cinatra repo: contracts/wp-drupal-assistant/.
 // v2 drops the browser-side apiKey: the widget is served locally and streams
