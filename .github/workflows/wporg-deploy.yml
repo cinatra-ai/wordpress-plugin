@@ -15,8 +15,8 @@
 #
 # Required repository (or `wporg` Environment) secrets — these do NOT exist yet
 # and are only read at runtime, so this file is inert until they are added:
-#   SVN_USERNAME — the WordPress.org plugin-committer username
-#   SVN_PASSWORD — that committer's WordPress.org password
+#   WPORG_SVN_USERNAME — the WordPress.org plugin-committer username
+#   WPORG_SVN_PASSWORD — that committer's WordPress.org password
 #
 # The 10up deploy action honours `.distignore`, so the published trunk matches
 # the artifact produced offline by bin/build-wporg.sh and validated by the CI
@@ -108,8 +108,8 @@ jobs:
       - name: WordPress.org plugin deploy
         uses: 10up/action-wordpress-plugin-deploy@54bd289b8525fd23a5c365ec369185f2966529c2 # 2.3.0
         env:
-          SVN_USERNAME: ${{ secrets.SVN_USERNAME }}
-          SVN_PASSWORD: ${{ secrets.SVN_PASSWORD }}
+          SVN_USERNAME: ${{ secrets.WPORG_SVN_USERNAME }}
+          SVN_PASSWORD: ${{ secrets.WPORG_SVN_PASSWORD }}
           SLUG: cinatra
           # Explicit resolved SemVer (overrides the action's raw-tag default).
           VERSION: ${{ steps.resolve.outputs.version }}

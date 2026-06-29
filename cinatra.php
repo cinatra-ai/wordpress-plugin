@@ -3,7 +3,7 @@
  * Plugin Name: Cinatra
  * Plugin URI: https://cinatra.ai
  * Description: Embeds the Cinatra AI assistant chat widget in WordPress admin. Floating button bottom-right; opens chat panel on click.
- * Version: 0.2.3
+ * Version: 0.1.4
  * Author: Cinatra
  * Requires at least: 5.9
  * Tested up to: 7.0
@@ -22,7 +22,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // Bump this version whenever the vendored widget asset or plugin UI changes so
 // browsers and WordPress invalidate their cached copy of cinatra-widget.js.
 // Keep CINATRA_THEME_* values in sync with the canonical Cinatra brand tokens.
-define( 'CINATRA_PLUGIN_VERSION', '0.2.3' );
+define( 'CINATRA_PLUGIN_VERSION', '0.1.4' );
 // Plugin↔core wire-contract version. Cinatra rejects unknown versions with an
 // admin-visible error. See the cinatra repo: contracts/wp-drupal-assistant/.
 // v2 drops the browser-side apiKey: the widget is served locally and streams
@@ -35,6 +35,42 @@ define( 'CINATRA_THEME_ACCENT_SOFT_HOV', '#d8e7db' );
 define( 'CINATRA_THEME_LOGO_COLOR', '#7a2e3a' );
 // Upper bound on stored webhook subscriptions (DoS / unbounded-option guard).
 define( 'CINATRA_MAX_WEBHOOK_SUBSCRIPTIONS', 50 );
+
+// ---------------------------------------------------------------------------
+// WordPress MCP Adapter (https://github.com/WordPress/mcp-adapter) detection.
+//
+// The adapter is a SOFT / OPTIONAL dependency: the base Cinatra chat widget
+// works without it. The adapter is REQUIRED for the AI-tools path (the ability
+// for the assistant to read and edit WordPress content via MCP). Because the
+// adapter is distributed via GitHub Releases and is not on the wordpress.org
+// directory, a hard `Requires Plugins:` header is intentionally NOT added (it
+// would break wp.org Plugin Review and give users no install link). See #62.
+//
+// Detection strategy: check whether the adapter's known plugin file is active.
+// The adapter registers its own REST routes, so absence is detectable at
+// runtime without requiring the adapter to be installed. The slug
+// `mcp-adapter/mcp-adapter.php` is the adapter's canonical plugin file path
+// (verified from the WordPress/mcp-adapter GitHub repository). If the adapter
+// ever moves to wp.org under a different slug, this constant should be updated.
+define( 'CINATRA_MCP_ADAPTER_PLUGIN_FILE', 'mcp-adapter/mcp-adapter.php' );
+define( 'CINATRA_MCP_ADAPTER_RELEASE_URL', 'https://github.com/WordPress/mcp-adapter/releases/latest' );
+
+/**
+ * Detect whether the WordPress MCP Adapter plugin is installed and active.
+ *
+ * The adapter is the recommended companion for the AI-tools path. When it is
+ * absent the base chat widget still works, but the assistant cannot use
+ * WordPress AI tools (reading/editing content via MCP). This function is the
+ * single source of truth for that state; all notices and config flags read it.
+ *
+ * @return bool True if the adapter plugin is active (AI-tools path enabled).
+ */
+function cinatra_mcp_adapter_active(): bool {
+	if ( ! function_exists( 'is_plugin_active' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+	return (bool) is_plugin_active( CINATRA_MCP_ADAPTER_PLUGIN_FILE );
+}
 
 // ---------------------------------------------------------------------------
 
@@ -337,6 +373,8 @@ function cinatra_render_settings_page() {
 			</details>
 		</div>
 
+		<?php cinatra_render_setup_checklist(); ?>
+
 		<h2><?php echo esc_html__( 'Advanced / manual configuration', 'cinatra' ); ?></h2>
 		<p class="description"><?php echo esc_html__( 'Most sites should use Connect above. These fields let you set or override the connection manually.', 'cinatra' ); ?></p>
 		<form method="post" action="options.php">
@@ -425,6 +463,72 @@ function cinatra_render_settings_page() {
 }
 
 /**
+ * Render a "Setup checklist" card on the settings page. Surfaces the key
+ * optional dependency — the WordPress MCP Adapter — with a clear status
+ * indicator and a direct link to its GitHub release. The checklist makes the
+ * dependency first-class on the settings UI without burying it in prose.
+ *
+ * The card is always rendered (even when everything is configured) so admins
+ * can see at a glance which capabilities are enabled.
+ *
+ * @return void
+ */
+function cinatra_render_setup_checklist(): void {
+	$mcp_active = cinatra_mcp_adapter_active();
+	if ( $mcp_active ) {
+		$mcp_icon   = '&#10003;'; // Unicode U+2713 CHECK MARK.
+		$mcp_class  = 'cinatra-check-ok';
+		$mcp_status = __( 'WordPress MCP Adapter is active — AI tools enabled.', 'cinatra' );
+		$mcp_extra  = '';
+	} else {
+		$mcp_icon   = '&#9679;'; // Unicode U+25CF BLACK CIRCLE, used as a status dot.
+		$mcp_class  = 'cinatra-check-pending';
+		$mcp_status = __( 'WordPress MCP Adapter is not active — AI tools are not available.', 'cinatra' );
+		$mcp_extra  = sprintf(
+			'<br /><a href="%1$s" target="_blank" rel="noopener noreferrer">%2$s</a>',
+			esc_url( CINATRA_MCP_ADAPTER_RELEASE_URL ),
+			esc_html__( 'Download the WordPress MCP Adapter from GitHub', 'cinatra' )
+		);
+	}
+	?>
+	<div class="card" style="max-width:680px;margin-top:24px;">
+		<h2 style="margin-top:0;"><?php echo esc_html__( 'AI tools setup', 'cinatra' ); ?></h2>
+		<p class="description">
+			<?php echo esc_html__( 'The Cinatra assistant works without the adapter below, but installing it unlocks WordPress AI tools — letting the assistant read and edit your site content directly from the chat.', 'cinatra' ); ?>
+		</p>
+		<ul style="list-style:none;margin:0;padding:0;">
+			<li class="<?php echo esc_attr( $mcp_class ); ?>" style="margin-bottom:8px;">
+				<span aria-hidden="true" style="margin-right:6px;"><?php echo wp_kses_post( $mcp_icon ); ?></span>
+				<?php echo esc_html( $mcp_status ); ?>
+				<?php
+				echo wp_kses(
+					$mcp_extra,
+					array(
+						'a'  => array(
+							'href'   => array(),
+							'target' => array(),
+							'rel'    => array(),
+						),
+						'br' => array(),
+					)
+				);
+				?>
+			</li>
+		</ul>
+		<p class="description" style="margin-top:12px;">
+			<?php
+			printf(
+				/* translators: %s: URL to WordPress MCP Adapter releases */
+				esc_html__( 'The WordPress MCP Adapter is distributed via GitHub Releases (%s) and is not in the wordpress.org directory. Install it manually and activate it like any other plugin.', 'cinatra' ),
+				'<a href="' . esc_url( CINATRA_MCP_ADAPTER_RELEASE_URL ) . '" target="_blank" rel="noopener noreferrer">' . esc_html__( 'WordPress/mcp-adapter', 'cinatra' ) . '</a>'
+			);
+			?>
+		</p>
+	</div>
+	<?php
+}
+
+/**
  * Plain-text display of the Cinatra connector path for the settings hints. The
  * JS in cinatra-settings.js upgrades the matching span(s) into a real link via
  * DOM APIs (no innerHTML) once a base URL is present.
@@ -471,14 +575,13 @@ add_action(
 		if ( ! $screen || 'settings_page_cinatra' !== $screen->id ) {
 			return;
 		}
-		if ( ! function_exists( 'is_plugin_active' ) ) {
-			require_once ABSPATH . 'wp-admin/includes/plugin.php';
-		}
-		if ( ! is_plugin_active( 'mcp-adapter/mcp-adapter.php' ) ) {
+		if ( ! cinatra_mcp_adapter_active() ) {
 			printf(
-				'<div class="notice notice-warning"><p><strong>%1$s</strong> %2$s</p></div>',
-				esc_html__( 'Cinatra:', 'cinatra' ),
-				esc_html__( 'Install the WordPress MCP Adapter plugin to enable AI tool access from the chat widget. The widget will still work without it.', 'cinatra' )
+				'<div class="notice notice-warning"><p><strong>%1$s</strong> %2$s <a href="%3$s" target="_blank" rel="noopener noreferrer">%4$s</a></p></div>',
+				esc_html__( 'WordPress AI tools are not enabled:', 'cinatra' ),
+				esc_html__( 'To let the Cinatra assistant read and edit your WordPress content, install and activate the WordPress MCP Adapter. The chat widget works without it.', 'cinatra' ),
+				esc_url( CINATRA_MCP_ADAPTER_RELEASE_URL ),
+				esc_html__( 'Get the WordPress MCP Adapter', 'cinatra' )
 			);
 		}
 		$instance_id = get_option( 'cinatra_instance_id', '' );
@@ -1217,13 +1320,25 @@ function cinatra_enqueue_widget(): void {
 		'cinatra',
 		'CinatraConfig',
 		array(
-			'contractVersion' => CINATRA_CONTRACT_VERSION,
-			'cinatraUrl'      => rtrim( $url, '/' ),
+			'contractVersion'   => CINATRA_CONTRACT_VERSION,
+			'cinatraUrl'        => rtrim( $url, '/' ),
 			// No apiKey. The browser obtains a short-lived token from this endpoint.
-			'tokenEndpoint'   => rest_url( 'cinatra/v1/token' ),
-			'nonce'           => wp_create_nonce( 'wp_rest' ),
-			'instanceId'      => $instance_id,
-			'wpAdminUrl'      => admin_url(),
+			'tokenEndpoint'     => rest_url( 'cinatra/v1/token' ),
+			// Required-login (cinatra#410): same-origin broker relays for the
+			// per-user PKCE handshake. The long-lived cnx_ key stays server-side;
+			// these routes present it server-to-server to /api/widget-auth/*.
+			'authInitEndpoint'  => rest_url( 'cinatra/v1/widget-auth/init' ),
+			'authTokenEndpoint' => rest_url( 'cinatra/v1/widget-auth/token' ),
+			'nonce'             => wp_create_nonce( 'wp_rest' ),
+			'instanceId'        => $instance_id,
+			'wpAdminUrl'        => admin_url(),
+			// Feature-gate for the AI-tools path. True when the WordPress MCP
+			// Adapter (WordPress/mcp-adapter) is installed and active, giving the
+			// assistant access to WordPress content via MCP. False when the adapter
+			// is absent: the base chat widget still loads, but the widget should
+			// surface a clear "install the adapter to enable tools" state instead
+			// of a silent absence. Implements wordpress-plugin#62.
+			'mcpAdapterActive'  => cinatra_mcp_adapter_active(),
 		)
 	);
 }
@@ -1289,6 +1404,35 @@ add_action(
 				},
 			)
 		);
+
+			// Required-login (cinatra#410): per-user PKCE handshake relays. The
+			// browser POSTs here (same-origin, wp_rest nonce, manage_options); the
+			// PHP backend presents the long-lived cnx_ key server-to-server to the
+			// instance widget-auth endpoints and returns ONLY the upstream envelope
+			// (no key, no internals). Mirrors /token above.
+			register_rest_route(
+				'cinatra/v1',
+				'/widget-auth/init',
+				array(
+					'methods'             => 'POST',
+					'callback'            => 'cinatra_rest_widget_auth_init',
+					'permission_callback' => function () {
+						return current_user_can( 'manage_options' );
+					},
+				)
+			);
+
+			register_rest_route(
+				'cinatra/v1',
+				'/widget-auth/token',
+				array(
+					'methods'             => 'POST',
+					'callback'            => 'cinatra_rest_widget_auth_token',
+					'permission_callback' => function () {
+						return current_user_can( 'manage_options' );
+					},
+				)
+			);
 
 		register_rest_route(
 			'cinatra/v1',
@@ -1517,6 +1661,189 @@ function cinatra_rest_mint_token( WP_REST_Request $request ): WP_REST_Response {
 }
 
 /**
+ * Remove the long-lived integration key from a string before it is logged.
+ *
+ * The widget-auth relays carry the per-user code/codeVerifier outbound and the
+ * long-lived key in the Authorization header; a buggy/proxy/debug upstream could
+ * echo any of those into an error string. We cannot enumerate every transient
+ * secret, but the durable, highest-value one — the long-lived key — is redacted
+ * here so it can never land in a WordPress log. Mirrors the Drupal broker's
+ * scrub(). A blank key returns the text unchanged.
+ *
+ * @param string $text    The text about to be logged.
+ * @param string $api_key The long-lived integration key to redact.
+ * @return string The text with the key replaced by [redacted].
+ */
+function cinatra_scrub_secret( string $text, string $api_key ): string {
+	if ( '' === $api_key ) {
+		return $text;
+	}
+	return str_replace( $api_key, '[redacted]', $text );
+}
+
+/**
+ * Shared server-to-server relay for the per-user widget-auth handshake
+ * (cinatra#410). Validates the wp_rest nonce, presents the long-lived cnx_ key
+ * server-to-server to the instance's /api/widget-auth/{init,token} endpoint with
+ * the caller-whitelisted JSON, and returns ONLY the whitelisted upstream
+ * envelope to the browser. The long-lived key never reaches JS, and upstream
+ * error bodies are never reflected (generic message only). Mirrors the
+ * cinatra_rest_mint_token transport.
+ *
+ * @param WP_REST_Request $request The incoming REST request (wp_rest nonce + JSON params).
+ * @param string          $segment The upstream path segment ('init' or 'token').
+ * @param array           $fields  Whitelisted request-field names to forward.
+ * @param array           $passthrough Whitelisted response-field names to return.
+ * @return WP_REST_Response The upstream envelope (whitelisted), or an error response.
+ */
+function cinatra_rest_widget_auth_relay( WP_REST_Request $request, string $segment, array $fields, array $passthrough ): WP_REST_Response {
+	// CSRF: a valid wp_rest nonce must accompany the cookie-authenticated call.
+	$nonce = $request->get_header( 'X-WP-Nonce' );
+	if ( empty( $nonce ) || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+		return new WP_REST_Response( array( 'error' => __( 'Invalid or missing nonce.', 'cinatra' ) ), 403 );
+	}
+
+	$url     = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
+	$api_key = (string) get_option( 'cinatra_api_key', '' );
+	if ( empty( $url ) || empty( $api_key ) ) {
+		return new WP_REST_Response(
+			array( 'error' => __( 'Cinatra URL or API key is not configured.', 'cinatra' ) ),
+			500
+		);
+	}
+
+	// Forward ONLY whitelisted JSON fields the widget is allowed to set. The
+	// instance derives the rest (txn binding, the agent's instances config key,
+	// the user identity from the authenticated login). We never forward arbitrary
+	// keys, and never echo the long-lived key.
+	$params  = $request->get_json_params();
+	$forward = array();
+	if ( is_array( $params ) ) {
+		foreach ( $fields as $field ) {
+			if ( array_key_exists( $field, $params ) && null !== $params[ $field ] ) {
+				$forward[ $field ] = $params[ $field ];
+			}
+		}
+	}
+
+	// Route the TRANSPORT to the container-reachable base when CINATRA_BASE_URL is
+	// set (dev/container topology), else the configured cinatra_url (production).
+	$server_base = cinatra_server_base_url( $url );
+	$endpoint    = $server_base . '/api/widget-auth/' . $segment;
+
+	// Assert THIS site's own origin on the server-to-server relay. The instance's
+	// /api/widget-auth/{init,token} enforces a paired Origin === the `cnx_`
+	// credential's bound connect-site origin (fail-closed: a missing Origin is
+	// rejected). We derive the origin from admin_url() — the SAME source the
+	// connect handshake used to register this site's `widget_origin` (see the
+	// connect-start payload) — so a split front-end/admin origin install still
+	// asserts the registered origin and matches. The relay cannot spoof another
+	// site because the credential_hash must ALSO match the same connect-site row,
+	// so this header is identity assertion, not a trust grant. The browser never
+	// reaches this endpoint (server-to-server only).
+	$site_origin   = cinatra_site_origin( admin_url() );
+	$relay_headers = array(
+		'Authorization' => 'Bearer ' . $api_key,
+		'Content-Type'  => 'application/json',
+		'Accept'        => 'application/json',
+	);
+	if ( '' !== $site_origin ) {
+		$relay_headers['Origin'] = $site_origin;
+	}
+
+	$response = cinatra_server_post(
+		$endpoint,
+		array(
+			'timeout' => 10,
+			'headers' => $relay_headers,
+			'body'    => wp_json_encode( $forward ),
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		// Log the transport detail server-side; return a generic message so we
+		// never reflect low-level/internal error text to the browser. SCRUB the
+		// long-lived key first: a buggy/proxy upstream error could echo the
+		// outgoing Authorization: Bearer cnx_... back into the message, and these
+		// widget-auth relays carry the per-user code/codeVerifier, so the key must
+		// never reach WP logs.
+		error_log( '[cinatra] widget-auth ' . $segment . ' endpoint unreachable: ' . cinatra_scrub_secret( $response->get_error_message(), $api_key ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; the long-lived key is scrubbed and the detail is never reflected to the browser.
+		return new WP_REST_Response(
+			array( 'error' => __( 'Could not reach the Cinatra instance. Check the connector URL, or contact your administrator.', 'cinatra' ) ),
+			502
+		);
+	}
+
+	$status = (int) wp_remote_retrieve_response_code( $response );
+	$raw    = (string) wp_remote_retrieve_body( $response );
+	$json   = json_decode( $raw, true );
+
+	if ( $status < 200 || $status >= 300 || ! is_array( $json ) ) {
+		// Never reflect the upstream body to the browser. Log server-side (with
+		// the long-lived key scrubbed); return a generic, actionable message.
+		// Always 502 from the browser's view.
+		$detail = ( is_array( $json ) && ! empty( $json['error'] ) ) ? (string) $json['error'] : substr( $raw, 0, 500 );
+		error_log( '[cinatra] widget-auth ' . $segment . ' failed (HTTP ' . $status . '): ' . cinatra_scrub_secret( $detail, $api_key ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; the long-lived key is scrubbed and the detail is never reflected to the browser.
+		return new WP_REST_Response(
+			array( 'error' => __( 'Cinatra could not complete sign-in. Check the connector settings, or contact your administrator.', 'cinatra' ) ),
+			502
+		);
+	}
+
+	// Return ONLY the whitelisted upstream fields to the browser.
+	$out = array();
+	foreach ( $passthrough as $key ) {
+		if ( array_key_exists( $key, $json ) ) {
+			$out[ $key ] = $json[ $key ];
+		}
+	}
+	$resp = new WP_REST_Response( $out, 200 );
+	// The redeem response carries the opaque per-user token; never cache it.
+	$resp->header( 'Cache-Control', 'no-store, private' );
+	return $resp;
+}
+
+/**
+ * REST: start the per-user widget-auth PKCE handshake (cinatra#410).
+ *
+ * Forwards the PKCE challenge + state to /api/widget-auth/init server-to-server
+ * (presenting the long-lived cnx_ key) and returns the {txnId, authorizeUrl,
+ * instanceId} envelope. The browser opens authorizeUrl as the hosted login
+ * popup; raw credentials never touch this CMS DOM.
+ *
+ * @param WP_REST_Request $request The incoming REST request.
+ * @return WP_REST_Response The init envelope, or an error response.
+ */
+function cinatra_rest_widget_auth_init( WP_REST_Request $request ): WP_REST_Response {
+	return cinatra_rest_widget_auth_relay(
+		$request,
+		'init',
+		array( 'client', 'agentSlug', 'codeChallenge', 'codeChallengeMethod', 'state', 'instanceId' ),
+		array( 'txnId', 'authorizeUrl', 'instanceId' )
+	);
+}
+
+/**
+ * REST: redeem the authorization code for the opaque per-user token (cinatra#410).
+ *
+ * Forwards {grantType, client, agentSlug, code, codeVerifier} to
+ * /api/widget-auth/token server-to-server (presenting the long-lived cnx_ key)
+ * and returns the {token: cwu_..., tokenType, expiresIn, scope} envelope. The
+ * browser sends that token on the dual-token stream (cinatra#408).
+ *
+ * @param WP_REST_Request $request The incoming REST request.
+ * @return WP_REST_Response The token envelope, or an error response.
+ */
+function cinatra_rest_widget_auth_token( WP_REST_Request $request ): WP_REST_Response {
+	return cinatra_rest_widget_auth_relay(
+		$request,
+		'token',
+		array( 'grantType', 'client', 'agentSlug', 'code', 'codeVerifier' ),
+		array( 'token', 'tokenType', 'expiresIn', 'scope' )
+	);
+}
+
+/**
  * REST: list the stored webhook subscriptions.
  *
  * @param WP_REST_Request $request The incoming REST request (unused; required by the callback signature).
@@ -1623,4 +1950,256 @@ function cinatra_get_webhook_subscriptions(): array {
 function cinatra_save_webhook_subscriptions( array $subscriptions ): void {
 	update_option( 'cinatra_webhook_subscriptions', wp_json_encode( array_values( $subscriptions ) ) );
 }
+
+// ---------------------------------------------------------------------------
+// Publish emitter (wp#48). On a post transitioning INTO 'publish' this fires a
+// signed server-to-server webhook to the connected Cinatra instance so the
+// agent can react to newly-published content.
+//
+// WIRE CONTRACT — pinned to the MERGED host bridge
+// (cinatra: src/app/api/webhooks/wordpress/route.ts +
+// packages/webhooks/src/verify.ts `verifyLegacyHmac`):
+// - TARGET   : {cinatra_url}/api/webhooks/wordpress — the simple per-site
+// shared-secret route. The transport base is resolved through
+// cinatra_server_base_url() and the POST goes via the SSRF-safe
+// cinatra_server_post(); the plugin never posts to an operator-entered
+// target_url (that would be an SSRF surface) and never to the generic
+// webhook/.../<bindingId> bridge (needs a server-issued opaque binding id
+// the plugin does not hold).
+// - SIGNING  : a bespoke legacy HMAC — header `X-Cinatra-Sig-256: sha256=<hex>`
+// where <hex> = hash_hmac('sha256', $raw_body, $secret) over the EXACT bytes
+// posted. The body is JSON-encoded ONCE and the same string is both signed
+// and sent. (The issue TITLE says "Standard-Webhooks"; the merged host
+// bridge verifies this legacy HMAC, so we follow the merged contract. See
+// the PR for the discrepancy note.)
+// - PAYLOAD  : the exact strict host Zod schema —
+// { event:"post_published", postId:int>0, postType:string, title:string,
+// url?:string, siteUrl:string, issuedAt:string }.
+// - IDEMPOTENCY: `X-Cinatra-Webhook-Id` is STABLE per publish event (derived
+// from the site instance id + post id + post_modified_gmt) so a retried
+// delivery carries the same id and the host can dedupe.
+//
+// SAFETY: emission is fire-and-forget — it NEVER blocks or fails a publish, only
+// ever posts to the operator-configured cinatra_url via the SSRF-safe helper
+// (no arbitrary host), and logs only fixed text + an HTTP status on failure
+// (never the secret, signature, raw body, title, or any upstream response body).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the publish-webhook endpoint URL for the configured Cinatra instance.
+ *
+ * Resolves the transport base through cinatra_server_base_url() (so a validated
+ * CINATRA_BASE_URL container override redirects the TRANSPORT in dev, while
+ * production uses the configured cinatra_url unchanged) and appends the fixed
+ * simple-route path. Returns '' when no instance URL is configured.
+ *
+ * @return string The full endpoint URL, or '' when cinatra_url is unset.
+ */
+function cinatra_publish_webhook_endpoint(): string {
+	$base = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
+	if ( '' === $base ) {
+		return '';
+	}
+	$transport = cinatra_server_base_url( $base );
+	return rtrim( $transport, '/' ) . '/api/webhooks/wordpress';
+}
+
+/**
+ * Whether a stored webhook subscription enables 'post_published' emission for
+ * the given post.
+ *
+ * Returns true iff a subscription row has event_type === 'post_published' AND
+ * its post_types filter is either empty (all post types) or includes the post's
+ * type. The subscription registry stays the enable + post-type filter (its
+ * existing purpose); the network destination is ALWAYS the fixed simple route,
+ * so the operator-entered (free-form) target_url is intentionally NOT matched
+ * here — normalizing it against the host route would be brittle and could
+ * silently drop legitimate publishes.
+ *
+ * @param WP_Post $post The post being published.
+ * @return bool True when at least one matching subscription enables emission.
+ */
+function cinatra_publish_emit_enabled_for_post( WP_Post $post ): bool {
+	$post_type = (string) $post->post_type;
+	foreach ( cinatra_get_webhook_subscriptions() as $subscription ) {
+		if ( 'post_published' !== ( $subscription['event_type'] ?? '' ) ) {
+			continue;
+		}
+		$post_types = (array) ( $subscription['post_types'] ?? array() );
+		if ( array() === $post_types || in_array( $post_type, $post_types, true ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Whether a value is a well-formed ABSOLUTE http(s) URL with a host.
+ *
+ * Used to gate the optional `url` payload field so it satisfies the host
+ * schema's Zod .url() (which rejects relative URLs); a permalink that is not a
+ * clean absolute URL is omitted rather than sent.
+ *
+ * @param string $url Candidate URL.
+ * @return bool True when $url is an absolute http/https URL with a host.
+ */
+function cinatra_is_absolute_http_url( string $url ): bool {
+	if ( '' === $url ) {
+		return false;
+	}
+	$scheme = wp_parse_url( $url, PHP_URL_SCHEME );
+	$host   = wp_parse_url( $url, PHP_URL_HOST );
+	return ( 'http' === $scheme || 'https' === $scheme )
+		&& is_string( $host ) && '' !== $host;
+}
+
+/**
+ * Build the strict publish-webhook payload for a post (exactly the host schema).
+ *
+ * @param WP_Post $post The published post.
+ * @return array The payload array: event, postId, postType, title, url, siteUrl, issuedAt.
+ */
+function cinatra_build_publish_payload( WP_Post $post ): array {
+	$payload = array(
+		'event'    => 'post_published',
+		'postId'   => (int) $post->ID,
+		'postType' => (string) $post->post_type,
+		'title'    => (string) get_the_title( $post ),
+		'siteUrl'  => home_url(),
+		'issuedAt' => gmdate( 'c' ),
+	);
+	// The host schema validates `url` as an ABSOLUTE URL (Zod .url()). Include it
+	// ONLY when get_permalink() yields a well-formed absolute http(s) URL; a
+	// relative/custom-filtered permalink would otherwise fail the host's strict
+	// parse and reject the whole payload. `url` is optional, so omit it instead.
+	$permalink = get_permalink( $post );
+	if ( is_string( $permalink ) && cinatra_is_absolute_http_url( $permalink ) ) {
+		$payload['url'] = $permalink;
+	}
+	return $payload;
+}
+
+/**
+ * Build the STABLE per-publish-event idempotency id.
+ *
+ * Stable across retries of the SAME publish event (so the host can dedupe a
+ * re-delivered webhook): derived from the site instance id, the post id, and
+ * the post's last-modified GMT timestamp. NOT random per send.
+ *
+ * @param WP_Post $post The published post.
+ * @return string The webhook id (e.g. "wp-<instance>-<postId>-<modified-epoch>").
+ */
+function cinatra_publish_webhook_id( WP_Post $post ): string {
+	$instance_id = (string) get_option( 'cinatra_instance_id', '' );
+	if ( '' === $instance_id ) {
+		// Fall back to the site home so the id is still stable + site-scoped when
+		// no instance id is configured.
+		$instance_id = (string) wp_parse_url( home_url(), PHP_URL_HOST );
+	}
+	// Stable revision component from the post's last-modified GMT. Prefer the
+	// parsed epoch; if the stored timestamp is unparseable (strtotime false),
+	// fall back to a sanitized form of the raw value so the id is still stable
+	// and NEVER ends in an empty suffix.
+	$modified = (string) $post->post_modified_gmt;
+	$epoch    = strtotime( $modified . ' UTC' );
+	if ( false !== $epoch ) {
+		$revision = (string) $epoch;
+	} else {
+		$revision = preg_replace( '/[^0-9A-Za-z]+/', '', $modified );
+		if ( '' === (string) $revision ) {
+			$revision = '0';
+		}
+	}
+	return 'wp-' . $instance_id . '-' . (int) $post->ID . '-' . $revision;
+}
+
+/**
+ * Emit a signed 'post_published' webhook when a post transitions INTO publish.
+ *
+ * Bound to transition_post_status. Fire-and-forget and fully non-fatal: every
+ * bail is quiet and nothing here can block or fail the publish itself.
+ *
+ * @param string  $new_status The new post status.
+ * @param string  $old_status The previous post status.
+ * @param WP_Post $post       The post object (transition_post_status passes it third).
+ * @return void
+ */
+function cinatra_emit_post_published( $new_status, $old_status, $post ): void {
+	// Only a genuine transition INTO publish (skip publish->publish edits and
+	// any non-publish status change).
+	if ( 'publish' !== $new_status || 'publish' === $old_status ) {
+		return;
+	}
+	if ( ! $post instanceof WP_Post ) {
+		return;
+	}
+	// Never fire for revisions / autosaves.
+	if ( wp_is_post_revision( $post ) || wp_is_post_autosave( $post ) ) {
+		return;
+	}
+	// Attachments are a public post type but represent media, not editorial
+	// content — never emit for them even if a subscription matches all types.
+	if ( 'attachment' === $post->post_type ) {
+		return;
+	}
+	// Only public post types (skip revisions and internal/non-public types).
+	$type_object = get_post_type_object( $post->post_type );
+	if ( null === $type_object || empty( $type_object->public ) ) {
+		return;
+	}
+
+	// Quiet bails: no instance configured, no signing secret, or no subscription
+	// enabling this post's type.
+	$endpoint = cinatra_publish_webhook_endpoint();
+	$secret   = (string) get_option( 'cinatra_webhook_secret', '' );
+	if ( '' === $endpoint || '' === $secret ) {
+		return;
+	}
+	if ( ! cinatra_publish_emit_enabled_for_post( $post ) ) {
+		return;
+	}
+
+	// Encode the body ONCE; sign and send the SAME exact bytes. Bail quietly if
+	// encoding fails (an empty signed body would only be rejected by the host).
+	$raw_body = wp_json_encode( cinatra_build_publish_payload( $post ) );
+	if ( ! is_string( $raw_body ) || '' === $raw_body ) {
+		return;
+	}
+	$signature = 'sha256=' . hash_hmac( 'sha256', $raw_body, $secret );
+
+	// Blocking with a short timeout. We deliberately keep blocking => true: a
+	// non-blocking request can drop the request BODY in some WordPress HTTP
+	// transports, which would invalidate the signed delivery. The short timeout
+	// caps the worst-case added publish latency when the instance is slow/down.
+	// Delivery is best-effort — a failure is logged (fixed text) and NEVER blocks
+	// or fails the publish. Durable retry/queueing is intentionally out of scope
+	// here; the STABLE X-Cinatra-Webhook-Id is what lets the host dedupe a future
+	// re-delivery if a retry path is added later.
+	$response = cinatra_server_post(
+		$endpoint,
+		array(
+			'timeout'  => 4,
+			'blocking' => true,
+			'headers'  => array(
+				'Content-Type'         => 'application/json',
+				'Accept'               => 'application/json',
+				'X-Cinatra-Sig-256'    => $signature,
+				'X-Cinatra-Webhook-Id' => cinatra_publish_webhook_id( $post ),
+			),
+			'body'     => $raw_body,
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		// Fixed text only — never the secret, signature, body, title, or upstream
+		// detail.
+		error_log( '[cinatra] publish webhook transport failed.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional fixed-text server-side warning; never logs any secret, signature, payload, or upstream detail.
+		return;
+	}
+	$code = (int) wp_remote_retrieve_response_code( $response );
+	if ( $code < 200 || $code >= 300 ) {
+		error_log( '[cinatra] publish webhook rejected: HTTP ' . $code ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional fixed-text + status-only server-side warning; never logs any secret, signature, payload, or upstream body.
+	}
+}
+add_action( 'transition_post_status', 'cinatra_emit_post_published', 10, 3 );
 

@@ -1,27 +1,27 @@
 {
   "meta": {
     "name": "Cinatra WordPress.org directory asset manifest",
-    "description": "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the cinatra-ai/design repo (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
-    "designRepo": "cinatra-ai/design",
-    "note": "icon/banner derive from the design repo masters; screenshot-N.png are representative mockups of the shipping plugin UI (Settings page copy + the floating button's exact fedora glyph and theme colours), rendered by the same sharp+SVG pipeline. A real browser capture of a live WordPress install can supersede these post-launch."
+    "description": "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the Cinatra design system (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
+    "designSource": "Cinatra design system",
+    "note": "icon + banner derive from the design system masters. The directory icon follows the brand favicon treatment — the mustard fedora on a clean white/paper ground with a hairline border (design assets/logo/variants.json: 'Mustard on paper or surface ... Never mustard on a coloured chip or on the navy ground'). screenshot-1.png, screenshot-2.png and screenshot-3.png are real captures of the plugin running in a live wp-admin (assistant in action, account sign-in, and the connect/settings page), not generated assets; their captions live in readme.txt under == Screenshots ==."
   },
   "entries": [
     {
       "path": ".wordpress-org/icon-128x128.png",
       "source": "design assets/logo/cinatra-mark.svg",
-      "colorway": "app icon (mustard fedora on navy)",
+      "colorway": "favicon (mustard fedora on white/paper, hairline border)",
       "dimensions": "128x128",
       "tokensVersion": "0.1.0",
-      "sha256": "e9c89bd3ec550a8bcf745be79ea74980ad8c2edf7485522a1473bbea0e445504",
+      "sha256": "79ffd90938d9c8497cb30a82935f4368f554ee4683418ef308a501d0426f8f9a",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     },
     {
       "path": ".wordpress-org/icon-256x256.png",
       "source": "design assets/logo/cinatra-mark.svg",
-      "colorway": "app icon (mustard fedora on navy)",
+      "colorway": "favicon (mustard fedora on white/paper, hairline border)",
       "dimensions": "256x256",
       "tokensVersion": "0.1.0",
-      "sha256": "8c692f456005ba2e2f81ce5d4a1885ad0c8b15bf6914c70c7b9e5bc69c52003e",
+      "sha256": "8c7c4906fcb52115a851230db2f58d67e268b2f30ffa74eaf9cb3d1c87025208",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     },
     {
@@ -40,33 +40,6 @@
       "dimensions": "1544x500",
       "tokensVersion": "0.1.0",
       "sha256": "03420f3724259b30efff47b3844578eefe5a965ecf1a545da1b1c1cc77f3b4bc",
-      "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
-    },
-    {
-      "path": ".wordpress-org/screenshot-1.png",
-      "source": "plugin UI: cinatra_render_settings_page() in cinatra.php",
-      "colorway": "wp-admin chrome (Settings -> Cinatra)",
-      "dimensions": "1280x800",
-      "tokensVersion": "0.1.0",
-      "sha256": "1d120f17804e33c598a786ab5a3944597bee6ef81519f8443ec952677ba5897f",
-      "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
-    },
-    {
-      "path": ".wordpress-org/screenshot-2.png",
-      "source": "plugin UI: #cw-fallback-btn (assets/cinatra-fallback.css + cinatra.php)",
-      "colorway": "wp-admin chrome + floating assistant button",
-      "dimensions": "1280x800",
-      "tokensVersion": "0.1.0",
-      "sha256": "8563bcfb30c07cc9d1a5b0ac90370bdda97e1f6e13ec77d9f867b6e61e4a0a2e",
-      "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
-    },
-    {
-      "path": ".wordpress-org/screenshot-3.png",
-      "source": "plugin UI: assistant chat panel (assets/cinatra-widget.js .cw-* DOM/CSS)",
-      "colorway": "wp-admin chrome + chat panel open (cream panel, mustard wordmark)",
-      "dimensions": "1280x800",
-      "tokensVersion": "0.1.0",
-      "sha256": "2cadce0e594bb3100ab281a8ad10e22f6d9c424a1ac871b36098949f8e5092eb",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     }
   ]

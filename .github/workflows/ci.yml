@@ -36,6 +36,8 @@ jobs:
           php-version: "8.2"
       - name: Run standalone behavior tests (no WP install required)
         run: php tests/test-token-broker.php
+      - name: Run publish-emitter behavior tests (no WP install required)
+        run: php tests/test-publish-emitter.php
 
   js-tests:
     runs-on: ubuntu-latest

@@ -28,6 +28,7 @@ $GLOBALS['cinatra_test'] = [
     'remote_post_calls'    => [],   // captured wp_remote_post args (+ filters_active snapshot)
     'filters'              => [],   // hook => count of currently-registered callbacks
     'filter_cbs'           => [],   // hook => [live callbacks] (for safe-request replay)
+    'active_plugins'       => [],   // active plugin files for is_plugin_active() stub
 ];
 
 // ---------------------------------------------------------------------------
@@ -111,6 +112,58 @@ function sanitize_hex_color($color) {
     return (is_string($color) && preg_match('/^#([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6})$/', $color)) ? $color : '';
 }
 function post_type_exists($pt) { return in_array($pt, ['post', 'page'], true); }
+// MCP Adapter detection: fixture-controlled via $GLOBALS['cinatra_test']['active_plugins'].
+// The cinatra_mcp_adapter_active() function requires is_plugin_active() which normally
+// loads wp-admin/includes/plugin.php; stub it here so tests do not need a real WP install.
+function is_plugin_active($plugin) {
+    return in_array($plugin, (array) ($GLOBALS['cinatra_test']['active_plugins'] ?? []), true);
+}
+// HTML sanitisation stubs (pass-through for tests; the tag/attribute filter is irrelevant
+// in the test harness since no real HTML output is asserted in these tests).
+function wp_kses($text, $allowed_html, $allowed_protocols = []) { return $text; }
+function wp_kses_post($text) { return $text; }
+
+// ---------------------------------------------------------------------------
+// Post / publish-emitter stubs (wp#48). Behavior is driven by the fixture:
+//   $GLOBALS['cinatra_test']['post_types']   => post_type => ['public' => bool]
+//   $GLOBALS['cinatra_test']['is_revision']  => bool (wp_is_post_revision)
+//   $GLOBALS['cinatra_test']['is_autosave']  => bool (wp_is_post_autosave)
+// A WP_Post stub carries the fields the emitter reads.
+// ---------------------------------------------------------------------------
+class WP_Post {
+    public $ID;
+    public $post_type;
+    public $post_title;
+    public $post_status;
+    public $post_modified_gmt;
+    public $permalink;
+    public function __construct(array $fields = []) {
+        $this->ID = $fields['ID'] ?? 0;
+        $this->post_type = $fields['post_type'] ?? 'post';
+        $this->post_title = $fields['post_title'] ?? '';
+        $this->post_status = $fields['post_status'] ?? 'publish';
+        $this->post_modified_gmt = $fields['post_modified_gmt'] ?? '2026-06-24 12:00:00';
+        $this->permalink = $fields['permalink'] ?? '';
+    }
+}
+function get_the_title($post) {
+    return $post instanceof WP_Post ? (string) $post->post_title : '';
+}
+function get_permalink($post) {
+    return $post instanceof WP_Post ? (string) $post->permalink : '';
+}
+function get_post_type_object($post_type) {
+    $registry = $GLOBALS['cinatra_test']['post_types'] ?? [
+        'post' => ['public' => true],
+        'page' => ['public' => true],
+    ];
+    if (!array_key_exists($post_type, $registry)) {
+        return null;
+    }
+    return (object) $registry[$post_type];
+}
+function wp_is_post_revision($post) { return (bool) ($GLOBALS['cinatra_test']['is_revision'] ?? false); }
+function wp_is_post_autosave($post) { return (bool) ($GLOBALS['cinatra_test']['is_autosave'] ?? false); }
 
 // ---------------------------------------------------------------------------
 // Options
