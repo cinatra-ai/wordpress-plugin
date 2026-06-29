@@ -1,14 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Cinatra WordPress assistant widget — vendored, locally-served bundle.
+// Cinatra WordPress assistant widget — CANONICAL, locally-served widget (cinatra#411).
 //
-// This file is a human-readable vendored copy of the Cinatra widget IIFE that
-// the Cinatra instance previously served from `/api/wordpress/bundle.js`
-// (cinatra-ai/cinatra: src/app/api/wordpress/bundle.js/route.ts). It is shipped
-// locally so the plugin never remote-loads executable code into wp-admin and so
-// the long-lived integration key never reaches the browser (see wp#4 / cinatra#220).
+// This file is the CANONICAL source-of-truth widget for WordPress and is
+// AUTHORED FIRST; the Drupal copy (cinatra-ai/drupal-module/js/cinatra-widget.js)
+// is hand-mirrored from it. The Cinatra instance previously served a widget IIFE
+// from `/api/wordpress/bundle.js` (cinatra-ai/cinatra:
+// src/app/api/wordpress/bundle.js/route.ts), but that route is now the
+// DEPRECATED, pre-Option-A artifact (nothing executes it; scheduled for removal)
+// — this copy is NOT re-vendored from it. It is shipped locally so the plugin
+// never remote-loads executable code into wp-admin and so the long-lived
+// integration key never reaches the browser (see wp#4 / cinatra#220, and the
+// contract: cinatra docs/widget-source-of-truth.md).
 //
-// Modifications from the upstream bundle:
+// #410's login UI is authored HERE first, then mirrored to the Drupal copy.
+//
+// Security-critical invariants (no apiKey in the browser; tokenEndpoint broker;
+// short-lived-token Bearer stream; contract-version set) are gated by
+// tools/widget-parity-check.mjs in CI.
+//
+// Modifications from the original instance-served bundle:
 //   * The long-lived `apiKey` is removed from the browser. The widget exchanges
 //     a short-lived, origin/audience/scope-bound token via the same-origin
 //     WordPress REST broker (`CinatraConfig.tokenEndpoint`) and streams with it.
