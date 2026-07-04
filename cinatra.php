@@ -110,17 +110,12 @@ add_action(
 				'default'           => '',
 			)
 		);
-		register_setting(
-			'cinatra_options',
-			'cinatra_webhook_secret',
-			array(
-				'type'              => 'string',
-				'sanitize_callback' => function ( $value ) {
-					return cinatra_sanitize_secret_keep_existing( $value, 'cinatra_webhook_secret' );
-				},
-				'default'           => '',
-			)
-		);
+		// cinatra_webhook_secret is intentionally NOT registered as a settings
+		// field any more (cinatra#974): the publish-webhook signing secret is
+		// server-issued by the connect token exchange as a PAIR with
+		// cinatra_webhook_binding_id, and a manually pasted secret could never
+		// carry the paired binding id — so the pair is programmatic-only and
+		// the settings form never reads or writes it.
 		register_setting(
 			'cinatra_options',
 			'cinatra_webhook_subscriptions',
@@ -438,20 +433,16 @@ function cinatra_render_settings_page() {
 					</td>
 				</tr>
 				<tr>
-					<th scope="row"><label for="cinatra_webhook_secret"><?php echo esc_html__( 'Webhook Secret', 'cinatra' ); ?></label></th>
+					<th scope="row"><?php echo esc_html__( 'Publish Webhooks', 'cinatra' ); ?></th>
 					<td>
-						<input
-							type="password"
-							id="cinatra_webhook_secret"
-							name="cinatra_webhook_secret"
-							value=""
-							class="regular-text"
-							autocomplete="off"
-							placeholder="<?php echo cinatra_has_secret( 'cinatra_webhook_secret' ) ? esc_attr__( '(stored — leave blank to keep)', 'cinatra' ) : ''; ?>"
-						/>
-						<p class="description">
-							<?php echo esc_html__( 'A shared secret stored here and on your Cinatra instance. Cinatra uses it on its own side to sign the requests it makes; this plugin only stores the value and maintains a subscription registry. It does not receive or verify inbound signed webhooks.', 'cinatra' ); ?>
-							<?php echo esc_html__( 'Leave blank to keep the stored value.', 'cinatra' ); ?>
+						<p>
+							<?php if ( cinatra_webhook_pair_configured() ) : ?>
+								<strong><?php echo esc_html__( 'Provisioned.', 'cinatra' ); ?></strong>
+								<?php echo esc_html__( 'Publish events are signed and delivered to your Cinatra instance.', 'cinatra' ); ?>
+							<?php else : ?>
+								<strong><?php echo esc_html__( 'Not provisioned.', 'cinatra' ); ?></strong>
+								<?php echo esc_html__( 'Use "Connect with Cinatra" (or reconnect) to provision publish webhooks. The signing credentials are issued by your Cinatra instance during the connection — there is nothing to paste here.', 'cinatra' ); ?>
+							<?php endif; ?>
 						</p>
 					</td>
 				</tr>
@@ -593,6 +584,13 @@ add_action(
 				esc_html__( 'The Agent Instance ID is not set — the AI assistant will not be able to edit content. Set it in the manual configuration below.', 'cinatra' )
 			);
 		}
+		if ( cinatra_webhook_reconnect_needed() ) {
+			printf(
+				'<div class="notice notice-warning"><p><strong>%1$s</strong> %2$s</p></div>',
+				esc_html__( 'Cinatra publish webhooks are paused:', 'cinatra' ),
+				esc_html__( 'This site has a publish-webhook subscription but no server-issued webhook credentials. Reconnect this site to your Cinatra instance ("Connect with Cinatra") to provision them — publish events are not delivered until then.', 'cinatra' )
+			);
+		}
 	}
 );
 
@@ -622,6 +620,9 @@ const CINATRA_CONNECT_CALLBACK_ACTION   = 'cinatra_connect_callback';
 const CINATRA_CONNECT_STATE_TTL         = 600; // Seconds.
 const CINATRA_CONNECT_RESULT_KEY_PREFIX = 'cinatra_connect_result_';
 const CINATRA_CONNECT_STATE_PREFIX      = 'cinatra_connect_state_';
+// cinatra#974: the webhook-contract value sent in the token exchange and
+// echoed back by a host that provisions the Standard-Webhooks pair.
+const CINATRA_WEBHOOK_CONTRACT = 'standard-webhooks';
 
 /**
  * Validate a user-supplied Cinatra instance URL for use as an OUTBOUND redirect
@@ -1069,11 +1070,17 @@ add_action(
 		$result = cinatra_connect_exchange(
 			(string) $stored['instance_url'],
 			array(
-				'grant_type'    => 'authorization_code',
-				'code'          => $code,
-				'client'        => CINATRA_CONNECT_CLIENT,
-				'redirect_uri'  => (string) ( $stored['redirect_uri'] ?? cinatra_connect_redirect_uri() ),
-				'code_verifier' => (string) $stored['code_verifier'],
+				'grant_type'       => 'authorization_code',
+				'code'             => $code,
+				'client'           => CINATRA_CONNECT_CLIENT,
+				'redirect_uri'     => (string) ( $stored['redirect_uri'] ?? cinatra_connect_redirect_uri() ),
+				'code_verifier'    => (string) $stored['code_verifier'],
+				// cinatra#974: capability signal — this plugin signs publish
+				// webhooks as Standard-Webhooks against the generic /webhook
+				// route. A host that understands it echoes `webhookContract`
+				// and returns the PAIRED webhookSecret + webhookBindingId; an
+				// older host ignores the field.
+				'webhook_contract' => CINATRA_WEBHOOK_CONTRACT,
 			)
 		);
 
@@ -1103,9 +1110,11 @@ add_action(
 		$result = cinatra_connect_exchange(
 			$parsed['instance_url'],
 			array(
-				'grant_type'   => 'install_code',
-				'install_code' => $parsed['install_code'],
-				'client'       => CINATRA_CONNECT_CLIENT,
+				'grant_type'       => 'install_code',
+				'install_code'     => $parsed['install_code'],
+				'client'           => CINATRA_CONNECT_CLIENT,
+				// cinatra#974: same capability signal as the redirect path.
+				'webhook_contract' => CINATRA_WEBHOOK_CONTRACT,
 			)
 		);
 
@@ -1212,6 +1221,22 @@ function cinatra_connect_exchange( string $instance_url, array $body ): array {
  * long-lived credential is stored server-side; nothing is returned to the
  * browser beyond a generic success/failure notice.
  *
+ * Webhook pair semantics (cinatra#974, mirroring the drupal-module):
+ * cinatra_webhook_secret + cinatra_webhook_binding_id are a PAIR written
+ * together — a secret is only usable against the binding it was minted with.
+ * The pair is stored ONLY from a response that ECHOES
+ * `webhookContract: "standard-webhooks"` AND carries both halves. When the
+ * echo is present but the pair is omitted (a transient binding-mint failure on
+ * the host) an existing pair for the SAME instance is kept — the next
+ * reconnect re-mints idempotently. When the echo is ABSENT (an older host, or
+ * one rolled back below the contract) any stored pair is DISCARDED (codex:
+ * such a host serves the plugin's binding as a legacy-bridge row, which
+ * rejects Standard-Webhooks headers — keeping the pair would 401 every
+ * publish with no "not provisioned" signal). A pair belonging to a DIFFERENT
+ * instance can never survive either way: the cinatra_url / instance-id option
+ * hooks below clear it the moment the stored identity changes, BEFORE the
+ * pair write at the end of this function.
+ *
  * @param array $result Normalized exchange result from cinatra_connect_exchange().
  * @return void
  */
@@ -1226,14 +1251,134 @@ function cinatra_connect_apply_result( array $result ): void {
 		update_option( 'cinatra_url', $instance_url );
 	}
 	update_option( 'cinatra_api_key', cinatra_sanitize_secret( (string) $r['credential'] ) );
-	if ( ! empty( $r['cinatraInstanceId'] ) ) {
-		update_option( 'cinatra_instance_id', sanitize_text_field( (string) $r['cinatraInstanceId'] ) );
+	// Always overwrite the instance id from THIS connection — empty when the
+	// host returned none (codex: an only-when-present update could leave a
+	// stale identity from a previous instance and mask an identity change).
+	update_option( 'cinatra_instance_id', sanitize_text_field( (string) ( $r['cinatraInstanceId'] ?? '' ) ) );
+
+	// PAIRED webhook persistence — LAST, so the identity-change hooks above
+	// have already cleared any stale pair before the new one lands.
+	$contract   = (string) ( $r['webhookContract'] ?? '' );
+	$secret     = cinatra_sanitize_secret( (string) ( $r['webhookSecret'] ?? '' ) );
+	$binding_id = cinatra_sanitize_webhook_binding_id( (string) ( $r['webhookBindingId'] ?? '' ) );
+	if ( CINATRA_WEBHOOK_CONTRACT === $contract && '' !== $secret && '' !== $binding_id ) {
+		update_option( 'cinatra_webhook_secret', $secret );
+		update_option( 'cinatra_webhook_binding_id', $binding_id );
+	} elseif ( CINATRA_WEBHOOK_CONTRACT !== $contract ) {
+		cinatra_clear_webhook_pair();
 	}
-	if ( ! empty( $r['webhookSecret'] ) ) {
-		update_option( 'cinatra_webhook_secret', cinatra_sanitize_secret( (string) $r['webhookSecret'] ) );
-	}
+	// else: echo present, pair omitted — keep whatever pair survives (same
+	// instance keeps its working pair; a changed instance was already cleared
+	// by the option hooks).
 	cinatra_set_connect_result( 'success', __( 'Connected to Cinatra. The integration credential is stored on this server.', 'cinatra' ) );
 }
+
+/**
+ * Delete the paired publish-webhook credentials (secret + server-issued
+ * binding id). The two options are only ever written together by
+ * cinatra_connect_apply_result(), so they are only ever cleared together.
+ *
+ * @return void
+ */
+function cinatra_clear_webhook_pair(): void {
+	delete_option( 'cinatra_webhook_secret' );
+	delete_option( 'cinatra_webhook_binding_id' );
+}
+
+/**
+ * Whether the paired publish-webhook credentials are configured.
+ *
+ * @return bool True when BOTH the signing secret and the binding id are stored.
+ */
+function cinatra_webhook_pair_configured(): bool {
+	return '' !== (string) get_option( 'cinatra_webhook_secret', '' )
+		&& '' !== (string) get_option( 'cinatra_webhook_binding_id', '' );
+}
+
+/**
+ * Whether the settings screen should prompt for a reconnect: the site is
+ * connected and has a publish-webhook subscription, but no server-issued
+ * webhook pair (e.g. the plugin was updated before its Cinatra instance, or
+ * the connection predates the pair). Publish events are NOT delivered in this
+ * state (there is deliberately no legacy fallback).
+ *
+ * @return bool True when a reconnect would (re)enable publish webhooks.
+ */
+function cinatra_webhook_reconnect_needed(): bool {
+	if ( cinatra_webhook_pair_configured() ) {
+		return false;
+	}
+	if ( '' === (string) get_option( 'cinatra_url', '' ) || '' === (string) get_option( 'cinatra_api_key', '' ) ) {
+		return false;
+	}
+	foreach ( cinatra_get_webhook_subscriptions() as $subscription ) {
+		if ( 'post_published' === ( $subscription['event_type'] ?? '' ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Sanitize a server-issued webhook binding id: an opaque URL-safe token (the
+ * host mints base64url). Anything outside [A-Za-z0-9_-]{1,128} collapses to ''
+ * so the value can never smuggle a path segment into the webhook URL.
+ *
+ * @param string $value Raw binding id from the exchange response.
+ * @return string The validated binding id, or '' if rejected.
+ */
+function cinatra_sanitize_webhook_binding_id( string $value ): string {
+	$value = trim( $value );
+	return preg_match( '/^[A-Za-z0-9_-]{1,128}$/', $value ) ? $value : '';
+}
+
+// ---------------------------------------------------------------------------
+// Clear the webhook pair the moment the connected-instance IDENTITY changes
+// (cinatra#974, mirroring the drupal-module): a binding id minted by one
+// instance must never be targeted at another — the emitter would send signed
+// webhook material for the OLD instance to the NEW origin. WordPress fires
+// update_option_{option} only on a REAL value change and add_option_{option}
+// when the option is (re)created, so together these cover the connect-flow
+// overwrite, a manual settings edit of the URL / instance id, and a
+// delete-then-re-add. Ordering inside cinatra_connect_apply_result() is safe:
+// the identity options are written BEFORE the pair, so a cross-instance
+// reconnect clears the old pair here and then stores the fresh one.
+// (delete_option is intentionally not hooked: with no identity there is no
+// emission target, and any later re-add lands on add_option_{option}.)
+// ---------------------------------------------------------------------------
+
+/**
+ * Clear the pair on a real identity change — the
+ * update_option_{cinatra_url|cinatra_instance_id} callback.
+ *
+ * @param mixed $old_value Previous option value.
+ * @param mixed $value     New option value.
+ * @return void
+ */
+function cinatra_on_instance_identity_changed( $old_value, $value ): void {
+	if ( (string) $old_value === (string) $value ) {
+		return; // update_option only fires on change; belt-and-braces.
+	}
+	cinatra_clear_webhook_pair();
+}
+
+/**
+ * Clear any stored pair when an identity option is (re)created — the
+ * add_option_{cinatra_url|cinatra_instance_id} callback (a re-added identity
+ * is always a new identity).
+ *
+ * @param string $option Option name (unused; WP passes it first).
+ * @param mixed  $value  New option value (unused).
+ * @return void
+ */
+function cinatra_on_instance_identity_added( $option, $value ): void { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- Required add_option_{option} callback signature.
+	cinatra_clear_webhook_pair();
+}
+
+add_action( 'update_option_cinatra_url', 'cinatra_on_instance_identity_changed', 10, 2 );
+add_action( 'update_option_cinatra_instance_id', 'cinatra_on_instance_identity_changed', 10, 2 );
+add_action( 'add_option_cinatra_url', 'cinatra_on_instance_identity_added', 10, 2 );
+add_action( 'add_option_cinatra_instance_id', 'cinatra_on_instance_identity_added', 10, 2 );
 
 // ---------------------------------------------------------------------------
 
@@ -1956,28 +2101,35 @@ function cinatra_save_webhook_subscriptions( array $subscriptions ): void {
 // signed server-to-server webhook to the connected Cinatra instance so the
 // agent can react to newly-published content.
 //
-// WIRE CONTRACT — pinned to the MERGED host bridge
-// (cinatra: src/app/api/webhooks/wordpress/route.ts +
-// packages/webhooks/src/verify.ts `verifyLegacyHmac`):
-// - TARGET   : {cinatra_url}/api/webhooks/wordpress — the simple per-site
-// shared-secret route. The transport base is resolved through
-// cinatra_server_base_url() and the POST goes via the SSRF-safe
+// WIRE CONTRACT — pinned to the cinatra GENERIC inbound-webhook facility
+// (cinatra#340/#974: src/app/webhook/[vendor]/[slug]/[hook]/[bindingId] +
+// packages/webhooks verifyInbound; the drupal-module emitter is the sibling):
+// - TARGET   : {cinatra_url}/webhook/cinatra-ai/wordpress-mcp-connector/
+// post-published/{binding_id} — the host-owned generic route. The binding id
+// is SERVER-ISSUED, returned by the connect token exchange PAIRED with the
+// signing secret (see cinatra_connect_apply_result()), and carries the
+// connected-site identity on the cinatra side. The transport base is resolved
+// through cinatra_server_base_url() and the POST goes via the SSRF-safe
 // cinatra_server_post(); the plugin never posts to an operator-entered
-// target_url (that would be an SSRF surface) and never to the generic
-// webhook/.../<bindingId> bridge (needs a server-issued opaque binding id
-// the plugin does not hold).
-// - SIGNING  : a bespoke legacy HMAC — header `X-Cinatra-Sig-256: sha256=<hex>`
-// where <hex> = hash_hmac('sha256', $raw_body, $secret) over the EXACT bytes
-// posted. The body is JSON-encoded ONCE and the same string is both signed
-// and sent. (The issue TITLE says "Standard-Webhooks"; the merged host
-// bridge verifies this legacy HMAC, so we follow the merged contract. See
-// the PR for the discrepancy note.)
-// - PAYLOAD  : the exact strict host Zod schema —
-// { event:"post_published", postId:int>0, postType:string, title:string,
-// url?:string, siteUrl:string, issuedAt:string }.
-// - IDEMPOTENCY: `X-Cinatra-Webhook-Id` is STABLE per publish event (derived
-// from the site instance id + post id + post_modified_gmt) so a retried
-// delivery carries the same id and the host can dedupe.
+// target_url (that would be an SSRF surface). There is NO legacy fallback:
+// without a stored pair the emitter is a quiet no-op and the settings screen
+// prompts for a reconnect (owner ruling on cinatra#974 — the superseded
+// /api/webhooks/wordpress vendor route is being retired).
+// - SIGNING  : Standard-Webhooks. The stored `whsec_` secret is base64-decoded
+// (after the prefix strip) into the HMAC key; the signed content is
+// "{webhook-id}.{webhook-timestamp}.{body}" and the header set is
+// webhook-id / webhook-timestamp / webhook-signature
+// ("v1,<base64(hmac-sha256)>"). The body is JSON-encoded ONCE and the same
+// exact bytes are signed and sent. The signature math is pinned by a golden
+// vector generated with the reference standardwebhooks JS library (the exact
+// library the host verifies with) — see tests/test-publish-emitter.php.
+// - PAYLOAD  : the exact strict schema the wordpress-mcp-connector handler
+// re-validates — { event:"post_published", postId:int>0, postType:string,
+// title:string, url?:string, siteUrl:string, issuedAt:string } (unchanged
+// from the legacy route; only transport + signing moved).
+// - IDEMPOTENCY: webhook-id is STABLE per publish event (derived from the
+// site instance id + post id + post_modified_gmt) so a retried delivery
+// carries the same id and the host's idempotency ledger dedupes.
 //
 // SAFETY: emission is fire-and-forget — it NEVER blocks or fails a publish, only
 // ever posts to the operator-configured cinatra_url via the SSRF-safe helper
@@ -1985,23 +2137,67 @@ function cinatra_save_webhook_subscriptions( array $subscriptions ): void {
 // (never the secret, signature, raw body, title, or any upstream response body).
 // ---------------------------------------------------------------------------
 
+// The generic-route path for the WordPress post-published hook. The trailing
+// segment is the server-issued binding id, appended at build time. Path
+// segments before it are the connector package's vendor/slug and the declared
+// hook id (the wordpress-mcp-connector cinatra.webhooks declaration).
+const CINATRA_WEBHOOK_HOOK_PATH = '/webhook/cinatra-ai/wordpress-mcp-connector/post-published/';
+
+// Standard-Webhooks secret prefix, stripped before base64-decoding the key.
+const CINATRA_WHSEC_PREFIX = 'whsec_';
+
 /**
  * Build the publish-webhook endpoint URL for the configured Cinatra instance.
  *
  * Resolves the transport base through cinatra_server_base_url() (so a validated
  * CINATRA_BASE_URL container override redirects the TRANSPORT in dev, while
- * production uses the configured cinatra_url unchanged) and appends the fixed
- * simple-route path. Returns '' when no instance URL is configured.
+ * production uses the configured cinatra_url unchanged) and appends the
+ * generic-route path + the server-issued binding id. Returns '' when the
+ * instance URL or the binding id is not configured — there is deliberately NO
+ * legacy-route fallback.
  *
- * @return string The full endpoint URL, or '' when cinatra_url is unset.
+ * @return string The full endpoint URL, or '' when not fully configured.
  */
 function cinatra_publish_webhook_endpoint(): string {
 	$base = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
 	if ( '' === $base ) {
 		return '';
 	}
+	$binding_id = cinatra_sanitize_webhook_binding_id( (string) get_option( 'cinatra_webhook_binding_id', '' ) );
+	if ( '' === $binding_id ) {
+		return '';
+	}
 	$transport = cinatra_server_base_url( $base );
-	return rtrim( $transport, '/' ) . '/api/webhooks/wordpress';
+	return rtrim( $transport, '/' ) . CINATRA_WEBHOOK_HOOK_PATH . rawurlencode( $binding_id );
+}
+
+/**
+ * Compute the Standard-Webhooks v1 signature header value.
+ *
+ * The key is the base64-decoded secret (after the optional whsec_ prefix
+ * strip); the signed content is "{id}.{timestamp}.{body}"; the header value is
+ * "v1," followed by the base64 of the raw HMAC-SHA256. This matches the
+ * standardwebhooks reference libraries byte-for-byte (the cinatra host
+ * verifies with exactly that library); the byte-equivalence is pinned by a
+ * golden vector generated with the reference JS library.
+ *
+ * @param string $secret     The stored webhook secret (whsec_-prefixed base64).
+ * @param string $message_id The webhook-id header value.
+ * @param int    $timestamp  Seconds since epoch (the webhook-timestamp header value).
+ * @param string $body       The exact request body bytes.
+ * @return string|null The "v1,<base64>" signature, or null when the secret does not decode.
+ */
+function cinatra_webhook_sign( string $secret, string $message_id, int $timestamp, string $body ): ?string {
+	$encoded = $secret;
+	if ( 0 === strpos( $encoded, CINATRA_WHSEC_PREFIX ) ) {
+		$encoded = substr( $encoded, strlen( CINATRA_WHSEC_PREFIX ) );
+	}
+	$key = base64_decode( $encoded, true ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode -- Standard-Webhooks keys are base64-encoded by spec; this derives the HMAC key, not code.
+	if ( ! is_string( $key ) || '' === $key ) {
+		return null;
+	}
+	$content = $message_id . '.' . $timestamp . '.' . $body;
+	return 'v1,' . base64_encode( hash_hmac( 'sha256', $content, $key, true ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- Standard-Webhooks signatures are base64-encoded raw HMAC bytes by spec; nothing is obfuscated.
 }
 
 /**
@@ -2148,8 +2344,11 @@ function cinatra_emit_post_published( $new_status, $old_status, $post ): void {
 		return;
 	}
 
-	// Quiet bails: no instance configured, no signing secret, or no subscription
-	// enabling this post's type.
+	// Quiet bails: no instance configured, no server-issued webhook pair
+	// (endpoint requires the binding id; the secret is its pair — a partial
+	// configuration means "webhooks not provisioned": the settings screen
+	// prompts for a reconnect, and there is deliberately NO legacy fallback),
+	// or no subscription enabling this post's type.
 	$endpoint = cinatra_publish_webhook_endpoint();
 	$secret   = (string) get_option( 'cinatra_webhook_secret', '' );
 	if ( '' === $endpoint || '' === $secret ) {
@@ -2165,7 +2364,15 @@ function cinatra_emit_post_published( $new_status, $old_status, $post ): void {
 	if ( ! is_string( $raw_body ) || '' === $raw_body ) {
 		return;
 	}
-	$signature = 'sha256=' . hash_hmac( 'sha256', $raw_body, $secret );
+	$message_id = cinatra_publish_webhook_id( $post );
+	$timestamp  = time();
+	$signature  = cinatra_webhook_sign( $secret, $message_id, $timestamp, $raw_body );
+	if ( null === $signature ) {
+		// A malformed stored secret (not base64) — fail CLOSED with fixed text,
+		// never the value, and no HTTP request.
+		error_log( '[cinatra] publish webhook skipped: the stored webhook secret is not a valid Standard-Webhooks secret.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional fixed-text server-side warning; never logs the secret value.
+		return;
+	}
 
 	// Blocking with a short timeout. We deliberately keep blocking => true: a
 	// non-blocking request can drop the request BODY in some WordPress HTTP
@@ -2173,18 +2380,19 @@ function cinatra_emit_post_published( $new_status, $old_status, $post ): void {
 	// caps the worst-case added publish latency when the instance is slow/down.
 	// Delivery is best-effort — a failure is logged (fixed text) and NEVER blocks
 	// or fails the publish. Durable retry/queueing is intentionally out of scope
-	// here; the STABLE X-Cinatra-Webhook-Id is what lets the host dedupe a future
-	// re-delivery if a retry path is added later.
+	// here; the STABLE webhook-id is what lets the host's idempotency ledger
+	// dedupe a future re-delivery if a retry path is added later.
 	$response = cinatra_server_post(
 		$endpoint,
 		array(
 			'timeout'  => 4,
 			'blocking' => true,
 			'headers'  => array(
-				'Content-Type'         => 'application/json',
-				'Accept'               => 'application/json',
-				'X-Cinatra-Sig-256'    => $signature,
-				'X-Cinatra-Webhook-Id' => cinatra_publish_webhook_id( $post ),
+				'Content-Type'      => 'application/json',
+				'Accept'            => 'application/json',
+				'webhook-id'        => $message_id,
+				'webhook-timestamp' => (string) $timestamp,
+				'webhook-signature' => $signature,
 			),
 			'body'     => $raw_body,
 		)

@@ -36,7 +36,8 @@ never reaches the page.
   key for a short-lived stream token. The integration key never reaches the
   browser.
 - **Outbound publish webhooks.** When a post is published, the plugin can sign
-  and send a `post_published` notification to subscription targets you register.
+  (Standard-Webhooks) and send a `post_published` notification to your connected
+  Cinatra instance, using credentials the instance issues during Connect.
 
 ## Who it is for
 

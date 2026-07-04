@@ -29,10 +29,17 @@ All configuration lives on the **Settings → Cinatra** admin page in `wp-admin`
 
 ### Webhooks
 
-- **Webhook secret.** A shared secret used to sign outbound `post_published`
-  notifications. Set it here.
-- **Subscription targets.** Register the targets that should receive a signed
-  `post_published` notification when a post is published.
+- **Signing credentials.** Outbound `post_published` notifications are signed
+  (Standard-Webhooks) with a secret and webhook binding id issued by your
+  Cinatra instance during **Connect** — there is nothing to paste manually. The
+  page shows whether they are provisioned; if not (for example after updating
+  the plugin on an existing connection), reconnect once to provision them.
+- **Subscription targets.** Register the subscriptions that enable a signed
+  `post_published` notification when a post is published. Delivery always goes
+  to your connected Cinatra instance.
+- Changing the Cinatra URL or the agent instance ID invalidates the signing
+  credentials (they belong to the previous instance); reconnect to re-provision
+  them.
 
 ### MCP Adapter status
 
@@ -69,8 +76,9 @@ platform's permission model, see the canonical
   plugin and is served from your own site — no executable code is fetched from a
   remote server at runtime.
 - **Outbound webhooks are signed.** `post_published` notifications are signed
-  with your shared webhook secret so receivers can verify their origin. The
-  plugin never receives or verifies inbound webhooks.
+  (Standard-Webhooks) with a per-site secret issued by your Cinatra instance so
+  the receiver can verify their origin. The plugin never receives or verifies
+  inbound webhooks.
 
 For installing, updating, granting permissions to, and removing marketplace
 extensions in general, see

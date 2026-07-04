@@ -25,6 +25,7 @@ function cinatra_uninstall_option_keys(): array {
 		'cinatra_api_key',
 		'cinatra_instance_id',
 		'cinatra_webhook_secret',
+		'cinatra_webhook_binding_id',
 		'cinatra_webhook_subscriptions',
 		// Legacy keys from the pre-rename plugin (cinatra-widget.php).
 		'cinatra_widget_url',

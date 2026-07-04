@@ -41,7 +41,19 @@ if (!defined('ABSPATH')) {
 // ---------------------------------------------------------------------------
 // Hook + i18n stubs (no-ops / capture)
 // ---------------------------------------------------------------------------
-function add_action($hook, $cb, $priority = 10, $args = 1) { return true; }
+function add_action($hook, $cb, $priority = 10, $args = 1) {
+    // Captured in a global OUTSIDE $GLOBALS['cinatra_test'] so reset_fixture()
+    // (which replaces that array wholesale) never wipes hooks registered at
+    // plugin load time. Only the option-lifecycle hooks are ever REPLAYED (see
+    // update_option below); everything else is capture-only.
+    $GLOBALS['cinatra_test_actions'][$hook][] = $cb;
+    return true;
+}
+function cinatra_test_do_action($hook, ...$args) {
+    foreach ($GLOBALS['cinatra_test_actions'][$hook] ?? [] as $cb) {
+        call_user_func_array($cb, $args);
+    }
+}
 function add_filter($hook, $cb, $priority = 10, $args = 1) {
     // Track filters by hook so tests can assert request-scoped add/remove, AND
     // keep the live callbacks so the HTTP stub can replay WordPress's real
@@ -174,7 +186,21 @@ function get_option($name, $default = false) {
         : $default;
 }
 function update_option($name, $value) {
+    // WP-core semantics (the plugin's option-lifecycle hooks depend on them):
+    // an unchanged value is a no-op that fires NOTHING; a missing option is an
+    // add (fires add_option_{$name}($name, $value)); a real change fires
+    // update_option_{$name}($old, $value, $name).
+    $exists = array_key_exists($name, $GLOBALS['cinatra_test']['options']);
+    $old    = $exists ? $GLOBALS['cinatra_test']['options'][$name] : null;
+    if ($exists && $old === $value) {
+        return false;
+    }
     $GLOBALS['cinatra_test']['options'][$name] = $value;
+    if ($exists) {
+        cinatra_test_do_action('update_option_' . $name, $old, $value, $name);
+    } else {
+        cinatra_test_do_action('add_option_' . $name, $name, $value);
+    }
     return true;
 }
 function delete_option($name) {
