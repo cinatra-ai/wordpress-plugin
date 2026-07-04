@@ -48,8 +48,10 @@ The plugin registers admin-gated REST endpoints under `wp-json/cinatra/v1/`:
 
 - a **token** endpoint that performs the server-to-server exchange and returns a
   short-lived stream token (gated to administrators plus a request nonce), and
-- a **webhooks** registry that stores subscription targets and the shared secret
-  used to sign outbound `post_published` notifications.
+- a **webhooks** registry that stores the subscriptions enabling outbound
+  `post_published` notifications. The notifications are signed
+  (Standard-Webhooks) with per-site credentials issued by the connected Cinatra
+  instance during Connect.
 
 ## Compatibility
 

@@ -36,17 +36,23 @@ Troubleshooting, Advanced & reference) and is published from this repository's
 - Negotiates capabilities and contract version with the instance at boot and
   degrades gracefully against older instances.
 - Provides a webhook-subscription REST registry (`/wp-json/cinatra/v1/webhooks`)
-  and stores a shared webhook secret. When a post is published, the plugin signs
-  and sends a `post_published` notification to each matching subscription target
-  using that secret. The plugin sends outbound signed webhooks; it does not
-  receive or verify inbound webhooks.
+  that enables `post_published` notifications per post type. When a post is
+  published, the plugin signs the notification as a
+  [Standard-Webhooks](https://www.standardwebhooks.com/) request and delivers it
+  to the connected Cinatra instance's generic webhook endpoint, using a signing
+  secret and webhook binding id issued by the instance during Connect (there is
+  nothing to paste manually; reconnect once after upgrading to provision them).
+  The plugin sends outbound signed webhooks; it does not receive or verify
+  inbound webhooks.
 - Offers one-click **Connect with Cinatra** provisioning: an admin enters the
   instance URL and approves a consent screen; the site exchanges an
   authorization code (PKCE S256) server-side at `/api/connect/token` and stores
   the credential server-side — no key is copy-pasted or exposed to the browser.
   A connection-string (install-code) fallback is available.
 - Exposes a **Settings → Cinatra** admin page for Connect, plus manual/advanced
-  fields for the Cinatra URL, API key, agent instance ID, and webhook secret.
+  fields for the Cinatra URL, API key, and agent instance ID. (The webhook
+  signing credentials are provisioned by Connect and are not manually
+  editable.)
 
 ## Install
 

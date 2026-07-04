@@ -50,11 +50,13 @@ resolve it, [contact support](https://docs.cinatra.ai/resources/support/).
 
 - **Symptom:** A subscription target does not receive a `post_published`
   notification.
-- **Cause:** No subscription target is registered for that case, the shared
-  webhook secret is missing, or the receiver rejects the signature.
+- **Cause:** No subscription is registered for that case, or the site has no
+  server-issued webhook signing credentials (for example the plugin was updated
+  on an existing connection, or the Cinatra URL / instance ID changed).
 - **Fix:** On [settings & permissions](./settings-and-permissions.md), confirm a
-  subscription target is registered and the **webhook secret** is set, and verify
-  the receiver checks the signature with the same secret. The plugin sends
+  subscription is registered and the **Publish Webhooks** status shows
+  provisioned; if it does not, reconnect the site to your Cinatra instance
+  ("Connect with Cinatra") to provision the credentials. The plugin sends
   outbound signed webhooks only.
 
 ## Still stuck?

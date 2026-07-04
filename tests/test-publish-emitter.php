@@ -4,17 +4,25 @@
  * (wp#48). Runs under plain `php tests/test-publish-emitter.php` — no PHPUnit,
  * no WordPress install. Exit code 0 = all pass, 1 = a failure.
  *
- * Asserts the MERGED host wire contract
- * (cinatra: src/app/api/webhooks/wordpress/route.ts + packages/webhooks
- * verifyLegacyHmac):
- *   - X-Cinatra-Sig-256 == 'sha256=' . hash_hmac('sha256', <exact body>, secret)
- *     recomputed over the EXACT captured body string (sign==send bytes).
+ * Asserts the GENERIC host wire contract (cinatra#340/#974:
+ * src/app/webhook/[vendor]/[slug]/[hook]/[bindingId] + packages/webhooks
+ * verifyInbound — Standard-Webhooks):
+ *   - the Standard-Webhooks signature is pinned against a GOLDEN VECTOR
+ *     generated with the reference `standardwebhooks` JS library (the exact
+ *     library the host verifies with), and independently recomputed over the
+ *     EXACT captured body string (sign==send bytes).
+ *   - the header set is webhook-id / webhook-timestamp / webhook-signature;
+ *     the LEGACY X-Cinatra-Sig-256 / X-Cinatra-Webhook-Id headers are GONE.
  *   - the JSON body decodes to the strict host schema with correct values.
- *   - X-Cinatra-Webhook-Id is present and STABLE across two invokes of the same
- *     publish event (retry-dedupe friendly).
- *   - the endpoint is {cinatra_url}/api/webhooks/wordpress (the simple route).
- *   - NO fire when: secret missing / url missing / no matching subscription /
- *     post type not in the subscription's post_types.
+ *   - webhook-id is present and STABLE across two invokes of the same publish
+ *     event (retry-dedupe friendly).
+ *   - the endpoint is {cinatra_url}/webhook/cinatra-ai/wordpress-mcp-connector/
+ *     post-published/{binding_id} — and NEVER the retired
+ *     /api/webhooks/wordpress vendor route (NO legacy fallback: a missing
+ *     binding id is a quiet no-op).
+ *   - NO fire when: secret missing / binding id missing / url missing / secret
+ *     malformed (fail closed, no HTTP) / no matching subscription / post type
+ *     not in the subscription's post_types.
  *   - NO fire on publish->publish (edit) or draft->draft (no transition into
  *     publish).
  *   - NO fire for a non-public post type / a revision / an autosave.
@@ -53,11 +61,20 @@ function check($label, $cond) {
     }
 }
 
-// The shared secret + a distinctive title we can scan the log for. Assembled
-// from fragments so no credentialed-URI/secret literal sits verbatim in the
-// fixture source (secret-scan hygiene).
-const EMIT_SECRET = 'whk' . '-shared-' . 'SECRET-' . 'abc123';
-const EMIT_TITLE  = 'Distinctive Title ' . 'GAMMA-DELTA';
+// The signing secret (a Standard-Webhooks whsec_ value — computed, so no
+// secret literal sits verbatim in the fixture source; secret-scan hygiene), the
+// server-issued binding id, and a distinctive title we can scan the log for.
+define('EMIT_SECRET', 'whsec_' . base64_encode('fixture-hmac-key-' . str_repeat('k', 15)));
+const EMIT_BINDING_ID = 'BINDtest_' . 'fixture-1';
+const EMIT_TITLE      = 'Distinctive Title ' . 'GAMMA-DELTA';
+const EMIT_ENDPOINT   = 'https://app.cinatra.ai/webhook/cinatra-ai/wordpress-mcp-connector/post-published/' . EMIT_BINDING_ID;
+
+// Independent Standard-Webhooks recompute (NOT the plugin's function) so the
+// signature assertions do not merely test the code against itself.
+function emit_expected_signature(string $secret, string $id, string $ts, string $body): string {
+    $key = base64_decode(substr($secret, strlen('whsec_')), true);
+    return 'v1,' . base64_encode(hash_hmac('sha256', $id . '.' . $ts . '.' . $body, $key, true));
+}
 
 function reset_fixture(array $overrides = []) {
     $base = [
@@ -65,6 +82,7 @@ function reset_fixture(array $overrides = []) {
             'cinatra_url'                   => 'https://app.cinatra.ai',
             'cinatra_instance_id'           => 'wp-prod',
             'cinatra_webhook_secret'        => EMIT_SECRET,
+            'cinatra_webhook_binding_id'    => EMIT_BINDING_ID,
             // A subscription enabling post_published for the 'post' type only.
             'cinatra_webhook_subscriptions' => json_encode([
                 [
@@ -126,17 +144,31 @@ cinatra_emit_post_published('publish', 'draft', $post);
 $call = last_call();
 check('emitted exactly one webhook', count($GLOBALS['cinatra_test']['remote_post_calls']) === 1);
 
-// (d) endpoint is the simple route on the configured cinatra_url.
-check('endpoint == {cinatra_url}/api/webhooks/wordpress',
-    $call && $call['url'] === 'https://app.cinatra.ai/api/webhooks/wordpress');
+// (d) endpoint is the GENERIC route on the configured cinatra_url, carrying
+// the server-issued binding id — never the retired vendor route.
+check('endpoint == {cinatra_url}/webhook/cinatra-ai/wordpress-mcp-connector/post-published/{binding_id}',
+    $call && $call['url'] === EMIT_ENDPOINT);
+check('the retired /api/webhooks/wordpress vendor route is never targeted',
+    $call && strpos($call['url'], '/api/webhooks/wordpress') === false);
 
-// (a) signature is over the EXACT captured body bytes.
-$body    = $call ? (string) $call['args']['body'] : '';
-$sig     = $call ? ($call['args']['headers']['X-Cinatra-Sig-256'] ?? '') : '';
-$expected_sig = 'sha256=' . hash_hmac('sha256', $body, EMIT_SECRET);
-check('X-Cinatra-Sig-256 == sha256=hash_hmac(sha256, EXACT body, secret)',
-    $sig !== '' && hash_equals($expected_sig, $sig));
-check('signature header carries the sha256= prefix', strpos($sig, 'sha256=') === 0);
+// (a) Standard-Webhooks signature over the EXACT captured body bytes,
+// independently recomputed (the golden vector below pins the math against the
+// reference library).
+$body = $call ? (string) $call['args']['body'] : '';
+$hid  = $call ? (string) ($call['args']['headers']['webhook-id'] ?? '') : '';
+$hts  = $call ? (string) ($call['args']['headers']['webhook-timestamp'] ?? '') : '';
+$sig  = $call ? (string) ($call['args']['headers']['webhook-signature'] ?? '') : '';
+check('webhook-signature == v1,base64(hmac-sha256("{id}.{ts}.{body}", base64key))',
+    $sig !== '' && hash_equals(emit_expected_signature(EMIT_SECRET, $hid, $hts, $body), $sig));
+check('signature header carries the v1, prefix', strpos($sig, 'v1,') === 0);
+check('webhook-timestamp is a current unix epoch (string of digits)',
+    $hts !== '' && ctype_digit($hts) && abs(time() - (int) $hts) < 60);
+
+// The LEGACY headers are gone (the generic route would take an unexpected
+// X-Cinatra-Sig-256 arm as a contract confusion; the new contract sends only
+// the Standard-Webhooks set).
+check('no legacy X-Cinatra-Sig-256 header', !isset($call['args']['headers']['X-Cinatra-Sig-256']));
+check('no legacy X-Cinatra-Webhook-Id header', !isset($call['args']['headers']['X-Cinatra-Webhook-Id']));
 
 // Content negotiation headers per the contract.
 check('Content-Type: application/json', ($call['args']['headers']['Content-Type'] ?? '') === 'application/json');
@@ -156,14 +188,14 @@ check('payload has ONLY the schema keys',
     count(array_diff(array_keys($payload), ['event', 'postId', 'postType', 'title', 'url', 'siteUrl', 'issuedAt'])) === 0);
 
 // ---------------------------------------------------------------------------
-echo "Test: X-Cinatra-Webhook-Id is present and STABLE across two emits of the same event\n";
+echo "Test: webhook-id is present and STABLE across two emits of the same event\n";
 reset_fixture();
 $GLOBALS['cinatra_test']['remote_post'] = ok_204();
 $post = make_post();
 cinatra_emit_post_published('publish', 'draft', $post);
-$id1 = $GLOBALS['cinatra_test']['remote_post_calls'][0]['args']['headers']['X-Cinatra-Webhook-Id'] ?? '';
+$id1 = $GLOBALS['cinatra_test']['remote_post_calls'][0]['args']['headers']['webhook-id'] ?? '';
 cinatra_emit_post_published('publish', 'draft', $post);
-$id2 = $GLOBALS['cinatra_test']['remote_post_calls'][1]['args']['headers']['X-Cinatra-Webhook-Id'] ?? '';
+$id2 = $GLOBALS['cinatra_test']['remote_post_calls'][1]['args']['headers']['webhook-id'] ?? '';
 check('webhook id present', $id1 !== '');
 check('webhook id is stable across retries of the same event', $id1 === $id2);
 check('webhook id is derived from instance + post id', strpos($id1, 'wp-prod') !== false && strpos($id1, '4242') !== false);
@@ -172,7 +204,7 @@ check('webhook id is derived from instance + post id', strpos($id1, 'wp-prod') !
 reset_fixture();
 $GLOBALS['cinatra_test']['remote_post'] = ok_204();
 cinatra_emit_post_published('publish', 'draft', make_post(['ID' => 4242, 'post_modified_gmt' => '2026-06-24 13:00:00']));
-$id_remod = $GLOBALS['cinatra_test']['remote_post_calls'][0]['args']['headers']['X-Cinatra-Webhook-Id'] ?? '';
+$id_remod = $GLOBALS['cinatra_test']['remote_post_calls'][0]['args']['headers']['webhook-id'] ?? '';
 check('a later post_modified_gmt yields a DIFFERENT webhook id', $id_remod !== $id1 && $id_remod !== '');
 
 // ---------------------------------------------------------------------------
@@ -216,11 +248,11 @@ echo "Test: webhook id never ends in an empty suffix when post_modified_gmt is u
 reset_fixture();
 $GLOBALS['cinatra_test']['remote_post'] = ok_204();
 cinatra_emit_post_published('publish', 'draft', make_post(['post_modified_gmt' => 'not-a-real-timestamp']));
-$id_bad = last_call()['args']['headers']['X-Cinatra-Webhook-Id'] ?? '';
+$id_bad = last_call()['args']['headers']['webhook-id'] ?? '';
 check('webhook id is non-empty + does NOT end in a trailing dash', $id_bad !== '' && substr($id_bad, -1) !== '-');
 // Stable across two emits of the same (unparseable-timestamp) post.
 cinatra_emit_post_published('publish', 'draft', make_post(['post_modified_gmt' => 'not-a-real-timestamp']));
-$id_bad2 = $GLOBALS['cinatra_test']['remote_post_calls'][1]['args']['headers']['X-Cinatra-Webhook-Id'] ?? '';
+$id_bad2 = $GLOBALS['cinatra_test']['remote_post_calls'][1]['args']['headers']['webhook-id'] ?? '';
 check('webhook id stable across retries even with an unparseable timestamp', $id_bad === $id_bad2);
 
 // ---------------------------------------------------------------------------
@@ -229,12 +261,76 @@ reset_fixture(['options' => array_replace(
     [
         'cinatra_url'                   => 'https://app.cinatra.ai',
         'cinatra_instance_id'           => 'wp-prod',
+        'cinatra_webhook_binding_id'    => EMIT_BINDING_ID,
         'cinatra_webhook_subscriptions' => json_encode([['id' => 's', 'event_type' => 'post_published', 'target_url' => 'https://x.example/h', 'post_types' => [], 'created_at' => '']]),
     ]
 )]);
 $GLOBALS['cinatra_test']['remote_post'] = ok_204();
 cinatra_emit_post_published('publish', 'draft', make_post());
-check('no webhook fired without a secret', count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
+check('no webhook fired without a secret (binding id alone is half a pair)', count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
+
+// ---------------------------------------------------------------------------
+echo "Test: NO fire when the binding id is missing — NO legacy fallback (cinatra#974)\n";
+reset_fixture(['options' => array_replace(
+    [
+        'cinatra_url'                   => 'https://app.cinatra.ai',
+        'cinatra_instance_id'           => 'wp-prod',
+        'cinatra_webhook_secret'        => EMIT_SECRET,
+        'cinatra_webhook_subscriptions' => json_encode([['id' => 's', 'event_type' => 'post_published', 'target_url' => 'https://x.example/h', 'post_types' => [], 'created_at' => '']]),
+    ]
+)]);
+$GLOBALS['cinatra_test']['remote_post'] = ok_204();
+cinatra_emit_post_published('publish', 'draft', make_post());
+check('no webhook fired without a binding id (a pre-#974 connection: quiet no-op, never the legacy route)',
+    count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
+check('endpoint helper returns empty string without a binding id', cinatra_publish_webhook_endpoint() === '');
+// The reconnect prompt needs the site to be CONNECTED (url + api key).
+check('no reconnect prompt while the site is not connected (no api key)', cinatra_webhook_reconnect_needed() === false);
+$GLOBALS['cinatra_test']['options']['cinatra_api_key'] = 'cnx_site_x_KEY';
+check('reconnect prompt shown when connected + subscribed + pair missing', cinatra_webhook_reconnect_needed() === true);
+$GLOBALS['cinatra_test']['options']['cinatra_webhook_binding_id'] = EMIT_BINDING_ID;
+check('reconnect prompt clears once the pair is stored', cinatra_webhook_reconnect_needed() === false);
+
+// A malformed stored binding id is rejected by the sanitizer → same no-op.
+reset_fixture();
+$GLOBALS['cinatra_test']['options']['cinatra_webhook_binding_id'] = "../escape/attempt";
+$GLOBALS['cinatra_test']['remote_post'] = ok_204();
+cinatra_emit_post_published('publish', 'draft', make_post());
+check('a malformed binding id (path chars) never reaches the URL — no fire',
+    count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
+
+// ---------------------------------------------------------------------------
+echo "Test: a MALFORMED secret fails CLOSED — no HTTP request, fixed-text log only\n";
+reset_fixture();
+cinatra_test_log_reset();
+$GLOBALS['cinatra_test']['options']['cinatra_webhook_secret'] = 'whsec_%%%not-base64%%%';
+$GLOBALS['cinatra_test']['remote_post'] = ok_204();
+cinatra_emit_post_published('publish', 'draft', make_post());
+check('no HTTP request with a non-base64 secret', count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
+$log = cinatra_test_log_contents();
+check('malformed-secret skip logs fixed text', strpos($log, 'not a valid Standard-Webhooks secret') !== false);
+check('malformed-secret log never contains the stored value', strpos($log, 'not-base64') === false);
+
+// ---------------------------------------------------------------------------
+echo "Test: GOLDEN VECTOR — cinatra_webhook_sign matches the reference standardwebhooks JS library byte-for-byte\n";
+// Generated with the reference library (the exact one the cinatra host
+// verifies with): new Webhook(secret).sign(id, new Date(1751587200 * 1000),
+// body). A drift in the PHP signing fails here before it could fail live.
+$vector_secret = 'whsec_' . 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=';
+$vector_body   = '{"event":"post_published","postId":42,"postType":"post","title":"Hello","siteUrl":"https:\/\/blog.example","issuedAt":"2026-07-04T00:00:00+00:00","url":"https:\/\/blog.example\/?p=42"}';
+$vector_sig    = 'v1,tuHShm353XsRPB1oafnmVo/Bcq/gI+mfLc/+wUjf/8E=';
+check('golden vector signature matches',
+    cinatra_webhook_sign($vector_secret, 'wp-testinstance-42-1751587200', 1751587200, $vector_body) === $vector_sig);
+check('the whsec_ prefix is optional — the same key signs identically without it',
+    cinatra_webhook_sign(substr($vector_secret, strlen('whsec_')), 'wp-testinstance-42-1751587200', 1751587200, $vector_body) === $vector_sig);
+check('a different id changes the signature',
+    cinatra_webhook_sign($vector_secret, 'wp-other', 1751587200, $vector_body) !== $vector_sig);
+check('a different timestamp changes the signature',
+    cinatra_webhook_sign($vector_secret, 'wp-testinstance-42-1751587200', 1751587201, $vector_body) !== $vector_sig);
+check('a different body changes the signature',
+    cinatra_webhook_sign($vector_secret, 'wp-testinstance-42-1751587200', 1751587200, '{}') !== $vector_sig);
+check('a non-base64 secret returns null', cinatra_webhook_sign('whsec_%%%not-base64%%%', 'id', 1751587200, '{}') === null);
+check('an empty secret returns null', cinatra_webhook_sign('', 'id', 1751587200, '{}') === null);
 
 // ---------------------------------------------------------------------------
 echo "Test: NO fire when the cinatra_url is missing\n";
@@ -327,8 +423,8 @@ $GLOBALS['cinatra_test']['options']['cinatra_webhook_subscriptions'] = json_enco
 $GLOBALS['cinatra_test']['remote_post'] = ok_204();
 cinatra_emit_post_published('publish', 'draft', make_post());
 $call = last_call();
-check('endpoint is the configured cinatra_url simple route (NOT the operator target_url)',
-    $call && $call['url'] === 'https://app.cinatra.ai/api/webhooks/wordpress');
+check('endpoint is the configured cinatra_url generic route (NOT the operator target_url)',
+    $call && $call['url'] === EMIT_ENDPOINT);
 check('the operator-entered target_url host is never contacted',
     $call && strpos($call['url'], 'attacker.evil') === false);
 
@@ -371,8 +467,8 @@ $GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) {
 };
 cinatra_emit_post_published('publish', 'draft', $post);
 $log = cinatra_test_log_contents();
-check('log never contains the shared secret', strpos($log, EMIT_SECRET) === false);
-check('log never contains a signature (sha256= hex)', strpos($log, 'sha256=') === false);
+check('log never contains the signing secret', strpos($log, EMIT_SECRET) === false && strpos($log, substr(EMIT_SECRET, strlen('whsec_'))) === false);
+check('log never contains a signature (v1, base64)', strpos($log, 'v1,') === false);
 check('log never contains the post title', strpos($log, EMIT_TITLE) === false);
 
 // ---------------------------------------------------------------------------

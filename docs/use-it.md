@@ -46,11 +46,13 @@ is published, so a Cinatra agent or another system can react to new content.
 
 - The plugin sends **outbound** signed webhooks only — it does not receive or
   verify inbound webhooks.
-- Each notification is signed with a shared webhook secret so the receiver can
-  verify it came from your site.
+- Each notification is signed (Standard-Webhooks) with a per-site secret issued
+  by your Cinatra instance during Connect, so the receiver can verify it came
+  from your site.
 
-You register and manage the targets, and set the shared secret, on the
-[settings & permissions](./settings-and-permissions.md) page.
+You register and manage the subscriptions on the
+[settings & permissions](./settings-and-permissions.md) page; the signing
+credentials are provisioned automatically when you connect (or reconnect).
 
 ## Tips
 

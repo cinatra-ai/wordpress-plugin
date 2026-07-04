@@ -608,6 +608,164 @@ check('connect -> stored cinatra_url is the BROWSER base, NEVER the env override
 putenv('CINATRA_BASE_URL');
 
 // ---------------------------------------------------------------------------
+// cinatra#974 — paired webhook persistence (webhookSecret + webhookBindingId),
+// keyed on the host's `webhookContract` echo, cleared on instance-identity
+// change. Mirrors the drupal-module semantics.
+// ---------------------------------------------------------------------------
+
+// whsec_ fixture secrets, computed (secret-scan hygiene: no literal).
+define('PAIR_SECRET', 'whsec_' . base64_encode('pair-hmac-key-' . str_repeat('p', 18)));
+define('PAIR_SECRET_2', 'whsec_' . base64_encode('pair-hmac-key-' . str_repeat('q', 18)));
+
+function pair_response(array $overrides = []): array {
+    return ['ok' => true, 'response' => array_replace([
+        '__instance_url'    => 'https://app.cinatra.ai',
+        'url'               => 'https://app.cinatra.ai',
+        'siteId'            => 'site_123',
+        'cinatraInstanceId' => 'wp-prod',
+        'credential'        => 'cnx_site_123_KEY',
+        'credentialVersion' => 2,
+        'contractVersion'   => 'v1',
+        'capabilities'      => ['tokenBroker' => false, 'supportedContractVersions' => ['v1']],
+    ], $overrides)];
+}
+
+function seed_connected_pair_state(): void {
+    $GLOBALS['cinatra_test']['options'] = [
+        'cinatra_url'                => 'https://app.cinatra.ai',
+        'cinatra_api_key'            => 'cnx_site_123_KEY',
+        'cinatra_instance_id'        => 'wp-prod',
+        'cinatra_webhook_secret'     => PAIR_SECRET,
+        'cinatra_webhook_binding_id' => 'BINDstored1',
+    ];
+}
+
+echo "Test: the token exchange SENDS webhook_contract=standard-webhooks\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['options'] = [];
+$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) {
+    return ['response' => ['code' => 200], 'body' => json_encode(pair_response()['response'])];
+};
+// The public flows build the body; drive the exchange helper with the same
+// body the install-code flow constructs (grounded against the flow source).
+cinatra_connect_exchange('https://app.cinatra.ai', [
+    'grant_type'       => 'install_code',
+    'install_code'     => 'x',
+    'client'           => CINATRA_CONNECT_CLIENT,
+    'webhook_contract' => CINATRA_WEBHOOK_CONTRACT,
+]);
+$call = end($GLOBALS['cinatra_test']['remote_post_calls']);
+$sent = json_decode((string) $call['args']['body'], true);
+check('exchange request carries webhook_contract=standard-webhooks',
+    ($sent['webhook_contract'] ?? '') === 'standard-webhooks');
+
+echo "Test: a standard response (echo + pair) persists BOTH pair halves\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['options'] = [];
+cinatra_connect_apply_result(pair_response([
+    'webhookContract'  => 'standard-webhooks',
+    'webhookSecret'    => PAIR_SECRET,
+    'webhookBindingId' => 'BINDfresh1',
+]));
+check('secret stored', get_option('cinatra_webhook_secret', '') === PAIR_SECRET);
+check('binding id stored', get_option('cinatra_webhook_binding_id', '') === 'BINDfresh1');
+check('instance id stored', get_option('cinatra_instance_id', '') === 'wp-prod');
+
+echo "Test: SAME instance + echo + pair omitted (transient mint failure) -> existing pair KEPT\n";
+reset_fixture();
+seed_connected_pair_state();
+cinatra_connect_apply_result(pair_response([
+    'webhookContract' => 'standard-webhooks',
+    // no webhookSecret / webhookBindingId — the host's upsert failed
+]));
+check('pair kept for the same instance when the host echoed the contract',
+    get_option('cinatra_webhook_secret', '') === PAIR_SECRET
+    && get_option('cinatra_webhook_binding_id', '') === 'BINDstored1');
+
+echo "Test: SAME instance + NO echo (older host) -> stored pair DISCARDED even if a bindingId is present\n";
+reset_fixture();
+seed_connected_pair_state();
+cinatra_connect_apply_result(pair_response([
+    // A #343-era host returns the legacy-bridge bindingId + the SHARED secret
+    // but no webhookContract echo: its binding would reject Standard-Webhooks
+    // headers, so keeping (or storing) a pair would 401 every publish (codex).
+    'webhookSecret'    => 'WH-SHARED-LEGACY',
+    'webhookBindingId' => 'BINDlegacy9',
+]));
+check('pair discarded when the host does not echo the contract',
+    get_option('cinatra_webhook_secret', '') === '' && get_option('cinatra_webhook_binding_id', '') === '');
+check('the legacy shared secret is NOT stored', get_option('cinatra_webhook_secret', 'unset') !== 'WH-SHARED-LEGACY');
+
+echo "Test: DIFFERENT instance + echo + fresh pair -> old pair replaced by the new one\n";
+reset_fixture();
+seed_connected_pair_state();
+cinatra_connect_apply_result(pair_response([
+    '__instance_url'    => 'https://other.cinatra.ai',
+    'url'               => 'https://other.cinatra.ai',
+    'cinatraInstanceId' => 'wp-other',
+    'webhookContract'   => 'standard-webhooks',
+    'webhookSecret'     => PAIR_SECRET_2,
+    'webhookBindingId'  => 'BINDother2',
+]));
+check('new instance url stored', get_option('cinatra_url', '') === 'https://other.cinatra.ai');
+check('new pair stored after the identity change', get_option('cinatra_webhook_secret', '') === PAIR_SECRET_2
+    && get_option('cinatra_webhook_binding_id', '') === 'BINDother2');
+
+echo "Test: DIFFERENT instance + echo + pair omitted -> old pair CLEARED (never cross-instance)\n";
+reset_fixture();
+seed_connected_pair_state();
+cinatra_connect_apply_result(pair_response([
+    '__instance_url'    => 'https://other.cinatra.ai',
+    'url'               => 'https://other.cinatra.ai',
+    'cinatraInstanceId' => 'wp-other',
+    'webhookContract'   => 'standard-webhooks',
+]));
+check('a pair minted by one instance never survives a reconnect to another',
+    get_option('cinatra_webhook_secret', '') === '' && get_option('cinatra_webhook_binding_id', '') === '');
+
+echo "Test: instance id is ALWAYS overwritten from the response (empty when absent)\n";
+reset_fixture();
+seed_connected_pair_state();
+$resp = pair_response(['webhookContract' => 'standard-webhooks']);
+unset($resp['response']['cinatraInstanceId']);
+cinatra_connect_apply_result($resp);
+check('a response without cinatraInstanceId clears the stale identity',
+    get_option('cinatra_instance_id', 'unset') === '');
+check('and the identity CHANGE cleared the pair', get_option('cinatra_webhook_binding_id', '') === '');
+
+echo "Test: a MANUAL cinatra_url / instance-id edit clears the pair; an unchanged re-save keeps it\n";
+reset_fixture();
+seed_connected_pair_state();
+update_option('cinatra_url', 'https://app.cinatra.ai'); // unchanged re-save
+update_option('cinatra_instance_id', 'wp-prod');        // unchanged re-save
+check('an unchanged settings re-save keeps the pair',
+    get_option('cinatra_webhook_binding_id', '') === 'BINDstored1');
+update_option('cinatra_url', 'https://moved.cinatra.ai');
+check('a manual URL change clears the pair', get_option('cinatra_webhook_binding_id', '') === ''
+    && get_option('cinatra_webhook_secret', '') === '');
+seed_connected_pair_state();
+update_option('cinatra_instance_id', 'wp-renamed');
+check('a manual instance-id change clears the pair', get_option('cinatra_webhook_binding_id', '') === '');
+// Delete-then-re-add lands on add_option_{name} and clears too.
+seed_connected_pair_state();
+delete_option('cinatra_url');
+update_option('cinatra_url', 'https://readded.cinatra.ai');
+check('a deleted-then-re-added URL clears the pair (add_option hook)',
+    get_option('cinatra_webhook_binding_id', '') === '');
+
+echo "Test: a malformed webhookBindingId in the response is rejected -> treated as pair-omitted\n";
+reset_fixture();
+seed_connected_pair_state();
+cinatra_connect_apply_result(pair_response([
+    'webhookContract'  => 'standard-webhooks',
+    'webhookSecret'    => PAIR_SECRET_2,
+    'webhookBindingId' => "../../etc/passwd",
+]));
+check('a path-shaped binding id is never stored; the existing same-instance pair is kept',
+    get_option('cinatra_webhook_binding_id', '') === 'BINDstored1'
+    && get_option('cinatra_webhook_secret', '') === PAIR_SECRET);
+
+// ---------------------------------------------------------------------------
 echo "\n";
 if ($failures === 0) {
     echo "ALL TESTS PASSED\n";
