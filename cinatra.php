@@ -1756,6 +1756,15 @@ function cinatra_rest_mint_token( WP_REST_Request $request ): WP_REST_Response {
 				'Authorization' => 'Bearer ' . $api_key,
 				'Content-Type'  => 'application/json',
 				'Accept'        => 'application/json',
+				// Assert THIS site's origin on the server-to-server mint. The
+				// instance's cnx_ arm on /api/agents/{slug}/token enforces a
+				// paired Origin === the credential's bound connect-site origin
+				// and FAILS CLOSED on a missing Origin — without this header
+				// every cnx_-paired site gets a 401 on the cit_ mint. Same
+				// identity assertion the widget-auth relays already send (the
+				// credential hash must also match the same connect-site row, so
+				// this grants no trust). $origin is validated non-empty above.
+				'Origin'        => $origin,
 			),
 			'body'    => wp_json_encode( $body ),
 		)
