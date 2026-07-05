@@ -142,6 +142,11 @@ check('called the instance token endpoint',
     $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
 check('Authorization Bearer is the long-lived key',
     $call && ($call['args']['headers']['Authorization'] ?? '') === 'Bearer LONG-LIVED-SECRET-KEY-uuid-uuid');
+// The instance's cnx_ arm fail-closes the mint on a missing Origin header
+// (paired-origin binding), so the broker MUST assert the site origin as a
+// header, exactly like the widget-auth relays (wordpress-plugin#78).
+check('asserts the site origin as the Origin header (host fail-closes without it)',
+    $call && ($call['args']['headers']['Origin'] ?? '') === 'https://blog.example');
 $sent_body = $call ? json_decode($call['args']['body'], true) : [];
 check('binds the request to the site origin (scheme://host, no path)',
     ($sent_body['origin'] ?? '') === 'https://blog.example');
