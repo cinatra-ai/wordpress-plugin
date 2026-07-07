@@ -3,7 +3,7 @@ Contributors: ordnas
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.1.5
+Stable tag: 0.1.6
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -59,6 +59,10 @@ WordPress supports plugin-to-plugin dependencies via the `Requires Plugins:` hea
 3. Connect the plugin to your Cinatra instance from the Cinatra settings page: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
 
 == Changelog ==
+= 0.1.6 =
+* The plugin now emits Standard-Webhooks events to the connected Cinatra instance's generic host URL, with a persisted binding id pairing the site to its Cinatra connection.
+* Security hardening: the session-token mint request now sends the site Origin so the Cinatra host can enforce fail-closed origin checks.
+
 = 0.1.5 =
 * Mirror the Cinatra widget from its source of truth and add a parity gate that keeps the mirrored copy in sync.
 * Fixed stale strings in the plugin.
