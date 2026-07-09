@@ -38,6 +38,8 @@ jobs:
         run: php tests/test-token-broker.php
       - name: Run publish-emitter behavior tests (no WP install required)
         run: php tests/test-publish-emitter.php
+      - name: Run content-abilities behavior tests (no WP install required)
+        run: php tests/test-abilities.php
 
   js-tests:
     runs-on: ubuntu-latest
