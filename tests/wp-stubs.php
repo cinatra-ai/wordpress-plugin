@@ -149,6 +149,11 @@ class WP_Post {
     public $post_status;
     public $post_modified_gmt;
     public $permalink;
+    // Additional content fields the Abilities API read/update path serializes
+    // (wp#1214). Declared (not dynamic) so PHP 8.2 does not emit a deprecation.
+    public $post_content;
+    public $post_excerpt;
+    public $post_name;
     public function __construct(array $fields = []) {
         $this->ID = $fields['ID'] ?? 0;
         $this->post_type = $fields['post_type'] ?? 'post';
@@ -156,6 +161,9 @@ class WP_Post {
         $this->post_status = $fields['post_status'] ?? 'publish';
         $this->post_modified_gmt = $fields['post_modified_gmt'] ?? '2026-06-24 12:00:00';
         $this->permalink = $fields['permalink'] ?? '';
+        $this->post_content = $fields['post_content'] ?? '';
+        $this->post_excerpt = $fields['post_excerpt'] ?? '';
+        $this->post_name = $fields['post_name'] ?? '';
     }
 }
 function get_the_title($post) {
@@ -211,7 +219,16 @@ function delete_option($name) {
 // ---------------------------------------------------------------------------
 // Auth / nonces / user
 // ---------------------------------------------------------------------------
-function current_user_can($cap) { return (bool) $GLOBALS['cinatra_test']['current_user_can']; }
+function current_user_can($cap) {
+    // Cap-aware when a per-capability map is provided (e.g. edit_post vs
+    // publish_posts differ); otherwise the single boolean drives every check.
+    // Backward compatible: tests that never set ['caps'] behave as before.
+    $caps = $GLOBALS['cinatra_test']['caps'] ?? null;
+    if (is_array($caps) && array_key_exists($cap, $caps)) {
+        return (bool) $caps[$cap];
+    }
+    return (bool) $GLOBALS['cinatra_test']['current_user_can'];
+}
 function get_current_user_id() { return (int) $GLOBALS['cinatra_test']['current_user_id']; }
 function wp_create_nonce($action = -1) { return 'nonce-for-' . $action; }
 function wp_verify_nonce($nonce, $action = -1) {

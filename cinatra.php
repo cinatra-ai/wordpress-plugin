@@ -1658,6 +1658,504 @@ add_action(
 	}
 );
 
+// ---------------------------------------------------------------------------
+// Cinatra content abilities (WordPress Abilities API) + dedicated MCP server.
+//
+// cinatra#1214 (S0). The in-admin Cinatra assistant must reach WordPress
+// content ONLY through the site's MCP integration — never a direct /wp/v2/*
+// REST call carrying the stored Application Password. The WordPress MCP Adapter
+// ships no post/page tools, so this plugin registers the missing abilities:
+//
+// - cinatra/post-get    — read a post or page for editing ( get_post() ).
+// - cinatra/post-update — update a post or page ( wp_update_post() ),
+// preserving the assistant's demote-then-edit flow
+// ( accepts status "draft"; WordPress auto-revisions ).
+//
+// Both call WordPress IN-PROCESS, so the content read/mutation happens inside
+// WordPress with NO outbound HTTP egress from Cinatra. They are exposed as
+// first-class MCP tools ( cinatra-post-get / cinatra-post-update — the Adapter
+// derives a tool name from each ability ID by turning "namespace/name" into
+// "namespace-name" ) on a dedicated Cinatra MCP server reachable at
+// /wp-json/mcp/cinatra-content-server, and — via meta.mcp.public — through the
+// Adapter's generic execute-ability gateway as a transport fallback.
+//
+// Every registration is optional-dependency-safe: each is gated on the
+// Abilities API / MCP Adapter being present and hooks only on the actions those
+// dependencies fire, so the base plugin still activates cleanly without them.
+// ---------------------------------------------------------------------------
+
+const CINATRA_ABILITY_CATEGORY    = 'cinatra';
+const CINATRA_ABILITY_POST_GET    = 'cinatra/post-get';
+const CINATRA_ABILITY_POST_UPDATE = 'cinatra/post-update';
+const CINATRA_MCP_CONTENT_SERVER  = 'cinatra-content-server';
+
+/**
+ * Invoke a function provided by an optional dependency (the WordPress Abilities
+ * API / MCP Adapter) only when it is available.
+ *
+ * These functions ship in WordPress 6.9 and the feature plugins, while this
+ * plugin's base widget supports WordPress 5.9+. Every ability call site is
+ * dependency-gated, so routing them through this single availability check keeps
+ * the plugin honestly compatible with its declared minimum WordPress version —
+ * the call simply no-ops (returns null) when the dependency is absent, and it
+ * never executes on an install that lacks the function.
+ *
+ * @param string $function_name Fully-qualified function name to invoke.
+ * @param mixed  ...$args       Arguments forwarded to the function.
+ * @return mixed The function's return value, or null when it is unavailable.
+ */
+function cinatra_call_optional( string $function_name, ...$args ) {
+	if ( ! function_exists( $function_name ) ) {
+		return null;
+	}
+	return $function_name( ...$args );
+}
+
+/**
+ * Post types the in-admin content editor operates on.
+ *
+ * @return string[] Allowed post-type slugs.
+ */
+function cinatra_ability_post_types(): array {
+	return array( 'post', 'page' );
+}
+
+/**
+ * Resolve and validate the target post/page for an ability call.
+ *
+ * Enforces that the ID exists, is one of the editor post types, and — when the
+ * caller passes postType — that the stored type matches, so a page ID cannot be
+ * edited as a post (or vice versa).
+ *
+ * @param array $input Ability input ( expects 'id', optional 'postType' ).
+ * @return WP_Post|null The post object, or null when it cannot be resolved.
+ */
+function cinatra_ability_resolve_post( array $input ): ?WP_Post {
+	$id = isset( $input['id'] ) ? absint( $input['id'] ) : 0;
+	if ( 1 > $id ) {
+		return null;
+	}
+
+	$post = get_post( $id );
+	if ( ! $post instanceof WP_Post ) {
+		return null;
+	}
+
+	if ( ! in_array( $post->post_type, cinatra_ability_post_types(), true ) ) {
+		return null;
+	}
+
+	$requested_type = isset( $input['postType'] ) ? sanitize_key( (string) $input['postType'] ) : '';
+	if ( '' !== $requested_type && $post->post_type !== $requested_type ) {
+		return null;
+	}
+
+	return $post;
+}
+
+/**
+ * Shape a post/page into the ability's output payload.
+ *
+ * Carries the raw title/content/excerpt so the assistant's field-level diff has
+ * exact before-values ( the reason the read exists ), plus the identity/status
+ * fields it needs to route the update.
+ *
+ * @param WP_Post $post Post to serialize.
+ * @return array<string,mixed> The ability output payload.
+ */
+function cinatra_ability_shape_post( WP_Post $post ): array {
+	return array(
+		'id'       => (int) $post->ID,
+		'postType' => (string) $post->post_type,
+		'status'   => (string) $post->post_status,
+		'title'    => (string) $post->post_title,
+		'content'  => (string) $post->post_content,
+		'excerpt'  => (string) $post->post_excerpt,
+		'slug'     => (string) $post->post_name,
+		'link'     => (string) get_permalink( $post ),
+		'modified' => (string) $post->post_modified_gmt,
+	);
+}
+
+/**
+ * JSON Schema properties describing the ability output payload.
+ *
+ * @return array<string,mixed> Output-schema properties.
+ */
+function cinatra_ability_output_properties(): array {
+	return array(
+		'id'       => array(
+			'type'        => 'integer',
+			'description' => __( 'The post ID.', 'cinatra' ),
+		),
+		'postType' => array(
+			'type'        => 'string',
+			'description' => __( 'The post type ( post or page ).', 'cinatra' ),
+		),
+		'status'   => array(
+			'type'        => 'string',
+			'description' => __( 'The post status.', 'cinatra' ),
+		),
+		'title'    => array(
+			'type'        => 'string',
+			'description' => __( 'The post title.', 'cinatra' ),
+		),
+		'content'  => array(
+			'type'        => 'string',
+			'description' => __( 'The raw post content.', 'cinatra' ),
+		),
+		'excerpt'  => array(
+			'type'        => 'string',
+			'description' => __( 'The post excerpt.', 'cinatra' ),
+		),
+		'slug'     => array(
+			'type'        => 'string',
+			'description' => __( 'The post slug.', 'cinatra' ),
+		),
+		'link'     => array(
+			'type'        => 'string',
+			'description' => __( 'The post permalink.', 'cinatra' ),
+		),
+		'modified' => array(
+			'type'        => 'string',
+			'description' => __( 'The GMT last-modified timestamp.', 'cinatra' ),
+		),
+	);
+}
+
+/**
+ * JSON Schema properties for the post-identity input ( shared by both abilities ).
+ *
+ * @return array<string,mixed> Identity input-schema properties.
+ */
+function cinatra_ability_identity_properties(): array {
+	return array(
+		'id'       => array(
+			'type'        => 'integer',
+			'minimum'     => 1,
+			'description' => __( 'The numeric ID of the post or page.', 'cinatra' ),
+		),
+		'postType' => array(
+			'type'        => 'string',
+			'enum'        => cinatra_ability_post_types(),
+			'description' => __( 'Which content type the ID refers to ( post or page ). Defaults to post.', 'cinatra' ),
+		),
+	);
+}
+
+/**
+ * Permission gate shared by both content abilities.
+ *
+ * Enforces the same per-object capability WordPress requires to edit the post
+ * via /wp/v2/posts/{id}?context=edit — the meta capability edit_post, which
+ * WordPress maps to the correct primitive ( edit_posts / edit_pages /
+ * edit_others_* / edit_published_* ) for the post, its type, and its author.
+ *
+ * @param mixed $input Ability input ( expects 'id' ).
+ * @return bool True when the current user may edit the target post.
+ */
+function cinatra_ability_can_edit( $input ): bool {
+	$input = is_array( $input ) ? $input : array();
+	$id    = isset( $input['id'] ) ? absint( $input['id'] ) : 0;
+	if ( 1 > $id ) {
+		return false;
+	}
+
+	// edit_post is a core meta capability mapped per-object by map_meta_cap();
+	// this is the in-process equivalent of the REST edit-context check.
+	return current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per-object.
+}
+
+/**
+ * Execute callback for cinatra/post-get.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed>|WP_Error The post payload, or WP_Error on failure.
+ */
+function cinatra_ability_post_get( $input = array() ) {
+	$input = is_array( $input ) ? $input : array();
+	$post  = cinatra_ability_resolve_post( $input );
+	if ( ! $post instanceof WP_Post ) {
+		return new WP_Error(
+			'cinatra_post_not_found',
+			__( 'The requested post could not be found.', 'cinatra' ),
+			array( 'status' => 404 )
+		);
+	}
+
+	return cinatra_ability_shape_post( $post );
+}
+
+/**
+ * Execute callback for cinatra/post-update.
+ *
+ * Applies only the fields the caller supplies ( partial update ), preserving the
+ * assistant's demote-then-edit flow: passing status "draft" on a published post
+ * demotes it and WordPress auto-creates the revision.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed>|WP_Error The updated post payload, or WP_Error.
+ */
+function cinatra_ability_post_update( $input = array() ) {
+	$input = is_array( $input ) ? $input : array();
+	$post  = cinatra_ability_resolve_post( $input );
+	if ( ! $post instanceof WP_Post ) {
+		return new WP_Error(
+			'cinatra_post_not_found',
+			__( 'The requested post could not be found.', 'cinatra' ),
+			array( 'status' => 404 )
+		);
+	}
+
+	$update = array( 'ID' => (int) $post->ID );
+
+	if ( array_key_exists( 'title', $input ) ) {
+		$update['post_title'] = sanitize_text_field( (string) $input['title'] );
+	}
+
+	if ( array_key_exists( 'content', $input ) ) {
+		$content = (string) $input['content'];
+		// Mirror WordPress core: users with unfiltered_html keep raw markup;
+		// everyone else has their content run through post KSES, exactly as the
+		// REST content-editor path would.
+		$update['post_content'] = current_user_can( 'unfiltered_html' ) ? $content : wp_kses_post( $content );
+	}
+
+	if ( array_key_exists( 'excerpt', $input ) ) {
+		$update['post_excerpt'] = wp_kses_post( (string) $input['excerpt'] );
+	}
+
+	if ( array_key_exists( 'status', $input ) ) {
+		$status = sanitize_key( (string) $input['status'] );
+
+		// Mirror the REST content path ( WP_REST_Posts_Controller::handle_status_param ):
+		// demotion to draft/pending needs only edit_post, but publishing or privately
+		// publishing requires the post type's publish capability. wp_update_post() does
+		// NOT re-check this, so the ability must — otherwise a contributor holding
+		// edit_post but not publish_posts could publish content through this tool.
+		if ( in_array( $status, array( 'publish', 'future', 'private' ), true ) ) {
+			$publish_cap = 'publish_posts';
+			$type_object = get_post_type_object( $post->post_type );
+			if ( $type_object && isset( $type_object->cap->publish_posts ) ) {
+				$publish_cap = $type_object->cap->publish_posts;
+			}
+			if ( ! current_user_can( $publish_cap ) ) { // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- Capability comes from the target post type's registered cap map, the same source WP core uses.
+				return new WP_Error(
+					'cinatra_cannot_publish',
+					__( 'You are not allowed to publish this content.', 'cinatra' ),
+					array( 'status' => 403 )
+				);
+			}
+		}
+
+		$update['post_status'] = $status;
+	}
+
+	if ( 1 === count( $update ) ) {
+		return new WP_Error(
+			'cinatra_no_fields',
+			__( 'No updatable fields were provided.', 'cinatra' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	$result = wp_update_post( $update, true );
+	if ( is_wp_error( $result ) ) {
+		return $result;
+	}
+
+	$fresh = get_post( (int) $result );
+	if ( ! $fresh instanceof WP_Post ) {
+		return new WP_Error(
+			'cinatra_post_reload_failed',
+			__( 'The post was updated but could not be reloaded.', 'cinatra' ),
+			array( 'status' => 500 )
+		);
+	}
+
+	return cinatra_ability_shape_post( $fresh );
+}
+
+/**
+ * Register the Cinatra ability category. Runs on
+ * wp_abilities_api_categories_init — the only hook on which
+ * wp_register_ability_category() succeeds.
+ *
+ * @return void
+ */
+function cinatra_register_ability_categories(): void {
+	if ( ! function_exists( 'wp_register_ability_category' ) ) {
+		return;
+	}
+	if ( true === cinatra_call_optional( 'wp_has_ability_category', CINATRA_ABILITY_CATEGORY ) ) {
+		return;
+	}
+
+	cinatra_call_optional(
+		'wp_register_ability_category',
+		CINATRA_ABILITY_CATEGORY,
+		array(
+			'label'       => __( 'Cinatra', 'cinatra' ),
+			'description' => __( 'Cinatra assistant abilities for reading and editing WordPress content through MCP.', 'cinatra' ),
+		)
+	);
+}
+add_action( 'wp_abilities_api_categories_init', 'cinatra_register_ability_categories' );
+
+/**
+ * Register the Cinatra content abilities. Runs on wp_abilities_api_init — the
+ * only hook on which wp_register_ability() succeeds.
+ *
+ * @return void
+ */
+function cinatra_register_content_abilities(): void {
+	if ( ! function_exists( 'wp_register_ability' ) ) {
+		return;
+	}
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_GET,
+		array(
+			'label'               => __( 'Get WordPress content', 'cinatra' ),
+			'description'         => __( 'Read a WordPress post or page ( title, content, excerpt, status ) for the in-admin assistant to edit.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => cinatra_ability_identity_properties(),
+				'required'             => array( 'id' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => cinatra_ability_output_properties(),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_post_get',
+			'permission_callback' => 'cinatra_ability_can_edit',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => true,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_UPDATE,
+		array(
+			'label'               => __( 'Update WordPress content', 'cinatra' ),
+			'description'         => __( 'Update a WordPress post or page ( title, content, excerpt, status ) for the in-admin assistant. Accepts status "draft" to preserve the demote-then-edit flow.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array_merge(
+					cinatra_ability_identity_properties(),
+					array(
+						'title'   => array(
+							'type'        => 'string',
+							'description' => __( 'New title. Omit to leave unchanged.', 'cinatra' ),
+						),
+						'content' => array(
+							'type'        => 'string',
+							'description' => __( 'New content ( HTML ). Omit to leave unchanged.', 'cinatra' ),
+						),
+						'excerpt' => array(
+							'type'        => 'string',
+							'description' => __( 'New excerpt. Omit to leave unchanged.', 'cinatra' ),
+						),
+						'status'  => array(
+							'type'        => 'string',
+							'enum'        => array( 'draft', 'pending', 'publish', 'private' ),
+							'description' => __( 'New post status. Pass "draft" to demote a published post before editing.', 'cinatra' ),
+						),
+					)
+				),
+				'required'             => array( 'id' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => cinatra_ability_output_properties(),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_post_update',
+			'permission_callback' => 'cinatra_ability_can_edit',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => false,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+}
+add_action( 'wp_abilities_api_init', 'cinatra_register_content_abilities' );
+
+/**
+ * Register the dedicated Cinatra MCP server exposing the content abilities as
+ * first-class tools. Runs on mcp_adapter_init — the WordPress MCP Adapter fires
+ * it with the McpAdapter instance, and create_server() must be called from
+ * within that action. The server is reachable at
+ * /wp-json/mcp/cinatra-content-server.
+ *
+ * @param object $adapter The McpAdapter instance passed by mcp_adapter_init.
+ * @return void
+ */
+function cinatra_register_mcp_content_server( $adapter ): void {
+	if ( ! is_object( $adapter ) || ! method_exists( $adapter, 'create_server' ) ) {
+		return;
+	}
+
+	// Only advertise the server once BOTH abilities actually registered — enforce
+	// the S0 dependency at runtime, not merely by load order, and avoid exposing a
+	// server with a partially-registered tool set. cinatra_call_optional() returns
+	// null both when the Abilities API is absent and when an ability is missing.
+	if ( null === cinatra_call_optional( 'wp_get_ability', CINATRA_ABILITY_POST_GET )
+		|| null === cinatra_call_optional( 'wp_get_ability', CINATRA_ABILITY_POST_UPDATE ) ) {
+		return;
+	}
+
+	$adapter->create_server(
+		CINATRA_MCP_CONTENT_SERVER,
+		'mcp',
+		CINATRA_MCP_CONTENT_SERVER,
+		__( 'Cinatra Content Server', 'cinatra' ),
+		__( 'Cinatra in-admin assistant post and page read/update tools ( MCP-only content egress, cinatra#1214 ).', 'cinatra' ),
+		CINATRA_PLUGIN_VERSION,
+		array( 'WP\\MCP\\Transport\\HttpTransport' ),
+		'WP\\MCP\\Infrastructure\\ErrorHandling\\NullMcpErrorHandler',
+		null,
+		array( CINATRA_ABILITY_POST_GET, CINATRA_ABILITY_POST_UPDATE ),
+		array(),
+		array(),
+		'cinatra_mcp_content_server_permission'
+	);
+}
+add_action( 'mcp_adapter_init', 'cinatra_register_mcp_content_server' );
+
+/**
+ * Transport-level permission gate for the Cinatra MCP content server. Requires a
+ * user who can edit content before any tool on this server is reachable;
+ * per-object authority is then enforced by each ability's permission_callback
+ * ( edit_post on the specific ID ). Defense in depth over the Adapter default,
+ * which would otherwise fall back to a bare read capability.
+ *
+ * @param mixed $request The REST request ( unused; the check is capability-only ).
+ * @return bool True when the current user may edit content.
+ */
+function cinatra_mcp_content_server_permission( $request ): bool { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- The adapter passes the REST request; this server gate is capability-only.
+	return current_user_can( 'edit_posts' );
+}
+
 /**
  * Agent slug for the WordPress content-editor assistant. The token + stream +
  * capabilities endpoints all live under /api/agents/{slug}/ on the instance.
