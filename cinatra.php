@@ -1687,7 +1687,17 @@ add_action(
 const CINATRA_ABILITY_CATEGORY    = 'cinatra';
 const CINATRA_ABILITY_POST_GET    = 'cinatra/post-get';
 const CINATRA_ABILITY_POST_UPDATE = 'cinatra/post-update';
-const CINATRA_MCP_CONTENT_SERVER  = 'cinatra-content-server';
+// cinatra#1214 (S0, follow-up wordpress-plugin#82). The remaining in-admin
+// content primitives that still egressed via a direct /wp/v2/* REST call
+// (status/list/delete/media/draft/meta) are rehomed onto plugin MCP abilities
+// so the in-admin assistant reaches them through the site's MCP integration.
+const CINATRA_ABILITY_POST_STATUS  = 'cinatra/post-status';
+const CINATRA_ABILITY_POSTS_LIST   = 'cinatra/posts-list';
+const CINATRA_ABILITY_POST_DELETE  = 'cinatra/post-delete';
+const CINATRA_ABILITY_MEDIA_UPLOAD = 'cinatra/media-upload';
+const CINATRA_ABILITY_POST_DRAFT   = 'cinatra/post-create-draft';
+const CINATRA_ABILITY_POST_META    = 'cinatra/post-update-meta';
+const CINATRA_MCP_CONTENT_SERVER   = 'cinatra-content-server';
 
 /**
  * Invoke a function provided by an optional dependency (the WordPress Abilities
@@ -1976,6 +1986,490 @@ function cinatra_ability_post_update( $input = array() ) {
 	return cinatra_ability_shape_post( $fresh );
 }
 
+// ===========================================================================
+// Remaining in-admin content abilities (wordpress-plugin#82).
+//
+// status / list / delete / media / draft / meta — the primitives that still
+// egressed via a direct /wp/v2/* REST call from Cinatra. Each handler calls
+// WordPress IN-PROCESS (no outbound HTTP from Cinatra) and enforces the
+// OPERATION-SPECIFIC capability in its permission_callback (not a blanket
+// edit/publish cap): status/list/create-draft → edit_posts (type-level);
+// delete → per-object ownership-aware delete_post; media → upload_files; meta →
+// per-object edit_post + a per-key protected-meta guard. Publish transitions
+// re-check the post type's publish capability (the same #81 escalation guard).
+// ===========================================================================
+
+/**
+ * Resolve the post type an ability call targets, defaulting to `post`.
+ *
+ * @param array $input Ability input ( optional 'postType' ).
+ * @return string One of the editor post types ( post|page ).
+ */
+function cinatra_ability_input_post_type( array $input ): string {
+	$requested = isset( $input['postType'] ) ? sanitize_key( (string) $input['postType'] ) : '';
+	if ( in_array( $requested, cinatra_ability_post_types(), true ) ) {
+		return $requested;
+	}
+	return 'post';
+}
+
+/**
+ * Type-level permission gate for the status / list / create-draft abilities.
+ *
+ * These operate on a COLLECTION ( list ), a not-necessarily-resolvable id
+ * ( status of a possibly-deleted post ), or a NEW post ( create-draft ), so the
+ * per-object edit_post gate does not apply. The operation-specific capability is
+ * the post type's edit_posts primitive ( edit_posts for posts, edit_pages for
+ * pages ) — the same capability WordPress requires for the /wp/v2/{type}
+ * context=edit collection.
+ *
+ * @param mixed $input Ability input ( optional 'postType' ).
+ * @return bool True when the current user may edit the post type's content.
+ */
+function cinatra_ability_can_edit_type( $input ): bool {
+	$input     = is_array( $input ) ? $input : array();
+	$post_type = cinatra_ability_input_post_type( $input );
+	$edit_cap  = 'edit_posts';
+	$type_obj  = get_post_type_object( $post_type );
+	if ( $type_obj && isset( $type_obj->cap->edit_posts ) ) {
+		$edit_cap = $type_obj->cap->edit_posts;
+	}
+	return current_user_can( $edit_cap ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- Capability comes from the target post type's registered cap map, the same source WP core uses.
+}
+
+/**
+ * Permission gate for the status read.
+ *
+ * The post-status ability returns a SPECIFIC object's publish status, so a bare
+ * type-level edit_posts gate would leak the status ( and existence ) of a post
+ * the caller
+ * cannot edit ( e.g. a Contributor with edit_posts but not edit_others_posts,
+ * reading someone else's draft ). When the id resolves to an existing editor
+ * post, require the per-object edit_post capability — the same check WordPress
+ * applies for GET /wp/v2/{type}/{id}?context=edit. When it does NOT resolve
+ * ( deleted / wrong type ), fall back to the type-level gate so a status poll
+ * AFTER a delete still returns the "deleted" sentinel to a legitimate editor of
+ * that type ( rather than a misleading permission error ).
+ *
+ * @param mixed $input Ability input ( expects 'id', optional 'postType' ).
+ * @return bool True when the current user may read the target's status.
+ */
+function cinatra_ability_can_read_status( $input ): bool {
+	$input = is_array( $input ) ? $input : array();
+	$id    = isset( $input['id'] ) ? absint( $input['id'] ) : 0;
+	if ( 1 > $id ) {
+		return false;
+	}
+
+	$post = get_post( $id );
+	if ( $post instanceof WP_Post && in_array( $post->post_type, cinatra_ability_post_types(), true ) ) {
+		// Existing object: enforce the per-object edit capability ( no status leak ).
+		return current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per-object.
+	}
+
+	// Not resolvable ( deleted / wrong type ): preserve the deleted-sentinel path
+	// for a user who may edit that post type.
+	return cinatra_ability_can_edit_type( $input );
+}
+
+/**
+ * Per-object DELETE permission gate. Enforces the meta capability delete_post,
+ * which map_meta_cap() resolves to the correct primitive ( delete_post /
+ * delete_page / delete_others_* / delete_published_* ) for the post, its type,
+ * and its author — the ownership-aware check WordPress applies at
+ * DELETE /wp/v2/{type}/{id}.
+ *
+ * @param mixed $input Ability input ( expects 'id' ).
+ * @return bool True when the current user may delete the target post.
+ */
+function cinatra_ability_can_delete( $input ): bool {
+	$input = is_array( $input ) ? $input : array();
+	$id    = isset( $input['id'] ) ? absint( $input['id'] ) : 0;
+	if ( 1 > $id ) {
+		return false;
+	}
+	return current_user_can( 'delete_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- delete_post is a core meta capability resolved per-object.
+}
+
+/**
+ * Permission gate for media upload. Enforces the operation-specific upload_files
+ * capability — the same primitive WordPress requires at POST /wp/v2/media.
+ *
+ * @param mixed $input Ability input ( unused; the cap is not per-object ).
+ * @return bool True when the current user may upload files.
+ */
+function cinatra_ability_can_upload( $input ): bool { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- The abilities API passes the input; upload_files is not per-object.
+	return current_user_can( 'upload_files' );
+}
+
+/**
+ * Execute callback for cinatra/post-status.
+ *
+ * Reads a post/page's publish status in-process. A missing/wrong-type id
+ * resolves to the "deleted" sentinel ( mirroring the REST client's 404 →
+ * "deleted" mapping ) rather than an error, so a status poll after a delete
+ * reports "deleted" instead of failing.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed> The status payload.
+ */
+function cinatra_ability_post_status( $input = array() ): array {
+	$input = is_array( $input ) ? $input : array();
+	$id    = isset( $input['id'] ) ? absint( $input['id'] ) : 0;
+	$post  = cinatra_ability_resolve_post( $input );
+
+	if ( ! $post instanceof WP_Post ) {
+		return array(
+			'id'     => $id,
+			'status' => 'deleted',
+			'link'   => '',
+		);
+	}
+
+	$is_public = ( 'publish' === $post->post_status );
+	return array(
+		'id'       => (int) $post->ID,
+		'postType' => (string) $post->post_type,
+		'status'   => (string) $post->post_status,
+		'link'     => $is_public ? (string) get_permalink( $post ) : '',
+	);
+}
+
+/**
+ * Execute callback for cinatra/posts-list.
+ *
+ * Lists published posts ( or pages, via postType ) newest-first with offset
+ * pagination — the in-process equivalent of the REST client's
+ * `GET /wp/v2/{type}?context=edit&status=publish&orderby=date&order=desc`.
+ * Returns metadata only ( id/title/status/date/url ) plus the total published
+ * count so the connector can build its cursor page.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed> { items: array<int,array>, total: int }.
+ */
+function cinatra_ability_posts_list( $input = array() ): array {
+	$input     = is_array( $input ) ? $input : array();
+	$post_type = cinatra_ability_input_post_type( $input );
+	$limit     = isset( $input['perPage'] ) ? absint( $input['perPage'] ) : 10;
+	$limit     = max( 1, min( 100, $limit ) );
+	$offset    = isset( $input['offset'] ) ? absint( $input['offset'] ) : 0;
+
+	$query = new WP_Query(
+		array(
+			'post_type'              => $post_type,
+			'post_status'            => 'publish',
+			'orderby'                => 'date',
+			'order'                  => 'DESC',
+			'posts_per_page'         => $limit,
+			'offset'                 => $offset,
+			'no_found_rows'          => false,
+			'ignore_sticky_posts'    => true,
+			'update_post_meta_cache' => false,
+			'update_post_term_cache' => false,
+		)
+	);
+
+	$items = array();
+	foreach ( $query->posts as $post ) {
+		if ( ! $post instanceof WP_Post ) {
+			continue;
+		}
+		$items[] = array(
+			'id'     => (int) $post->ID,
+			'title'  => (string) get_the_title( $post ),
+			'status' => (string) $post->post_status,
+			'date'   => (string) $post->post_date_gmt,
+			'url'    => (string) get_permalink( $post ),
+		);
+	}
+
+	return array(
+		'items' => $items,
+		'total' => (int) $query->found_posts,
+	);
+}
+
+/**
+ * Execute callback for cinatra/post-delete.
+ *
+ * Trashes ( default ) or permanently deletes ( force: true ) a post/page via
+ * wp_delete_post() — the in-process equivalent of DELETE /wp/v2/{type}/{id}.
+ * The per-object ownership-aware delete_post gate runs in the permission
+ * callback.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed>|WP_Error { deleted, previousStatus } or WP_Error.
+ */
+function cinatra_ability_post_delete( $input = array() ) {
+	$input = is_array( $input ) ? $input : array();
+	$post  = cinatra_ability_resolve_post( $input );
+	if ( ! $post instanceof WP_Post ) {
+		return new WP_Error(
+			'cinatra_post_not_found',
+			__( 'The requested post could not be found.', 'cinatra' ),
+			array( 'status' => 404 )
+		);
+	}
+
+	$previous_status = (string) $post->post_status;
+	$force           = ! empty( $input['force'] );
+	$result          = wp_delete_post( (int) $post->ID, $force );
+
+	if ( false === $result || null === $result ) {
+		return new WP_Error(
+			'cinatra_delete_failed',
+			__( 'The post could not be deleted.', 'cinatra' ),
+			array( 'status' => 500 )
+		);
+	}
+
+	return array(
+		'deleted'        => true,
+		'previousStatus' => $previous_status,
+	);
+}
+
+/**
+ * Execute callback for cinatra/media-upload.
+ *
+ * Sideloads a base64-encoded image into the media library IN-PROCESS ( no
+ * outbound HTTP from Cinatra ): wp_upload_bits() writes the file, an attachment
+ * post is inserted, and attachment metadata is generated. Mirrors the REST
+ * client's POST /wp/v2/media with the same operation-specific upload_files gate.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed>|WP_Error { mediaId, sourceUrl } or WP_Error.
+ */
+function cinatra_ability_media_upload( $input = array() ) {
+	$input     = is_array( $input ) ? $input : array();
+	$base64    = isset( $input['imageBase64'] ) ? (string) $input['imageBase64'] : '';
+	$mime_type = isset( $input['imageMimeType'] ) ? sanitize_text_field( (string) $input['imageMimeType'] ) : '';
+	$title     = isset( $input['title'] ) ? sanitize_text_field( (string) $input['title'] ) : '';
+
+	if ( '' === $base64 || '' === $mime_type ) {
+		return new WP_Error(
+			'cinatra_media_invalid_input',
+			__( 'imageBase64 and imageMimeType are required.', 'cinatra' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	$binary = base64_decode( $base64, true ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode -- Decoding caller-supplied image bytes for a media upload, not code; the decoded bytes are content-sniffed as an image below.
+	if ( false === $binary || '' === $binary ) {
+		return new WP_Error(
+			'cinatra_media_bad_base64',
+			__( 'imageBase64 is not valid base64 image data.', 'cinatra' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	// EXPLICIT image-only allowlist. wp_get_mime_types() is NOT an upload allowlist
+	// — it maps every type WordPress recognizes, including non-image, non-safe
+	// types ( text/html, application/javascript, application/x-msdownload ). A
+	// media-upload tool meant for featured images must accept ONLY real images, so
+	// gate on this fixed image allowlist rather than the site's full mime map.
+	$allowed_images = array(
+		'image/png'  => 'png',
+		'image/jpeg' => 'jpg',
+		'image/webp' => 'webp',
+		'image/gif'  => 'gif',
+	);
+	if ( ! isset( $allowed_images[ $mime_type ] ) ) {
+		return new WP_Error(
+			'cinatra_media_unsupported_type',
+			__( 'Unsupported image MIME type. Only PNG, JPEG, WebP, and GIF are accepted.', 'cinatra' ),
+			array( 'status' => 415 )
+		);
+	}
+
+	// Content sniff: confirm the DECODED BYTES are actually a supported image, so
+	// a caller cannot smuggle a script / HTML / executable payload past the
+	// upload_files gate by mislabeling it with an image MIME type. Trust the
+	// sniffed type over the caller-declared one for the stored extension and the
+	// attachment's post_mime_type.
+	$detected      = function_exists( 'getimagesizefromstring' ) ? @getimagesizefromstring( $binary ) : false; // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- getimagesizefromstring emits a warning on non-image input; the false return is handled explicitly below.
+	$detected_mime = is_array( $detected ) && ! empty( $detected['mime'] ) ? (string) $detected['mime'] : '';
+	if ( '' === $detected_mime || ! isset( $allowed_images[ $detected_mime ] ) ) {
+		return new WP_Error(
+			'cinatra_media_not_an_image',
+			__( 'The uploaded bytes are not a supported image ( PNG, JPEG, WebP, or GIF ).', 'cinatra' ),
+			array( 'status' => 415 )
+		);
+	}
+	$mime_type = $detected_mime;
+	$ext       = $allowed_images[ $mime_type ];
+
+	$base_name = sanitize_title( $title );
+	if ( '' === $base_name ) {
+		$base_name = 'blog-post-image';
+	}
+	$filename = $base_name . '.' . $ext;
+
+	$upload = wp_upload_bits( $filename, null, $binary );
+	if ( ! is_array( $upload ) || ! empty( $upload['error'] ) ) {
+		$message = is_array( $upload ) && ! empty( $upload['error'] )
+			? (string) $upload['error']
+			: __( 'The image could not be written to the uploads directory.', 'cinatra' );
+		return new WP_Error( 'cinatra_media_write_failed', $message, array( 'status' => 500 ) );
+	}
+
+	$attachment_id = wp_insert_attachment(
+		array(
+			'post_mime_type' => $mime_type,
+			'post_title'     => '' !== $title ? $title : $base_name,
+			'post_content'   => '',
+			'post_status'    => 'inherit',
+		),
+		$upload['file'],
+		0,
+		true
+	);
+	if ( is_wp_error( $attachment_id ) ) {
+		return $attachment_id;
+	}
+	if ( 1 > (int) $attachment_id ) {
+		return new WP_Error(
+			'cinatra_media_attach_failed',
+			__( 'The uploaded image could not be registered as an attachment.', 'cinatra' ),
+			array( 'status' => 500 )
+		);
+	}
+
+	// Generate attachment metadata ( thumbnails etc. ). image.php is only present
+	// in wp-admin; guard the require so the plugin still loads on a front-end
+	// request, and skip gracefully when it cannot be loaded.
+	if ( ! function_exists( 'wp_generate_attachment_metadata' ) && defined( 'ABSPATH' ) && file_exists( ABSPATH . 'wp-admin/includes/image.php' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/image.php';
+	}
+	if ( function_exists( 'wp_generate_attachment_metadata' ) ) {
+		$metadata = wp_generate_attachment_metadata( (int) $attachment_id, $upload['file'] );
+		if ( is_array( $metadata ) ) {
+			wp_update_attachment_metadata( (int) $attachment_id, $metadata );
+		}
+	}
+
+	return array(
+		'mediaId'   => (int) $attachment_id,
+		'sourceUrl' => (string) wp_get_attachment_url( (int) $attachment_id ),
+	);
+}
+
+/**
+ * Execute callback for cinatra/post-create-draft.
+ *
+ * Creates a NEW draft post in-process ( wp_insert_post ) — the in-process
+ * equivalent of the REST client's POST /wp/v2/posts with status pinned to
+ * "draft". Content is KSES-filtered for users without unfiltered_html, exactly
+ * as the REST content path would.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed>|WP_Error { id, status, link } or WP_Error.
+ */
+function cinatra_ability_post_create_draft( $input = array() ) {
+	$input   = is_array( $input ) ? $input : array();
+	$title   = isset( $input['title'] ) ? sanitize_text_field( (string) $input['title'] ) : '';
+	$content = isset( $input['content'] ) ? (string) $input['content'] : '';
+	$excerpt = isset( $input['excerpt'] ) ? (string) $input['excerpt'] : '';
+
+	if ( '' === $title && '' === $content ) {
+		return new WP_Error(
+			'cinatra_draft_empty',
+			__( 'A draft requires a title or content.', 'cinatra' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	$content = current_user_can( 'unfiltered_html' ) ? $content : wp_kses_post( $content );
+
+	$post_id = wp_insert_post(
+		array(
+			'post_type'    => 'post',
+			'post_status'  => 'draft',
+			'post_title'   => $title,
+			'post_content' => $content,
+			'post_excerpt' => wp_kses_post( $excerpt ),
+		),
+		true
+	);
+	if ( is_wp_error( $post_id ) ) {
+		return $post_id;
+	}
+	if ( 1 > (int) $post_id ) {
+		return new WP_Error(
+			'cinatra_draft_failed',
+			__( 'The draft could not be created.', 'cinatra' ),
+			array( 'status' => 500 )
+		);
+	}
+
+	$fresh = get_post( (int) $post_id );
+	return array(
+		'id'     => (int) $post_id,
+		'status' => $fresh instanceof WP_Post ? (string) $fresh->post_status : 'draft',
+		'link'   => (string) get_permalink( (int) $post_id ),
+	);
+}
+
+/**
+ * Execute callback for cinatra/post-update-meta.
+ *
+ * Writes post meta in-process ( update_post_meta ) — the in-process equivalent
+ * of the REST meta write. PROTECTED-META GUARD: every key is checked with the
+ * per-object, per-key edit_post_meta meta capability, which WordPress maps
+ * ( via map_meta_cap ) to a hard deny for a protected ( `_`-prefixed ) or
+ * registered-protected key the user is not entitled to write. A denied key
+ * aborts the whole call ( no partial write ) so the assistant cannot smuggle a
+ * write to a protected key.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed>|WP_Error { id, updated } or WP_Error.
+ */
+function cinatra_ability_post_update_meta( $input = array() ) {
+	$input = is_array( $input ) ? $input : array();
+	$post  = cinatra_ability_resolve_post( $input );
+	if ( ! $post instanceof WP_Post ) {
+		return new WP_Error(
+			'cinatra_post_not_found',
+			__( 'The requested post could not be found.', 'cinatra' ),
+			array( 'status' => 404 )
+		);
+	}
+
+	$meta = isset( $input['meta'] ) && is_array( $input['meta'] ) ? $input['meta'] : array();
+	if ( 0 === count( $meta ) ) {
+		return new WP_Error(
+			'cinatra_meta_empty',
+			__( 'No meta fields were provided.', 'cinatra' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	// Pre-flight EVERY key against the per-object, per-key edit_post_meta gate
+	// BEFORE writing any, so a protected/disallowed key fails the whole call.
+	foreach ( array_keys( $meta ) as $meta_key ) {
+		$meta_key = (string) $meta_key;
+		if ( ! current_user_can( 'edit_post_meta', (int) $post->ID, $meta_key ) ) { // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post_meta is a core meta capability resolved per-object + per-key ( protected-meta guard ).
+			return new WP_Error(
+				'cinatra_meta_forbidden',
+				/* translators: %s: the disallowed meta key. */
+				sprintf( __( 'You are not allowed to edit the meta key "%s".', 'cinatra' ), $meta_key ),
+				array( 'status' => 403 )
+			);
+		}
+	}
+
+	$updated = array();
+	foreach ( $meta as $meta_key => $meta_value ) {
+		update_post_meta( (int) $post->ID, (string) $meta_key, $meta_value );
+		$updated[] = (string) $meta_key;
+	}
+
+	return array(
+		'id'      => (int) $post->ID,
+		'updated' => $updated,
+	);
+}
+
 /**
  * Register the Cinatra ability category. Runs on
  * wp_abilities_api_categories_init — the only hook on which
@@ -2097,6 +2591,294 @@ function cinatra_register_content_abilities(): void {
 			),
 		)
 	);
+
+	// --- wordpress-plugin#82: status / list / delete / media / draft / meta ---
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_STATUS,
+		array(
+			'label'               => __( 'Get WordPress content status', 'cinatra' ),
+			'description'         => __( 'Read the publish status of a WordPress post or page. Returns "deleted" for a removed post.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => cinatra_ability_identity_properties(),
+				'required'             => array( 'id' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'id'       => array( 'type' => 'integer' ),
+					'postType' => array( 'type' => 'string' ),
+					'status'   => array( 'type' => 'string' ),
+					'link'     => array( 'type' => 'string' ),
+				),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_post_status',
+			'permission_callback' => 'cinatra_ability_can_read_status',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => true,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POSTS_LIST,
+		array(
+			'label'               => __( 'List WordPress content', 'cinatra' ),
+			'description'         => __( 'List published WordPress posts ( or pages, via postType ) newest-first with offset pagination.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'postType' => array(
+						'type'        => 'string',
+						'enum'        => cinatra_ability_post_types(),
+						'description' => __( 'Which content type to list ( post or page ). Defaults to post.', 'cinatra' ),
+					),
+					'perPage'  => array(
+						'type'        => 'integer',
+						'minimum'     => 1,
+						'maximum'     => 100,
+						'description' => __( 'How many items per page ( 1-100, default 10 ).', 'cinatra' ),
+					),
+					'offset'   => array(
+						'type'        => 'integer',
+						'minimum'     => 0,
+						'description' => __( 'Zero-based offset into the published set.', 'cinatra' ),
+					),
+				),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'items' => array(
+						'type'  => 'array',
+						'items' => array(
+							'type'       => 'object',
+							'properties' => array(
+								'id'     => array( 'type' => 'integer' ),
+								'title'  => array( 'type' => 'string' ),
+								'status' => array( 'type' => 'string' ),
+								'date'   => array( 'type' => 'string' ),
+								'url'    => array( 'type' => 'string' ),
+							),
+						),
+					),
+					'total' => array( 'type' => 'integer' ),
+				),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_posts_list',
+			'permission_callback' => 'cinatra_ability_can_edit_type',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => true,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_DELETE,
+		array(
+			'label'               => __( 'Delete WordPress content', 'cinatra' ),
+			'description'         => __( 'Trash ( or, with force, permanently delete ) a WordPress post or page.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array_merge(
+					cinatra_ability_identity_properties(),
+					array(
+						'force' => array(
+							'type'        => 'boolean',
+							'description' => __( 'Permanently delete instead of moving to trash. Defaults to false ( trash ).', 'cinatra' ),
+						),
+					)
+				),
+				'required'             => array( 'id' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'deleted'        => array( 'type' => 'boolean' ),
+					'previousStatus' => array( 'type' => 'string' ),
+				),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_post_delete',
+			'permission_callback' => 'cinatra_ability_can_delete',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => false,
+					'destructive' => true,
+					'idempotent'  => false,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_MEDIA_UPLOAD,
+		array(
+			'label'               => __( 'Upload WordPress media', 'cinatra' ),
+			'description'         => __( 'Sideload a base64-encoded image into the WordPress media library ( e.g. a featured image ).', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'imageBase64'   => array(
+						'type'        => 'string',
+						'description' => __( 'The image bytes, base64-encoded.', 'cinatra' ),
+					),
+					'imageMimeType' => array(
+						'type'        => 'string',
+						'description' => __( 'The image MIME type ( image/png, image/jpeg, image/webp, image/gif ).', 'cinatra' ),
+					),
+					'title'         => array(
+						'type'        => 'string',
+						'description' => __( 'A human title / filename base for the attachment.', 'cinatra' ),
+					),
+				),
+				'required'             => array( 'imageBase64', 'imageMimeType', 'title' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'mediaId'   => array( 'type' => 'integer' ),
+					'sourceUrl' => array( 'type' => 'string' ),
+				),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_media_upload',
+			'permission_callback' => 'cinatra_ability_can_upload',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => false,
+					'destructive' => false,
+					'idempotent'  => false,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_DRAFT,
+		array(
+			'label'               => __( 'Create WordPress draft', 'cinatra' ),
+			'description'         => __( 'Create a NEW draft post ( title/content/excerpt ). Always creates a draft.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'title'   => array(
+						'type'        => 'string',
+						'description' => __( 'The draft title.', 'cinatra' ),
+					),
+					'content' => array(
+						'type'        => 'string',
+						'description' => __( 'The draft content ( HTML ).', 'cinatra' ),
+					),
+					'excerpt' => array(
+						'type'        => 'string',
+						'description' => __( 'An optional excerpt.', 'cinatra' ),
+					),
+				),
+				'required'             => array( 'title', 'content' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'id'     => array( 'type' => 'integer' ),
+					'status' => array( 'type' => 'string' ),
+					'link'   => array( 'type' => 'string' ),
+				),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_post_create_draft',
+			'permission_callback' => 'cinatra_ability_can_edit_type',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => false,
+					'destructive' => false,
+					'idempotent'  => false,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_META,
+		array(
+			'label'               => __( 'Update WordPress content meta', 'cinatra' ),
+			'description'         => __( 'Write post meta on a WordPress post or page. Protected ( _-prefixed / registered-protected ) keys the user cannot write are refused.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array_merge(
+					cinatra_ability_identity_properties(),
+					array(
+						'meta' => array(
+							'type'        => 'object',
+							'description' => __( 'A map of meta key => value to write.', 'cinatra' ),
+						),
+					)
+				),
+				'required'             => array( 'id', 'meta' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'id'      => array( 'type' => 'integer' ),
+					'updated' => array(
+						'type'  => 'array',
+						'items' => array( 'type' => 'string' ),
+					),
+				),
+				'additionalProperties' => false,
+			),
+			'execute_callback'    => 'cinatra_ability_post_update_meta',
+			'permission_callback' => 'cinatra_ability_can_edit',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => false,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
 }
 add_action( 'wp_abilities_api_init', 'cinatra_register_content_abilities' );
 
@@ -2115,13 +2897,16 @@ function cinatra_register_mcp_content_server( $adapter ): void {
 		return;
 	}
 
-	// Only advertise the server once BOTH abilities actually registered — enforce
-	// the S0 dependency at runtime, not merely by load order, and avoid exposing a
-	// server with a partially-registered tool set. cinatra_call_optional() returns
-	// null both when the Abilities API is absent and when an ability is missing.
-	if ( null === cinatra_call_optional( 'wp_get_ability', CINATRA_ABILITY_POST_GET )
-		|| null === cinatra_call_optional( 'wp_get_ability', CINATRA_ABILITY_POST_UPDATE ) ) {
-		return;
+	// Only advertise the server once EVERY content ability actually registered —
+	// enforce the S0/#82 dependency at runtime, not merely by load order, and
+	// avoid exposing a server with a partially-registered tool set.
+	// cinatra_call_optional() returns null both when the Abilities API is absent
+	// and when an ability is missing.
+	$tools = cinatra_content_server_ability_ids();
+	foreach ( $tools as $ability_id ) {
+		if ( null === cinatra_call_optional( 'wp_get_ability', $ability_id ) ) {
+			return;
+		}
 	}
 
 	$adapter->create_server(
@@ -2129,15 +2914,34 @@ function cinatra_register_mcp_content_server( $adapter ): void {
 		'mcp',
 		CINATRA_MCP_CONTENT_SERVER,
 		__( 'Cinatra Content Server', 'cinatra' ),
-		__( 'Cinatra in-admin assistant post and page read/update tools ( MCP-only content egress, cinatra#1214 ).', 'cinatra' ),
+		__( 'Cinatra in-admin assistant post and page content tools ( MCP-only content egress, cinatra#1214 ).', 'cinatra' ),
 		CINATRA_PLUGIN_VERSION,
 		array( 'WP\\MCP\\Transport\\HttpTransport' ),
 		'WP\\MCP\\Infrastructure\\ErrorHandling\\NullMcpErrorHandler',
 		null,
-		array( CINATRA_ABILITY_POST_GET, CINATRA_ABILITY_POST_UPDATE ),
+		$tools,
 		array(),
 		array(),
 		'cinatra_mcp_content_server_permission'
+	);
+}
+
+/**
+ * The Cinatra ability ids exposed as first-class tools on the content MCP
+ * server, in a stable order ( get/update from S0, then the #82 primitives ).
+ *
+ * @return string[] Ability ids.
+ */
+function cinatra_content_server_ability_ids(): array {
+	return array(
+		CINATRA_ABILITY_POST_GET,
+		CINATRA_ABILITY_POST_UPDATE,
+		CINATRA_ABILITY_POST_STATUS,
+		CINATRA_ABILITY_POSTS_LIST,
+		CINATRA_ABILITY_POST_DELETE,
+		CINATRA_ABILITY_MEDIA_UPLOAD,
+		CINATRA_ABILITY_POST_DRAFT,
+		CINATRA_ABILITY_POST_META,
 	);
 }
 add_action( 'mcp_adapter_init', 'cinatra_register_mcp_content_server' );

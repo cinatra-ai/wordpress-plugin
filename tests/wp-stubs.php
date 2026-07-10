@@ -154,6 +154,8 @@ class WP_Post {
     public $post_content;
     public $post_excerpt;
     public $post_name;
+    // The list ability (wordpress-plugin#82) serializes the GMT publish date.
+    public $post_date_gmt;
     public function __construct(array $fields = []) {
         $this->ID = $fields['ID'] ?? 0;
         $this->post_type = $fields['post_type'] ?? 'post';
@@ -164,6 +166,7 @@ class WP_Post {
         $this->post_content = $fields['post_content'] ?? '';
         $this->post_excerpt = $fields['post_excerpt'] ?? '';
         $this->post_name = $fields['post_name'] ?? '';
+        $this->post_date_gmt = $fields['post_date_gmt'] ?? '2026-06-24 12:00:00';
     }
 }
 function get_the_title($post) {
