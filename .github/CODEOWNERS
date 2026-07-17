@@ -6,6 +6,4 @@
 
 # Security-relevant paths — request the owner + the org review account.
 /.github/ @groganz @megajustice
-/composer.json @groganz @megajustice
-/composer.lock @groganz @megajustice
 /LICENSE @groganz @megajustice
