@@ -376,7 +376,9 @@ async function main() {
     const TOKEN_ENDPOINT = "https://site.example/wp-json/cinatra/v1/token";
     const AUTH_INIT = "https://site.example/wp-json/cinatra/v1/widget-auth/init";
     const AUTH_TOKEN = "https://site.example/wp-json/cinatra/v1/widget-auth/token";
-    const STREAM_URL = "https://instance.example/api/agents/wordpress-content-editor/stream";
+    // cinatra#1221 S5 — the widget streams the UNIFIED broker-auth chat contract
+    // (POST /api/assistants/chat), NOT the OLD /api/agents/{slug}/stream relay.
+    const STREAM_URL = "https://instance.example/api/assistants/chat";
     const INSTANCE_ORIGIN = "https://instance.example";
     const fetched = [];
     let initState = null;   // capture the `state` the widget sent on init.
@@ -461,6 +463,24 @@ async function main() {
     check(
       "send happy path: post-login stream POST carries cit_ Bearer + cwu_ dual token; cit_ minted once",
       mounted && sent && bearerOk && dualTokenOk && tokenMints === 1,
+    );
+    // cinatra#1221 S5 — the UNIFIED contract body: a REQUIRED threadId (1..200),
+    // the `assistant` binding handle (== connector kind), and role/content
+    // messages. The OLD relay's `contractVersion` + `context` are gone.
+    const bodyThreadOk =
+      !!streamPost && streamPost.body &&
+      typeof streamPost.body.threadId === "string" &&
+      streamPost.body.threadId.length > 0 && streamPost.body.threadId.length <= 200;
+    const bodyAssistantOk = !!streamPost && streamPost.body && streamPost.body.assistant === "wordpress";
+    const bodyMessagesOk =
+      !!streamPost && streamPost.body && Array.isArray(streamPost.body.messages) &&
+      streamPost.body.messages.every((m) => typeof m.role === "string" && typeof m.content === "string");
+    const bodyNoLegacyFields =
+      !!streamPost && streamPost.body &&
+      streamPost.body.context === undefined && streamPost.body.contractVersion === undefined;
+    check(
+      "send happy path: unified body carries threadId + assistant handle + role/content messages (no legacy context/contractVersion)",
+      bodyThreadOk && bodyAssistantOk && bodyMessagesOk && bodyNoLegacyFields,
     );
   }
 

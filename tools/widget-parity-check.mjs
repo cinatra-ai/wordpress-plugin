@@ -195,17 +195,35 @@ assert(
   !!tokenVar,
   "no `<var> = await getStreamToken()` assignment found",
 );
+// cinatra#1221 S5 — the run-bound RESUME token is a SECOND sanctioned short-lived
+// Bearer credential. The unified chat turn (POST /api/assistants/chat) delivers
+// it on the `X-Cinatra-Chat-Resume-Token` RESPONSE header, and the widget
+// re-presents it on the AG-UI resume/tail GET when the primary stream drops.
+// Capture the var it is bound to so this remains a SINK-AWARE allowance (not a
+// blanket name allowlist): the binding MUST come from
+// `<resp>.headers.get('X-Cinatra-Chat-Resume-Token')`, which proves the value is
+// a server-issued short-lived token and NOT a config-derived credential — so the
+// "no long-lived / config credential in a Bearer header" invariant still holds
+// for EVERY Bearer sink. If the widget carries no resume path, resumeVar is null
+// and the only allowed sink stays the getStreamToken() value.
+const resumeVarMatch = code.match(
+  /([A-Za-z_$][\w$]*)\s*=\s*[A-Za-z_$][\w$.]*\.headers\.get\(\s*['"]X-Cinatra-Chat-Resume-Token['"]\s*\)/,
+);
+const resumeVar = resumeVarMatch ? resumeVarMatch[1] : null;
+// The sanctioned Bearer-sink SET: the cit_ mint value ∪ (when present) the
+// resume-header token. A Bearer header using ANY other var fails closed.
+const allowedBearerVars = new Set([tokenVar, resumeVar].filter(Boolean));
 const everyBearerIsShortLivedToken = bearerMatches.every(
-  (m) => tokenVar && m[1] === tokenVar,
+  (m) => allowedBearerVars.has(m[1]),
 );
 assert(
-  "every Bearer stream header uses the short-lived getStreamToken() value (no config-derived credential)",
+  "every Bearer header uses a sanctioned short-lived token (getStreamToken() cit_, or the X-Cinatra-Chat-Resume-Token response-header token) — no config-derived credential",
   everyBearerIsShortLivedToken,
-  tokenVar
-    ? `a Bearer header uses a var other than the getStreamToken() sink '${tokenVar}': ${bearerMatches
-        .map((m) => m[1])
-        .join(", ")}`
-    : "no getStreamToken() sink to compare against",
+  allowedBearerVars.size
+    ? `a Bearer header uses a var outside the sanctioned sink set {${[...allowedBearerVars].join(
+        ", ",
+      )}}: ${bearerMatches.map((m) => m[1]).join(", ")}`
+    : "no sanctioned short-lived-token sink to compare against",
 );
 
 // ---------------------------------------------------------------------------
