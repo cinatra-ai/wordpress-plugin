@@ -4,36 +4,42 @@
 //
 // This file is the CANONICAL source-of-truth widget for WordPress and is
 // AUTHORED FIRST; the Drupal copy (cinatra-ai/drupal-module/js/cinatra-widget.js)
-// is hand-mirrored from it. The Cinatra instance previously served a widget IIFE
-// from `/api/wordpress/bundle.js` (cinatra-ai/cinatra:
-// src/app/api/wordpress/bundle.js/route.ts), but that route is now the
-// DEPRECATED, pre-Option-A artifact (nothing executes it; scheduled for removal)
-// — this copy is NOT re-vendored from it. It is shipped locally so the plugin
-// never remote-loads executable code into wp-admin and so the long-lived
-// integration key never reaches the browser (see wp#4 / cinatra#220, and the
-// contract: cinatra docs/widget-source-of-truth.md).
+// is hand-mirrored from it.
 //
-// #410's login UI is authored HERE first, then mirrored to the Drupal copy.
+// ARCHITECTURE (S5 / cinatra#1221): the assistant conversation is NO LONGER
+// rendered by this file. The Cinatra instance serves the AG-UI surface at
+// `/embed/assistant` and THIS widget mounts it in a sandboxed <iframe> as the
+// SOLE session owner. This shell keeps only the host-side concerns that MUST live
+// on the CMS origin: the launcher/panel chrome, the required-login PKCE handshake
+// (cwu_ per-user token) + the short-lived cit_ site-token broker mint, capability
+// negotiation, and the parent half of the §12 parent↔iframe postMessage bridge.
+//
+// The vanilla AG-UI renderer (markdown/diff-card/history/SSE-stream loop) that
+// previously lived here is DELETED: the iframe owns the turn (textarea + submit +
+// streaming render are INSIDE the iframe). This shell never streams, never holds
+// an `Authorization: Bearer` fetch, and relays the cit_/cwu_ tokens ONLY into the
+// single BOOTSTRAP postMessage — never to storage, a URL, a log, or an uplink.
+//
+// TRUST BOUNDARY (§4/§6/§12):
+//   * The iframe is `sandbox="allow-scripts allow-same-origin"` (no top-nav, no
+//     forms, no popups, no downloads, no modals) framing `/embed/assistant`.
+//   * Every postMessage to the frame uses an EXPLICIT targetOrigin (the Cinatra
+//     instance origin), NEVER "*".
+//   * Inbound frame messages are accepted ONLY when `event.origin === cinatraOrigin`
+//     AND `event.source === iframe.contentWindow` (origin + source-window binding).
+//   * READY→BOOTSTRAP: the parent mints a CSPRNG correlationId (≥128-bit), echoes
+//     the frame nonce, sends seq=0, and one bootstrap per frame (re-auth = reload).
+//   * Two INDEPENDENT monotonic seq counters (one per direction) per correlationId.
+//   * apply_intent carries an UNTRUSTED SELECTOR only: the parent re-checks the
+//     current user may edit, uses its OWN canonical resource, dedups against a
+//     bounded LRU, and does an in-place draft refresh — NO direct /wp-json egress
+//     (#1214: field-apply happens server-side via the CMS MCP integration).
+//   * resize height is CLAMPED to the panel cap (clamp, never trust the value).
 //
 // Security-critical invariants (no apiKey in the browser; tokenEndpoint broker;
-// short-lived-token Bearer stream; contract-version set) are gated by
+// sandbox iframe; explicit targetOrigin; source-window binding; token-in-bootstrap
+// only; no apply-time egress; contract-version set) are gated by
 // tools/widget-parity-check.mjs in CI.
-//
-// Modifications from the original instance-served bundle:
-//   * The long-lived `apiKey` is removed from the browser. The widget exchanges
-//     a short-lived, origin/audience/scope-bound token via the same-origin
-//     WordPress REST broker (`CinatraConfig.tokenEndpoint`) and streams with it.
-//     The browser NEVER holds a long-lived key and NEVER direct-stream-auths.
-//   * Capability + contract-version negotiation against the instance
-//     `/capabilities` endpoint at boot is a HARD PREREQUISITE: any failure
-//     (HTTP error / 404 / 5xx / network / timeout / malformed JSON / invalid
-//     schema / missing required field / no mutually-supported contract version)
-//     ABORTS the mount — the widget never attaches its Shadow DOM and never sets
-//     `data-cinatra-mounted`, so the always-visible fallback button stays put as
-//     the "instance unavailable / incompatible" chrome. There is NO old-instance
-//     fallback and NO optimistic defaults.
-//   * Brand-token / logo `${...}` interpolations resolved to literal values
-//     (the canonical source is cinatra-ai/cinatra: src/lib/cinatra-brand.ts).
 //
 // ---------------------------------------------------------------------------
 // NOTICE (Apache License 2.0)
@@ -60,11 +66,11 @@
 // ---------------------------------------------------------------------------
 (function () {
   // ---------------------------------------------------------------------------
-  // Bootstrap
+  // Bootstrap config guard.
+  // The browser holds NO long-lived key. It needs the instance URL and a
+  // same-origin broker endpoint that mints short-lived tokens.
   // ---------------------------------------------------------------------------
   var config = window.CinatraConfig || {};
-  // v2 contract: the browser holds NO long-lived key. It needs the instance URL
-  // and a same-origin broker endpoint that mints short-lived stream tokens.
   if (!config.cinatraUrl || !config.tokenEndpoint) {
     console.warn('[cinatra] Missing CinatraConfig (cinatraUrl / tokenEndpoint)');
     return;
@@ -77,27 +83,53 @@
   // even when the instance is unavailable/incompatible.
 
   var AGENT_SLUG = 'wordpress-content-editor';
-  // cinatra#1221 S5 — the unified broker-auth assistant chat contract. The widget
-  // streams here (NOT the OLD /api/agents/{slug}/stream relay); the cit_/cwu_
-  // tokens are minted bound to THIS audience, so a token presented at the legacy
-  // relay now fails aud_mismatch. This is a FIXED same-origin path (not the
-  // capability-advertised streamPath) — the chat route is the single contract.
-  var CHAT_ROUTE_PATH = '/api/assistants/chat';
   // Required-login (cinatra#410): the per-user auth handshake (#407 hosted PKCE)
-  // names this site as the `client` so init/token can resolve the agent's
-  // instances config key. The CMS differentiator (vs the Drupal mirror) is this
-  // one constant + the CMS config accessor + the broker CSRF idiom.
+  // names this site as the `client`. The CMS differentiator (vs the Drupal mirror)
+  // is this one constant + the CMS config accessor + the broker CSRF idiom.
   var AUTH_CLIENT = 'wordpress';
+  // §4: the `?assistant` value; == the cit_-bound kind. MUST equal the embed
+  // page's `session.assistant` agreement check.
+  var EMBED_ASSISTANT = 'wordpress';
   // Contract versions this vendored widget understands, newest first.
   var CLIENT_CONTRACT_VERSIONS = ['v2', 'v1'];
 
+  // ---------------------------------------------------------------------------
+  // §12 bridge protocol constants (the byte-level contract both halves pin).
+  // Mirror of cinatra-ai/cinatra src/lib/embed/bridge-protocol.ts — kept in sync
+  // by review + the parity gate. There is NO arbitrary-tool channel: the message
+  // type set is CLOSED.
+  // ---------------------------------------------------------------------------
+  var EMBED_PROTOCOL_VERSION = 1;
+  var MSG = {
+    ready: 'cinatra.embed.ready',       // iframe -> parent, pre-bootstrap (no correlationId)
+    bootstrap: 'cinatra.embed.bootstrap', // parent -> iframe, the ONLY credential carrier
+    resize: 'cinatra.embed.resize',     // iframe -> parent
+    focus: 'cinatra.embed.focus',       // iframe -> parent
+    a11y: 'cinatra.embed.a11y',         // iframe -> parent
+    applyIntent: 'cinatra.embed.apply_intent', // iframe -> parent
+  };
+  // A CSPRNG base64url id carrying >=128 bits of entropy is >=22 chars; charset +
+  // length are enforced so a merely-short/low-entropy id is rejected (§6b).
+  var ID_PATTERN = /^[A-Za-z0-9_-]{22,128}$/;
+  var RESIZE_MAX_HEIGHT = 20000;                 // §5/§B9 schema upper bound
+  var APPLY_INTENT_VIEW_TYPES = ['content_change_proposal'];
+  var APPLY_LRU_MAX = 64;                         // §6f bounded seen-id LRU
+
+  // The Cinatra instance origin — the ONLY origin the bridge posts BOOTSTRAP to
+  // and the ONLY origin/source it accepts uplinks from. Resolved ONCE, strictly.
+  var cinatraOrigin = null;
+  try { cinatraOrigin = new URL(config.cinatraUrl).origin; } catch (_) { cinatraOrigin = null; }
+  if (!cinatraOrigin) {
+    console.warn('[cinatra] cinatraUrl is not a valid origin; widget not mounted');
+    return;
+  }
+
   // Negotiated state — populated ONLY by a SUCCESSFUL negotiateCapabilities().
-  // No optimistic defaults: if negotiation fails the widget never mounts.
+  // The iframe renders the turn now, so the shell needs only the mutually-agreed
+  // contractVersion (passed to the cit_ broker mint). No optimistic defaults: if
+  // negotiation fails the widget never mounts.
   var negotiated = {
     contractVersion: null,
-    supportsChangesFrame: false,
-    supportsMarkdown: false,
-    streamPath: null,
   };
 
   // ---------------------------------------------------------------------------
@@ -116,7 +148,6 @@
     try {
       p = fetch(url, options);
     } catch (err) {
-      // fetch threw synchronously (very rare) — clear the timer and propagate.
       if (timer) clearTimeout(timer);
       return Promise.reject(err);
     }
@@ -127,15 +158,20 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Capability + contract-version negotiation (HARD PREREQUISITE).
+  // Capability + contract-version negotiation (HARD PREREQUISITE — AC2 interlock).
   //
   // The /capabilities endpoint is auth-free and returns only static contract
-  // metadata. It MUST succeed and validate before the widget mounts. Any
-  // failure — HTTP not-ok (incl. 404 / 5xx), network error, timeout, non-JSON
-  // body, missing `capabilities` object, missing/empty supportedContractVersions,
-  // no mutually-supported contract version, missing required capability fields,
-  // or supportsTokenExchange !== true — returns false, and the caller aborts the
-  // mount. There are NO optimistic defaults and NO legacy long-lived fallback.
+  // metadata. It MUST succeed and validate before the widget mounts. Any failure
+  // (HTTP not-ok / network / timeout / non-JSON / missing capabilities / no
+  // mutually-supported contract version / supportsTokenExchange !== true / missing
+  // tokenPath) returns false and the caller aborts the mount. There are NO
+  // optimistic defaults and NO legacy long-lived fallback.
+  //
+  // The iframe owns streaming now, so the shell no longer resolves/validates a
+  // `streamPath` for its own fetch (it makes no stream fetch). Negotiation still
+  // gates the mount and yields the contractVersion the cit_ broker mint needs. The
+  // negotiation/capabilities path is KEPT until AC2 (the follow-up slice) lands
+  // everywhere; widgets still negotiate until then.
   // ---------------------------------------------------------------------------
   function pickContractVersion(serverVersions) {
     if (!Array.isArray(serverVersions)) { return null; }
@@ -161,51 +197,12 @@
         // Required: a mutually-supported contract version.
         var version = pickContractVersion(data.supportedContractVersions);
         if (!version) { return false; }
-        // Required: the broker token-exchange path is the ONLY client stream
-        // auth model. An instance that cannot mint short-lived tokens is
-        // incompatible — there is no long-lived key in the browser to fall back
-        // to. tokenPath must also be advertised (the same-origin broker uses it).
+        // Required: the broker token-exchange path is the ONLY client credential
+        // model. An instance that cannot mint short-lived tokens is incompatible —
+        // there is no long-lived key in the browser to fall back to.
         if (caps.supportsTokenExchange !== true) { return false; }
         if (typeof caps.tokenPath !== 'string' || !caps.tokenPath) { return false; }
-        // Required: the stream path the client POSTs the short-lived token to.
-        //
-        // SECURITY: streamPath is later combined with config.cinatraUrl in the
-        // Bearer-authenticated stream fetch. /capabilities is auth-free, so a
-        // hostile/compromised instance must NOT be able to steer that token to a
-        // foreign origin. Resolve streamPath and ASSERT it stays same-origin with
-        // the configured cinatraUrl; reject (=> negotiate false => no mount =>
-        // fallback chrome) anything off-origin. We first require a single-slash
-        // absolute path with no backslashes — this rejects userinfo ("@host"),
-        // protocol-relative ("//host"), absolute foreign URLs ("https://host"),
-        // and backslash forms ("/\\host", "\\host") that WHATWG resolution would
-        // otherwise normalize to a same-origin-looking or foreign path — then
-        // resolve against the instance origin and re-check the resolved origin.
-        if (typeof caps.streamPath !== 'string' || !caps.streamPath) { return false; }
-        if (caps.streamPath.charAt(0) !== '/' ||
-            caps.streamPath.charAt(1) === '/' ||
-            caps.streamPath.indexOf('\\') !== -1) { return false; }
-        try {
-          var base = new URL(config.cinatraUrl);
-          var u = new URL(caps.streamPath, base.origin + '/');
-          if (u.origin !== base.origin) { return false; }
-          // DEFENSE-IN-DEPTH: the raw-input charAt check above only inspects the
-          // unresolved string. Dot-segment forms ("/..//host", "/.//host",
-          // "/%2e%2e//host") pass that check yet WHATWG-normalize the resolved
-          // PATHNAME to "//host/..." — a protocol-relative authority smuggled
-          // PAST the origin assertion (the resolved origin is still the instance,
-          // because the authority only re-materializes when this pathname is
-          // resolved AGAIN at the fetch site). Re-assert that the RESOLVED
-          // pathname is a clean single-slash root-absolute path and store only
-          // that validated pathname+search; reject anything that re-smuggles an
-          // authority post-normalization. So such forms are rejected HERE, at
-          // negotiation -> NO mount -> getStreamToken() never mints a token.
-          if (u.pathname.charAt(0) !== '/' || u.pathname.charAt(1) === '/') { return false; }
-          negotiated.streamPath = u.pathname + u.search;
-        } catch (_) { return false; }
         negotiated.contractVersion = version;
-        // Forward flags: a behavior is enabled ONLY when explicitly advertised.
-        negotiated.supportsChangesFrame = caps.supportsChangesFrame === true;
-        negotiated.supportsMarkdown = caps.supportsMarkdown === true;
         return true;
       }).catch(function () { return false; });
     }).catch(function () {
@@ -215,31 +212,31 @@
   }
 
   // ---------------------------------------------------------------------------
-  // mountWidget() — builds the Shadow DOM + wires the assistant. Called ONLY
-  // after negotiateCapabilities() has resolved true.
+  // mountWidget() — builds the Shadow DOM + wires the launcher, login, and the
+  // parent-side bridge. Called ONLY after negotiateCapabilities() resolved true.
   // ---------------------------------------------------------------------------
   function mountWidget() {
   // Re-check after the async negotiation gap: a second copy of this IIFE could
-  // have mounted while we awaited /capabilities. Bail if a Shadow DOM already
-  // exists or the marker is already set (defense against duplicate includes).
+  // have mounted while we awaited /capabilities.
   if (rootEl.dataset.cinatraMounted === 'true' || rootEl.shadowRoot) { return; }
   var shadow = rootEl.attachShadow({ mode: 'open' });
   // The data-cinatra-mounted marker (which hides the fallback chrome) is set at
-  // the very END of synchronous mount construction — see the bottom of this
-  // function. A throw at any point during mount therefore leaves the fallback
-  // visible rather than hiding it over a half-built / dead widget.
+  // the very END of synchronous mount construction. A throw at any point during
+  // mount therefore leaves the fallback visible rather than hiding it over a
+  // half-built / dead widget.
 
   // ---------------------------------------------------------------------------
   // CSS
   // Collapsed: single logo circle (position:fixed, bottom-right).
-  // Expanded:  .cw-widget flex-column (panel on top, pill on bottom), same anchor.
+  // Expanded:  .cw-widget (panel), same anchor. The conversation body is the
+  //            mounted <iframe>; the textarea/submit live INSIDE the iframe.
   //            Drag the top-left corner (.cw-resize) to resize width + panel height.
   // ---------------------------------------------------------------------------
   var style = document.createElement('style');
   style.textContent = [
     ':host { all: initial; }',
 
-    /* Collapsed logo circle — same size/position as the submit button inside the pill. */
+    /* Collapsed logo circle. */
     '.cw-circle {',
     '  position: fixed; bottom: 66px; right: 36px;',
     '  width: 32px; height: 32px; border-radius: 9999px;',
@@ -251,7 +248,7 @@
     '}',
     '.cw-circle:hover { background: #d8e7db; }',
 
-    /* Expanded widget: position:fixed container, panel+pill both absolutely placed. */
+    /* Expanded widget: position:fixed container. */
     '.cw-widget {',
     '  position: fixed; bottom: 56px; right: 24px;',
     '  z-index: 10000000;',
@@ -265,9 +262,9 @@
     '  z-index: 3;',
     '}',
 
-    /* Response panel: absolute top of widget, fixed height set by JS */
+    /* Panel: fills the widget; header on top, body (login | iframe) below. */
     '.cw-panel {',
-    '  position: absolute; top: 0; left: 0; right: 0;',
+    '  position: absolute; top: 0; left: 0; right: 0; bottom: 0;',
     '  box-sizing: border-box;',
     '  background: #f7f7f3; color: #15213a;',
     '  border: 1px solid #15213a14; border-radius: 16px;',
@@ -292,132 +289,22 @@
     '}',
     '.cw-close:hover { background: #f7f7f3; color: #15213a; }',
 
-    /* Messages */
-    '.cw-messages {',
-    '  flex: 1; overflow-y: auto; padding: 16px;',
-    '  display: flex; flex-direction: column; gap: 12px;',
-    '}',
-    '.cw-msg { line-height: 1.6; max-width: 88%; }',
-    '.cw-msg-user {',
-    '  align-self: flex-end; background: #15213a; color: #ffffff;',
-    '  padding: 8px 14px; border-radius: 18px;',
-    '  font: 14px system-ui, sans-serif; white-space: pre-wrap;',
-    '}',
-    '.cw-msg-assistant {',
-    '  align-self: flex-start; color: #15213a;',
-    '  font: 14px/1.6 system-ui, sans-serif;',
-    '}',
-    '.cw-msg-assistant p { margin: 4px 0; }',
-    '.cw-msg-assistant p:first-child { margin-top: 0; }',
-    '.cw-msg-assistant p:last-child { margin-bottom: 0; }',
-    '.cw-msg-assistant h1,.cw-msg-assistant h2,.cw-msg-assistant h3 { font-weight:600; margin:12px 0 4px; line-height:1.3; }',
-    '.cw-msg-assistant h1 { font-size:1.2em; }',
-    '.cw-msg-assistant h2 { font-size:1.08em; }',
-    '.cw-msg-assistant h3 { font-size:1em; }',
-    '.cw-msg-assistant ul,.cw-msg-assistant ol { margin:6px 0; padding-left:20px; }',
-    '.cw-msg-assistant li { margin:2px 0; }',
-    '.cw-msg-assistant code { background:#f7f7f3; padding:1px 5px; border-radius:4px; font-family:ui-monospace,monospace; font-size:0.88em; }',
-    '.cw-msg-assistant pre { background:#f7f7f3; padding:12px; border-radius:8px; overflow-x:auto; margin:8px 0; }',
-    '.cw-msg-assistant pre code { background:none; padding:0; font-size:0.88em; }',
-    '.cw-msg-assistant strong { font-weight:600; }',
-    '.cw-msg-assistant em { font-style:italic; }',
-    '.cw-msg-assistant a { color:#364e81; text-decoration:underline; }',
-    '.cw-msg-assistant blockquote { border-left:3px solid #15213a14; padding-left:12px; margin:6px 0; color:#5a6477; }',
-    '.cw-msg-assistant table { border-collapse:collapse; margin:8px 0; font-size:0.9em; }',
-    '.cw-msg-assistant th,.cw-msg-assistant td { border:1px solid #15213a14; padding:6px 10px; text-align:left; }',
-    '.cw-msg-assistant th { background:#f7f7f3; font-weight:600; }',
-    '.cw-msg-assistant hr { border:none; border-top:1px solid #15213a14; margin:8px 0; }',
-    /* Spacer at the bottom of the panel. */
-    '.cw-messages-spacer { flex-shrink: 0; pointer-events: none; }',
-
-    '.cw-thinking { display:flex; align-items:center; gap:8px; color:#5a6477; font-size:13px; }',
-    '.cw-thinking-dot { position:relative; display:inline-flex; width:8px; height:8px; flex-shrink:0; }',
-    '.cw-thinking-dot::before {',
-    '  content:""; position:absolute; inset:0; border-radius:9999px;',
-    '  background:#5a6477; opacity:0.75;',
-    '  animation: cw-ping 1s cubic-bezier(0,0,0.2,1) infinite;',
-    '}',
-    '.cw-thinking-dot::after {',
-    '  content:""; position:relative; display:inline-block;',
-    '  width:8px; height:8px; border-radius:9999px; background:#5a6477;',
-    '}',
-    '.cw-thinking-label { font-weight:500; color:#5a6477; }',
-    '@keyframes cw-ping {',
-    '  75%, 100% { transform: scale(2); opacity: 0; }',
+    /* Conversation body: the sandboxed embed iframe fills the panel body. */
+    '.cw-frame-host { flex: 1; min-height: 0; display: flex; }',
+    '.cw-frame {',
+    '  flex: 1; width: 100%; height: 100%; border: none; background: #f7f7f3;',
+    '  display: block;',
     '}',
 
-    /* Prompt box: absolute bottom of widget, grows upward over the panel. */
-    '.cw-pill {',
-    '  position: absolute; bottom: 0; left: 0; right: 0;',
-    '  background: #ffffff; border: 1px solid #15213a14; border-top: none;',
-    '  border-radius: 0 0 16px 16px;',
-    '  padding: 10px 12px;',
-    '  display: flex; align-items: flex-end; gap: 10px;',
-    '  box-sizing: border-box;',
-    '  box-shadow: 0 4px 16px rgba(0,0,0,0.1);',
-    '  z-index: 2;',
+    /* Visually-hidden aria-live region: the parent mirrors iframe a11y status
+       here as textContent (never HTML) so host-page assistive tech is notified. */
+    '.cw-a11y-live {',
+    '  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;',
+    '  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;',
     '}',
 
-    /* Flyout toggle (+). */
-    '.cw-flyout-btn {',
-    '  background: none; border: none; cursor: pointer; flex-shrink: 0;',
-    '  color: #5a6477; font-size: 20px; line-height: 1;',
-    '  font-family: system-ui, sans-serif; font-weight: 300;',
-    '  padding: 0 2px; margin-bottom: 6px; display: flex; align-items: center;',
-    '}',
-    '.cw-flyout-btn:hover { color: #364e81; }',
-    '.cw-flyout-btn:active { color: #2d416c; }',
-
-    /* Textarea. */
-    '.cw-textarea {',
-    '  flex: 1; border: none; outline: none; resize: none;',
-    '  font: 15px/1.5 system-ui, -apple-system, sans-serif;',
-    '  background: transparent; color: #15213a;',
-    '  min-height: 24px; overflow-y: hidden;',
-    '  padding: 3px 0 0 0; margin: 0 0 4px;',
-    '}',
-    '.cw-textarea::placeholder { color: #5a6477; }',
-
-    /* Submit circle inside the pill (bottom-right) */
-    '.cw-submit {',
-    '  width: 32px; height: 32px; border-radius: 9999px;',
-    '  background: #364e81; border: none; cursor: pointer;',
-    '  display: flex; align-items: center; justify-content: center;',
-    '  flex-shrink: 0; transition: background 0.15s;',
-    '}',
-    '.cw-submit:hover { background: #2d416c; }',
-    '.cw-submit:disabled { opacity: 0.4; cursor: not-allowed; }',
-
-    /* Flyout menu */
-    '.cw-flyout-menu {',
-    '  position: absolute; bottom: calc(100% + 10px); left: 0;',
-    '  background: #ffffff; border: 1px solid #15213a14;',
-    '  border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.15);',
-    '  padding: 6px; min-width: 180px; z-index: 10;',
-    '}',
-    '.cw-flyout-item {',
-    '  display: block; width: 100%; box-sizing: border-box;',
-    '  padding: 8px 12px; border: none; background: none;',
-    '  text-align: left; font: 13px system-ui, sans-serif;',
-    '  cursor: pointer; border-radius: 8px; color: #15213a; text-decoration: none;',
-    '}',
-    '.cw-flyout-item:hover { background: #e8e8e3; }',
-
-    /* Diff card */
-    '.cw-diff-card { align-self: flex-start; flex-shrink: 0; max-width: 88%; margin-top: 4px; margin-bottom: 4px; border: 1px solid #15213a14; border-radius: 10px; overflow: hidden; font: 13px system-ui, sans-serif; }',
-    '.cw-diff-card-header { padding: 6px 12px; background: #f7f7f3; border-bottom: 1px solid #15213a14; font-weight: 600; color: #5a6477; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }',
-    '.cw-diff-row { display: flex; gap: 8px; padding: 6px 12px; align-items: baseline; min-width: 0; }',
-    '.cw-diff-row + .cw-diff-row { border-top: 1px solid #15213a14; }',
-    '.cw-diff-field { font-weight: 600; color: #15213a; white-space: nowrap; flex-shrink: 0; }',
-    '.cw-diff-values { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow: hidden; }',
-    '.cw-diff-before { color: #5a6477; text-decoration: line-through; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
-    '.cw-diff-after { color: #364e81; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }',
-    '.cw-diff-footer { padding: 5px 12px; background: #e8e8e3; color: #5a6477; font-size: 11px; border-top: 1px solid #15213a14; }',
-
-    /* Required-login window (cinatra#410). Shown in place of the conversation
-       (.cw-messages + .cw-pill) until a valid per-user token is held. Matches the
-       Cinatra /sign-in palette: brand navy #15213a primary on the #f7f7f3 panel,
-       muted #5a6477 secondary text. NO email/password inputs and NO sign-up — the
+    /* Required-login window (cinatra#410). Shown in place of the iframe until a
+       valid per-user token is held. NO email/password inputs and NO sign-up — the
        only affordance is the button that opens the hosted /widget-auth popup. */
     '.cw-login {',
     '  flex: 1; min-height: 0; display: flex; flex-direction: column;',
@@ -479,13 +366,6 @@
     return svg;
   }
 
-  function makeArrowSvg() {
-    var svg = mkSvg(14, 14, '0 0 24 24');
-    svg.appendChild(mkEl('path', { d: 'M12 19V5', stroke: 'white', 'stroke-width': '2.5', 'stroke-linecap': 'round' }));
-    svg.appendChild(mkEl('path', { d: 'M5 12l7-7 7 7', stroke: 'white', 'stroke-width': '2.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
-    return svg;
-  }
-
   // ---------------------------------------------------------------------------
   // DOM: collapsed circle
   // ---------------------------------------------------------------------------
@@ -496,7 +376,7 @@
   shadow.appendChild(circle);
 
   // ---------------------------------------------------------------------------
-  // Circle drag-to-reposition: position helpers (session-only, no persistence)
+  // Circle drag-to-reposition (session-only, no persistence)
   // ---------------------------------------------------------------------------
   function applyCirclePos(left, top) {
     circle.style.left = left + 'px';
@@ -528,18 +408,18 @@
   });
 
   // ---------------------------------------------------------------------------
-  // DOM: expanded widget — panel + pill stacked
+  // DOM: expanded widget — panel (header + body)
   // ---------------------------------------------------------------------------
   var currentWidth = 580;
-  var currentPanelHeight = 440;
-  var PILL_MIN_H = 46;
-  var PILL_GAP = 16;
+  var currentPanelHeight = 460;   // total panel height (header + body)
+  var MIN_PANEL_HEIGHT = 260;
+  var userResizedPanel = false;   // a manual drag pins the height (disables auto-grow)
+
+  function maxPanelHeight() { return Math.max(MIN_PANEL_HEIGHT, window.innerHeight - 120); }
 
   function setWidgetSize() {
     cwWidget.style.width = currentWidth + 'px';
-    cwWidget.style.height = (currentPanelHeight + PILL_GAP + PILL_MIN_H) + 'px';
-    panel.style.height = (currentPanelHeight + PILL_GAP + Math.floor(PILL_MIN_H / 2)) + 'px';
-    spacerEl.style.height = (PILL_GAP + Math.floor(PILL_MIN_H / 2)) + 'px';
+    cwWidget.style.height = currentPanelHeight + 'px';
   }
 
   var cwWidget = document.createElement('div');
@@ -575,24 +455,18 @@
   closeBtn.textContent = '×';
   panelHeader.appendChild(closeBtn);
 
-  var messagesEl = document.createElement('div');
-  messagesEl.className = 'cw-messages';
-  messagesEl.setAttribute('role', 'log');
-  messagesEl.setAttribute('aria-live', 'polite');
-  panel.appendChild(messagesEl);
-
-  var spacerEl = document.createElement('div');
-  spacerEl.className = 'cw-messages-spacer';
-  panel.appendChild(spacerEl);
+  // Visually-hidden aria-live region: mirrors iframe a11y uplinks (textContent).
+  var a11yLive = document.createElement('div');
+  a11yLive.className = 'cw-a11y-live';
+  a11yLive.setAttribute('role', 'status');
+  a11yLive.setAttribute('aria-live', 'polite');
+  panel.appendChild(a11yLive);
 
   // ---------------------------------------------------------------------------
-  // Required-login window (cinatra#410). Built once at mount; shown by
-  // applyPanelMode() when there is no valid per-user token, hidden in
-  // conversation mode. The .cw-messages + .cw-pill conversation surfaces are
-  // hidden while this is shown, so the conversation is NEVER visible pre-login.
-  // This panel has NO credential inputs and NO sign-up — its only affordance is
-  // the button that opens the Cinatra-hosted /widget-auth login popup, so raw
-  // credentials never touch this CMS-origin DOM.
+  // Required-login window (cinatra#410). Shown in login mode; hidden in
+  // conversation mode (replaced by the iframe). NO credential inputs, NO sign-up
+  // — its only affordance opens the Cinatra-hosted /widget-auth login popup, so
+  // raw credentials never touch this CMS-origin DOM.
   // ---------------------------------------------------------------------------
   var loginEl = document.createElement('div');
   loginEl.className = 'cw-login';
@@ -630,55 +504,16 @@
 
   panel.appendChild(loginEl);
 
-  var pill = document.createElement('div');
-  pill.className = 'cw-pill';
-  cwWidget.appendChild(pill);
-
-  var flyoutMenu = document.createElement('div');
-  flyoutMenu.className = 'cw-flyout-menu';
-  flyoutMenu.style.display = 'none';
-  pill.appendChild(flyoutMenu);
-
-  var clearItem = document.createElement('button');
-  clearItem.className = 'cw-flyout-item';
-  clearItem.type = 'button';
-  clearItem.textContent = 'Clear conversation';
-  flyoutMenu.appendChild(clearItem);
-
-  var settingsItem = document.createElement('a');
-  settingsItem.className = 'cw-flyout-item';
-  settingsItem.href = (config.wpAdminUrl || '') + 'options-general.php?page=cinatra';
-  settingsItem.textContent = 'Widget administration';
-  settingsItem.target = '_blank';
-  settingsItem.rel = 'noopener noreferrer';
-  flyoutMenu.appendChild(settingsItem);
-
-  var flyoutBtn = document.createElement('button');
-  flyoutBtn.className = 'cw-flyout-btn';
-  flyoutBtn.type = 'button';
-  flyoutBtn.setAttribute('aria-label', 'Options');
-  flyoutBtn.textContent = '+';
-  pill.appendChild(flyoutBtn);
-
-  var textarea = document.createElement('textarea');
-  textarea.className = 'cw-textarea';
-  textarea.placeholder = 'Ask Cinatra…';
-  textarea.rows = 1;
-  pill.appendChild(textarea);
-
-  var submitBtn = document.createElement('button');
-  submitBtn.className = 'cw-submit';
-  submitBtn.type = 'button';
-  submitBtn.disabled = true;
-  submitBtn.appendChild(makeArrowSvg());
-  pill.appendChild(submitBtn);
+  // Conversation body host — the sandboxed embed iframe is mounted here on login.
+  var frameHost = document.createElement('div');
+  frameHost.className = 'cw-frame-host';
+  frameHost.style.display = 'none';
+  panel.appendChild(frameHost);
 
   // ---------------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------------
   var isOpen = false;
-  var isFlyoutOpen = false;
-  var isStreaming = false;
 
   // Required-login state (cinatra#410). On a fresh mount there is never a valid
   // per-user token, so the panel starts in 'login' mode. `userToken` is held in
@@ -690,166 +525,599 @@
   var pkce = null;           // { codeVerifier, state, popup } during a handshake
   var popupTimer = null;     // setInterval handle while watching for popup close
 
-  function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
+  // ---------------------------------------------------------------------------
+  // Content editor context (repurposed for the `cms` BOOTSTRAP context and as the
+  // parent's OWN canonical resource for apply_intent — NOT a stream input).
+  // ---------------------------------------------------------------------------
+  function buildContentContext() {
+    var postId =
+      (window.wp && window.wp.data &&
+        window.wp.data.select('core/editor') &&
+        window.wp.data.select('core/editor').getCurrentPostId &&
+        window.wp.data.select('core/editor').getCurrentPostId()) ||
+      (document.querySelector('#post_ID') && document.querySelector('#post_ID').value) ||
+      '';
 
-  function renderDiffCard(fields) {
-    var card = document.createElement('div');
-    card.className = 'cw-diff-card';
-    var hdr = document.createElement('div');
-    hdr.className = 'cw-diff-card-header';
-    hdr.textContent = fields.length > 0 ? 'Changes applied' : 'Content updated';
-    card.appendChild(hdr);
-    if (fields.length === 0) {
-      var note = document.createElement('div');
-      note.className = 'cw-diff-row';
-      note.style.cssText = 'color:#5a6477;font-size:12px;font-style:italic;';
-      note.textContent = 'Field-level diff not available for rich content — reload will apply changes.';
-      card.appendChild(note);
-    }
-    for (var fi = 0; fi < fields.length; fi++) {
-      var f = fields[fi];
-      var row = document.createElement('div');
-      row.className = 'cw-diff-row';
-      var fieldEl = document.createElement('span');
-      fieldEl.className = 'cw-diff-field';
-      fieldEl.textContent = (f.field || '') + ':';
-      var vals = document.createElement('div');
-      vals.className = 'cw-diff-values';
-      if (f.before) {
-        var bef = document.createElement('span');
-        bef.className = 'cw-diff-before';
-        bef.textContent = trunc(String(f.before), 80);
-        vals.appendChild(bef);
-      }
-      var aft = document.createElement('span');
-      aft.className = 'cw-diff-after';
-      aft.textContent = trunc(String(f.after || '(removed)'), 80);
-      vals.appendChild(aft);
-      row.appendChild(fieldEl);
-      row.appendChild(vals);
-      card.appendChild(row);
-    }
-    return card;
+    var postStatus =
+      (window.wp && window.wp.data &&
+        window.wp.data.select('core/editor') &&
+        window.wp.data.select('core/editor').getEditedPostAttribute &&
+        window.wp.data.select('core/editor').getEditedPostAttribute('status')) ||
+      (document.querySelector('#post-status-display') &&
+        document.querySelector('#post-status-display').textContent.trim().toLowerCase()) ||
+      '';
+
+    return {
+      instanceId: config.instanceId || '',
+      postId:     String(postId),
+      postType:   typeof window.typenow !== 'undefined' ? window.typenow : '',
+      postStatus: postStatus,
+    };
   }
 
   // ---------------------------------------------------------------------------
-  // History
+  // Short-lived cit_ token exchange via the same-origin WordPress REST broker.
+  // The browser never holds the long-lived integration key; the broker (PHP)
+  // holds it and performs the server-to-server exchange. The minted cit_ token is
+  // relayed ONLY into the BOOTSTRAP message (§4) — never a Bearer header, never a
+  // URL, never storage. Cached in-memory and reused until ~10s before expiry.
   // ---------------------------------------------------------------------------
-  var _postIdForKey = (window.wp && window.wp.data && window.wp.data.select('core/editor') && window.wp.data.select('core/editor').getCurrentPostId && window.wp.data.select('core/editor').getCurrentPostId()) || (document.querySelector('#post_ID') && document.querySelector('#post_ID').value) || '';
-  var HISTORY_KEY = 'cinatra_history_' + (config.instanceId || 'default') + '_' + (_postIdForKey || 'unknown');
-  var history = [];
-  try { var raw = window.sessionStorage.getItem(HISTORY_KEY); if (raw) history = JSON.parse(raw) || []; } catch (_) {}
-  function saveHistory() { try { window.sessionStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch (_) {} }
+  var cachedToken = null;        // { token, expiresAtMs }
+  async function getStreamToken() {
+    var now = Date.now();
+    if (cachedToken && cachedToken.expiresAtMs - 10000 > now) {
+      return cachedToken.token;
+    }
+    var headers = { 'Content-Type': 'application/json' };
+    if (config.nonce) headers['X-WP-Nonce'] = config.nonce;
+    var resp = await fetch(config.tokenEndpoint, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: headers,
+      body: JSON.stringify({ contractVersion: negotiated.contractVersion }),
+    });
+    if (!resp.ok) {
+      var detail = 'HTTP ' + resp.status;
+      try {
+        var errRaw = await resp.text();
+        var errParsed = null;
+        try { errParsed = JSON.parse(errRaw); } catch (_) {}
+        if (errParsed && (errParsed.message || errParsed.error)) {
+          detail = errParsed.message || errParsed.error;
+        } else if (errRaw) {
+          detail += ': ' + errRaw.slice(0, 200);
+        }
+      } catch (_) {}
+      throw new Error('Could not obtain a Cinatra session token (' + detail + ').');
+    }
+    var body = await resp.json();
+    if (!body || typeof body.token !== 'string' || body.token.indexOf('cit_') !== 0) {
+      throw new Error('Cinatra session-token response was malformed.');
+    }
+    var ttlMs = (typeof body.expiresIn === 'number' ? body.expiresIn : 300) * 1000;
+    cachedToken = { token: body.token, expiresAtMs: now + ttlMs };
+    return body.token;
+  }
 
   // ---------------------------------------------------------------------------
-  // Conversation thread id (cinatra#1221 S5). The unified assistant chat contract
-  // (POST /api/assistants/chat) REQUIRES a `threadId` (1..200 chars) — the OLD
-  // relay had none. We mint one per conversation and persist it (sessionStorage,
-  // keyed with the history) so a reopen/auto-reload continues the SAME thread;
-  // "Clear conversation" mints a fresh one. Held here only; it is a client-chosen
-  // opaque id — the host authorizes it against the widget principal, never trusts
-  // it for identity.
+  // Required-login (cinatra#410): the per-user PKCE handshake against the hosted
+  // /widget-auth surface (#407) + the login-window mode toggle. The browser never
+  // holds the long-lived cnx_ key: both init and token redemptions go through the
+  // same-origin PHP broker, which presents cnx_ server-to-server. The opaque cwu_
+  // user token is short-lived (15-min TTL, no refresh) and held in memory only.
   // ---------------------------------------------------------------------------
-  var THREAD_KEY = 'cinatra_thread_' + (config.instanceId || 'default') + '_' + (_postIdForKey || 'unknown');
-  var _threadId = null;
-  function newThreadId() {
-    try { if (window.crypto && crypto.randomUUID) { return 'wpw_' + crypto.randomUUID(); } } catch (_) {}
+
+  // base64url(no padding) of a byte array.
+  function b64url(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function randB64url(n) {
+    var a = new Uint8Array(n);
+    crypto.getRandomValues(a);
+    return b64url(a);
+  }
+  async function sha256b64url(str) {
+    var data = new TextEncoder().encode(str);
+    var dig = await crypto.subtle.digest('SHA-256', data);
+    return b64url(new Uint8Array(dig));
+  }
+
+  // CSRF/auth headers for the same-origin broker POSTs (WP REST convention: the
+  // wp_rest nonce in X-WP-Nonce; the broker permission_callback + nonce check are
+  // the cross-site-POST defense).
+  function brokerHeaders() {
+    var h = { 'Content-Type': 'application/json' };
+    if (config.nonce) { h['X-WP-Nonce'] = config.nonce; }
+    return h;
+  }
+
+  // A per-user token is valid when present and at least 5s from expiry (skew).
+  function userTokenValid() {
+    return !!(userToken && userToken.token && (userToken.expiresAtMs - 5000) > Date.now());
+  }
+
+  // Reflect panelMode into the DOM. The header stays in both modes; the iframe is
+  // display:none in login mode so the conversation is never shown without a token.
+  function applyPanelMode() {
+    var login = panelMode === 'login';
+    loginEl.style.display = login ? 'flex' : 'none';
+    frameHost.style.display = login ? 'none' : 'flex';
+  }
+
+  // Tear down any in-flight handshake state. Does NOT close the popup — the caller
+  // decides that (success closes it).
+  function clearHandshake() {
+    if (popupTimer) { try { clearInterval(popupTimer); } catch (_) {} popupTimer = null; }
+    pkce = null;
+  }
+
+  // Drop the user token and return to the login window, tearing down the iframe
+  // session (single bootstrap per frame; re-auth = a fresh frame). Used on expiry.
+  function forceReLogin(message) {
+    userToken = null;
+    clearHandshake();
+    teardownBridge();
+    panelMode = 'login';
+    applyPanelMode();
+    loginErr.textContent = message || 'Your session expired. Please sign in again.';
+    loginBtn.disabled = false;
+  }
+
+  // Poll for a manually-closed/blocked popup so we can re-enable the button and
+  // drop the dangling handshake (the postMessage may never arrive).
+  function watchPopupClosed() {
+    if (popupTimer) { try { clearInterval(popupTimer); } catch (_) {} popupTimer = null; }
+    var ticks = 0;
+    popupTimer = setInterval(function () {
+      ticks++;
+      var closed = false;
+      try { closed = !pkce || !pkce.popup || pkce.popup.closed; } catch (_) { closed = false; }
+      if (closed || ticks > 600) {
+        try { clearInterval(popupTimer); } catch (_) {}
+        popupTimer = null;
+        if (pkce) {
+          pkce = null;
+          loginBtn.disabled = false;
+        }
+      }
+    }, 500);
+  }
+
+  // Start the login handshake: generate PKCE, init via the broker, open the hosted
+  // login popup. The auth-popup message listener does the redeem when it posts back.
+  async function startLogin() {
+    if (pkce) { return; }                  // reject concurrent handshakes
+    loginErr.textContent = '';
+    loginBtn.disabled = true;
     try {
-      var a = new Uint8Array(16); crypto.getRandomValues(a);
-      var s = ''; for (var i = 0; i < a.length; i++) { s += (a[i] + 256).toString(16).slice(1); }
-      return 'wpw_' + s;
+      if (typeof window.crypto === 'undefined' || !window.crypto || !crypto.subtle || typeof btoa === 'undefined') {
+        throw new Error('Secure sign-in is not available in this browser.');
+      }
+      var verifier = randB64url(48);
+      var challenge = await sha256b64url(verifier);
+      var state = randB64url(24);
+
+      var initResp = await fetch(config.authInitEndpoint, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: brokerHeaders(),
+        body: JSON.stringify({
+          client: AUTH_CLIENT,
+          agentSlug: AGENT_SLUG,
+          codeChallenge: challenge,
+          codeChallengeMethod: 'S256',
+          state: state,
+          instanceId: config.instanceId || undefined,
+        }),
+      });
+      if (!initResp.ok) { throw new Error('Could not start sign-in.'); }
+      var initBody = await initResp.json();
+      if (!initBody || !initBody.authorizeUrl) { throw new Error('Could not start sign-in.'); }
+
+      // SECURITY: the popup destination MUST be same-origin with the configured
+      // instance — defense against a compromised broker steering the login popup
+      // off-instance. Resolve and re-assert the origin here.
+      var authUrl = new URL(initBody.authorizeUrl, cinatraOrigin + '/');
+      if (authUrl.origin !== cinatraOrigin) { throw new Error('Refusing off-origin sign-in.'); }
+
+      pkce = { codeVerifier: verifier, state: state, popup: null };
+
+      var popup = window.open(authUrl.href, 'cinatra-login',
+        'width=460,height=640,menubar=no,toolbar=no,location=yes,status=no');
+      if (!popup) {
+        pkce = null;
+        throw new Error('Pop-up blocked. Allow pop-ups for this site and try again.');
+      }
+      pkce.popup = popup;
+      watchPopupClosed();
+    } catch (err) {
+      clearHandshake();
+      loginErr.textContent = (err && err.message) ? err.message : 'Sign-in failed.';
+      loginBtn.disabled = false;
+    }
+  }
+
+  // Redeem the authorization code for the opaque cwu_ user token via the broker,
+  // then swap to conversation mode (which mounts the iframe). Single-use: the
+  // in-flight pkce is consumed immediately.
+  async function redeemCode(code) {
+    var local = pkce;
+    clearHandshake();                      // consume handshake + stop popup watch
+    loginBtn.disabled = true;
+    try {
+      var resp = await fetch(config.authTokenEndpoint, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: brokerHeaders(),
+        body: JSON.stringify({
+          grantType: 'authorization_code',
+          client: AUTH_CLIENT,
+          agentSlug: AGENT_SLUG,
+          code: code,
+          codeVerifier: local.codeVerifier,
+        }),
+      });
+      if (!resp.ok) { throw new Error('Sign-in could not be completed.'); }
+      var body = await resp.json();
+      // Validate the token shape before trusting it: opaque Bearer cwu_ token + TTL.
+      if (!body || typeof body.token !== 'string' || body.token.indexOf('cwu_') !== 0) {
+        throw new Error('Sign-in could not be completed.');
+      }
+      if (body.tokenType && String(body.tokenType).toLowerCase() !== 'bearer') {
+        throw new Error('Sign-in could not be completed.');
+      }
+      var ttlSec = (typeof body.expiresIn === 'number' && body.expiresIn > 0) ? body.expiresIn : 900;
+      if (ttlSec > 900) { ttlSec = 900; }   // clamp to the backend max (15-min TTL)
+      userToken = { token: body.token, expiresAtMs: Date.now() + (ttlSec * 1000) };
+      try { if (local.popup && !local.popup.closed) { local.popup.close(); } } catch (_) {}
+      loginErr.textContent = '';
+      enterConversation();
+    } catch (err) {
+      try { if (local && local.popup && !local.popup.closed) { local.popup.close(); } } catch (_) {}
+      loginErr.textContent = (err && err.message) ? err.message : 'Sign-in failed.';
+    } finally {
+      loginBtn.disabled = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // §12 PARENT-SIDE BRIDGE — the host half of the parent↔iframe embed protocol.
+  //
+  // The iframe (`/embed/assistant`) is the SOLE session owner. This shell mints
+  // the credentials, delivers them ONCE via BOOTSTRAP, and services the closed
+  // set of iframe→parent uplinks. Every trust-boundary control is enforced here:
+  // origin + source-window binding, schema/protocolVersion/nonce agreement, dual
+  // monotonic seq, single-bootstrap-per-frame, apply_intent untrusted-selector
+  // permission checks + bounded LRU dedup, and the resize clamp.
+  // ---------------------------------------------------------------------------
+  var iframeEl = null;          // the mounted embed iframe (null until conversation)
+  var frameWindow = null;       // iframeEl.contentWindow captured at load
+  var frameNonce = null;        // the READY nonce the frame minted (echoed in bootstrap)
+  var correlationId = null;     // parent-minted CSPRNG id, echoed by every uplink
+  var bootstrapped = false;     // single bootstrap per frame
+  var inboundSeqLast = null;    // iframe->parent monotonic gate (READY seeds it)
+  var outboundSeqLast = null;   // parent->iframe monotonic counter (bootstrap = 0)
+  var appliedLru = [];          // §6f bounded seen apply-id LRU for this correlationId
+
+  // A CSPRNG base64url correlationId carrying >=128 bits (24 base64url chars ==
+  // 144 bits), satisfying ID_PATTERN (§6b).
+  function mintCorrelationId() {
+    return randB64url(18);
+  }
+
+  // §6c per-direction monotonic gate: a seq must be a nonnegative integer and, on
+  // any direction after the first accepted value, strictly increase.
+  function acceptInboundSeq(seq) {
+    if (typeof seq !== 'number' || !isFinite(seq) || Math.floor(seq) !== seq || seq < 0) return false;
+    if (inboundSeqLast !== null && seq <= inboundSeqLast) return false;
+    inboundSeqLast = seq;
+    return true;
+  }
+  function nextOutboundSeq() {
+    var next = (outboundSeqLast === null ? -1 : outboundSeqLast) + 1;
+    outboundSeqLast = next;
+    return next;
+  }
+
+  // ALWAYS an explicit origin, NEVER "*" (§6a outbound). Posts to the frame window.
+  function postToFrame(message) {
+    if (!frameWindow) return;
+    frameWindow.postMessage(message, cinatraOrigin);
+  }
+
+  // §3a READY validator (pre-bootstrap; the ONLY message without a correlationId).
+  function isValidReady(d) {
+    return !!d && d.type === MSG.ready &&
+      d.protocolVersion === EMBED_PROTOCOL_VERSION &&
+      typeof d.nonce === 'string' && ID_PATTERN.test(d.nonce) &&
+      typeof d.seq === 'number';
+  }
+
+  // §5 uplink common envelope validator (post-bootstrap): protocolVersion, the
+  // echoed correlationId, and a monotonic seq for the iframe->parent direction.
+  function validUplinkEnvelope(d) {
+    if (!d || d.protocolVersion !== EMBED_PROTOCOL_VERSION) return false;
+    if (typeof d.correlationId !== 'string' || d.correlationId !== correlationId) return false;
+    if (!acceptInboundSeq(d.seq)) return false;
+    return true;
+  }
+
+  // Synchronous read of the pre-minted cit_ site token from the in-memory cache
+  // (mirrors getStreamToken's freshness check). Returns null if it is absent or
+  // within ~10s of expiry. The cit_ token is pre-minted in enterConversation()
+  // BEFORE the frame mounts, so this read is warm when READY arrives.
+  function getCachedCitToken() {
+    var now = Date.now();
+    if (cachedToken && cachedToken.token && cachedToken.expiresAtMs - 10000 > now) {
+      return cachedToken.token;
+    }
+    return null;
+  }
+
+  // §4: build the ONE BOOTSTRAP (the only credential carrier) — mint the
+  // correlationId, echo the frame nonce, seq=0, relay cit_/cwu_. Pure builder: no
+  // await, no I/O, so the caller can release it SYNCHRONOUSLY in the same task as
+  // the READY message (see onBridgeMessage) — a same-origin navigation cannot
+  // interleave within one synchronous task, so credentials can never reach a
+  // document that navigated in mid-release.
+  function buildBootstrap(nonce, citToken) {
+    frameNonce = nonce;
+    correlationId = mintCorrelationId();
+    var ctx = buildContentContext();
+    var cms = { instanceId: config.instanceId || '' };
+    if (ctx.postId) { cms.resourceId = ctx.postId; }
+    if (ctx.postType) { cms.resourceType = ctx.postType; }
+    if (ctx.postStatus) { cms.status = ctx.postStatus; }
+    return {
+      type: MSG.bootstrap,
+      protocolVersion: EMBED_PROTOCOL_VERSION,
+      correlationId: correlationId,
+      nonceEcho: frameNonce,
+      seq: nextOutboundSeq(),              // parent->iframe counter starts at 0
+      auth: {
+        citToken: citToken,                // cit_ site transport token
+        cwuToken: userToken.token,         // cwu_ per-user token
+      },
+      session: {
+        threadId: correlationId,           // one thread per bootstrapped frame
+        assistant: EMBED_ASSISTANT,        // == ?assistant, == cit_ bound kind
+      },
+      cms: cms,
+    };
+  }
+
+  // §5/§B9 resize: CLAMP the reported content height to the panel cap (clamp,
+  // never reject a merely-tall height; NaN/negative/over-max are schema-dropped).
+  function handleResize(height) {
+    if (typeof height !== 'number' || !isFinite(height) ||
+        Math.floor(height) !== height || height < 0 || height > RESIZE_MAX_HEIGHT) {
+      return; // schema-reject
+    }
+    if (userResizedPanel) return; // a manual drag pins the height
+    var HEADER_H = 46;
+    var clamped = Math.max(MIN_PANEL_HEIGHT, Math.min(height + HEADER_H, maxPanelHeight()));
+    currentPanelHeight = clamped;
+    setWidgetSize();
+  }
+
+  // §5 focus: advisory. Bring the panel forward / keep it open on a focus request.
+  function handleFocus(focus) {
+    if (typeof focus !== 'boolean') return;
+    if (focus && !isOpen) { openWidget(); }
+  }
+
+  // §5 a11y: mirror the assistant status into the parent aria-live region as
+  // textContent — NEVER HTML (no markup injection from frame content).
+  function handleA11y(liveRegion, politeness) {
+    if (typeof liveRegion !== 'string' || liveRegion.length > 2000) return;
+    if (politeness !== 'polite' && politeness !== 'assertive') return;
+    a11yLive.setAttribute('aria-live', politeness);
+    a11yLive.textContent = liveRegion;
+  }
+
+  // Best-effort re-check that the current user may edit the canonical resource
+  // (§6f step 1). Uses WordPress's OWN capability oracle; fails CLOSED only on an
+  // explicit `false` (the server-side MCP apply is itself permission-checked, so
+  // an unresolved/absent oracle is not treated as a hard deny in the client).
+  function currentUserMayEdit(ctx) {
+    try {
+      if (window.wp && window.wp.data && window.wp.data.select && ctx.postType && ctx.postId) {
+        var coreSel = window.wp.data.select('core');
+        if (coreSel && typeof coreSel.canUser === 'function') {
+          // WordPress core-data `canUser` object-entity form (kind/name/id) — the
+          // 4-positional `('update','postType',type,id)` form is NOT a valid
+          // signature (it would silently return undefined, making the deny branch
+          // dead). `canUser` is a TRI-STATE that resolves ASYNCHRONOUSLY: the
+          // first synchronous read is `undefined` while it resolves. So deny ONLY
+          // on an explicit `false`; on `true` OR still-resolving `undefined`,
+          // defer to the SERVER-side write authorization — treating `undefined`
+          // as a deny would make the (non-mutating) draft refresh never fire on
+          // first use. This client gate only guards a refresh of the user's OWN
+          // already-open post; the field WRITE was performed + capability-checked
+          // server-side by the CMS MCP integration (#1214).
+          var can = coreSel.canUser('update', {
+            kind: 'postType',
+            name: ctx.postType,
+            id: ctx.postId,
+          });
+          if (can === false) return false;
+        }
+      }
     } catch (_) {}
-    return 'wpw_' + String(Date.now()) + Math.random().toString(16).slice(2);
-  }
-  function getThreadId() {
-    if (_threadId) return _threadId;
-    try { _threadId = window.sessionStorage.getItem(THREAD_KEY) || null; } catch (_) {}
-    if (!_threadId) { _threadId = newThreadId(); try { window.sessionStorage.setItem(THREAD_KEY, _threadId); } catch (_) {} }
-    return _threadId;
-  }
-  function resetThreadId() {
-    _threadId = newThreadId();
-    try { window.sessionStorage.setItem(THREAD_KEY, _threadId); } catch (_) {}
+    return true;
   }
 
-  // ---------------------------------------------------------------------------
-  // Markdown — inline renderer (XSS-safe: all user text goes through esc()).
-  // ---------------------------------------------------------------------------
-  function renderMd(text) {
-    if (!text) return '';
-    function esc(s) {
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    }
-    function inlineRender(s) {
-      s = esc(s);
-      s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-      s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-      s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
-      s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-      return s;
-    }
-    var lines = text.split('\n');
-    var html = '';
-    var inCode = false, codeLines = [];
-    var listType = null, listItems = [];
-    function flushList() {
-      if (!listItems.length) return;
-      var tag = listType === 'ol' ? 'ol' : 'ul';
-      html += '<' + tag + '>' + listItems.map(function(li) { return '<li>' + inlineRender(li) + '</li>'; }).join('') + '</' + tag + '>';
-      listItems = []; listType = null;
-    }
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i];
-      if (!inCode && /^```/.test(line)) { flushList(); inCode = true; codeLines = []; continue; }
-      if (inCode) {
-        if (/^```/.test(line)) { html += '<pre><code>' + esc(codeLines.join('\n')) + '</code></pre>'; inCode = false; codeLines = []; }
-        else codeLines.push(line);
-        continue;
+  // In-place draft refresh via WordPress's OWN data layer — NO widget-constructed
+  // /wp-json egress and NO page reload (#1214: the field-apply already happened
+  // server-side through the CMS MCP integration; this only refreshes the editor's
+  // view of the canonical post so the applied draft shows).
+  function refreshCurrentDraft(ctx) {
+    try {
+      if (window.wp && window.wp.data && window.wp.data.dispatch && ctx.postType && ctx.postId) {
+        var coreDispatch = window.wp.data.dispatch('core');
+        if (coreDispatch && typeof coreDispatch.invalidateResolution === 'function') {
+          coreDispatch.invalidateResolution('getEntityRecord', ['postType', ctx.postType, ctx.postId]);
+          return true;
+        }
       }
-      var olM = line.match(/^(\d+)\.\s+(.*)/);
-      var ulM = !olM && line.match(/^[-*]\s+(.*)/);
-      if (olM) { if (listType !== 'ol') flushList(); listType = 'ol'; listItems.push(olM[2]); }
-      else if (ulM) { if (listType !== 'ul') flushList(); listType = 'ul'; listItems.push(ulM[1]); }
-      else {
-        flushList();
-        var hM = line.match(/^(#{1,3})\s+(.*)/);
-        if (hM) { var lvl = Math.min(hM[1].length + 1, 4); html += '<h' + lvl + '>' + inlineRender(hM[2]) + '</h' + lvl + '>'; }
-        else if (line.trim() === '') html += '';
-        else html += '<p>' + inlineRender(line) + '</p>';
-      }
+    } catch (_) {}
+    return false;
+  }
+
+  // §5/§6e/§6f apply_intent: the payload carries an UNTRUSTED SELECTOR only (one of
+  // proposalId/changeSetId) + a fixed viewType. NO content, NO tool call. The
+  // parent (1) re-checks edit permission, (2) uses its OWN canonical resource,
+  // (3) the correlationId binding already proves the signal belongs to this
+  // bootstrapped thread/instance, (4) dedups against a bounded LRU, THEN does the
+  // in-place draft refresh. The selector id is used ONLY as the LRU key — never as
+  // a fetch selector, never egressed (#1214).
+  function handleApplyIntent(d) {
+    if (APPLY_INTENT_VIEW_TYPES.indexOf(d.viewType) === -1) return;
+    // Exactly one selector must be PRESENT — matching the core presence-XOR schema
+    // (`(proposalId != null) !== (changeSetId != null)`). A message carrying BOTH
+    // keys (even if one is an empty string) or NEITHER is rejected; presence, not
+    // value validity, decides the XOR so an empty-but-present field can't slip a
+    // both-present message through.
+    var proposalPresent = d.proposalId !== undefined && d.proposalId !== null;
+    var changeSetPresent = d.changeSetId !== undefined && d.changeSetId !== null;
+    if (proposalPresent === changeSetPresent) return;
+    var selectorId = proposalPresent ? d.proposalId : d.changeSetId;
+    // The present selector must still be a sane bounded non-empty string.
+    if (typeof selectorId !== 'string' || selectorId.length === 0 || selectorId.length > 200) return;
+
+    var ctx = buildContentContext();               // the parent's OWN canonical resource
+    if (!currentUserMayEdit(ctx)) return;          // fail closed on explicit deny
+
+    // Bounded LRU dedup per correlationId (a re-emitted apply must be idempotent).
+    var lruKey = (proposalPresent ? 'p:' : 'c:') + selectorId;
+    if (appliedLru.indexOf(lruKey) !== -1) return;
+    appliedLru.push(lruKey);
+    if (appliedLru.length > APPLY_LRU_MAX) { appliedLru.shift(); }
+
+    refreshCurrentDraft(ctx);
+    a11yLive.setAttribute('aria-live', 'polite');
+    a11yLive.textContent = 'The assistant applied changes to this content.';
+  }
+
+  // The single inbound bridge listener — origin + source-window bound. Attached
+  // when the iframe mounts and detached on teardown.
+  function onBridgeMessage(event) {
+    // (§6a) strict origin, BEFORE schema.
+    if (event.origin !== cinatraOrigin) return;
+    // (§6a-2) source-window binding, BEFORE schema — a sibling frame on the same
+    // origin must never drive this bridge. Nullish source never matches.
+    if (!frameWindow || event.source !== frameWindow) return;
+
+    var d = event.data;
+    if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
+
+    if (d.type === MSG.ready) {
+      // §4 READY → BOOTSTRAP, released SYNCHRONOUSLY in this same message task.
+      // A second READY on a mounted (bootstrapped) session is IGNORED (single
+      // bootstrap per frame; re-auth = reload the frame).
+      if (bootstrapped) return;
+      if (!isValidReady(d)) return;
+      if (!userTokenValid()) { forceReLogin(); return; }
+      // The cit_ token was PRE-MINTED in enterConversation() before this frame
+      // mounted, so it is read from cache SYNCHRONOUSLY here — there is NO await
+      // between receiving READY and posting the bootstrap. A same-origin
+      // navigation of the frame cannot interleave within one synchronous task, so
+      // credentials can never be released to a replacement document. If the cache
+      // is unexpectedly cold (the pre-mint failed/expired) we reload via re-login
+      // rather than mint-and-post across an await (which would reopen that gap).
+      var citToken = getCachedCitToken();
+      if (!citToken) { forceReLogin('Your session expired. Please sign in again.'); return; }
+      // Seed the iframe->parent monotonic gate with READY's seq (§6c); post-
+      // bootstrap uplinks must strictly increase from it.
+      if (!acceptInboundSeq(d.seq)) return;
+      // Set the single-bootstrap latch BEFORE posting so a re-entrant delivery
+      // cannot double-bootstrap. event.source === frameWindow was already verified
+      // above, so this posts to the exact document that sent READY.
+      bootstrapped = true;
+      postToFrame(buildBootstrap(d.nonce, citToken));
+      return;
     }
-    if (inCode) html += '<pre><code>' + esc(codeLines.join('\n')) + '</code></pre>';
-    flushList();
-    return html;
+
+    // All other messages are post-bootstrap uplinks: require an established
+    // correlationId + a monotonic seq for the iframe->parent direction.
+    if (!bootstrapped) return;
+    if (!validUplinkEnvelope(d)) return;
+
+    if (d.type === MSG.resize) { handleResize(d.height); return; }
+    if (d.type === MSG.focus) { handleFocus(d.focus); return; }
+    if (d.type === MSG.a11y) { handleA11y(d.liveRegion, d.politeness); return; }
+    if (d.type === MSG.applyIntent) { handleApplyIntent(d); return; }
+    // Unknown type: dropped (the set is closed).
   }
 
-  // Render assistant content into an element. Markdown is used ONLY when the
-  // instance advertised supportsMarkdown; otherwise the text is rendered as
-  // plain text (absent forward flag => the behavior is disabled).
-  function renderAssistantInto(el, content) {
-    if (negotiated.supportsMarkdown) { el.innerHTML = renderMd(content); }
-    else { el.textContent = content || ''; }
+  // Build the sandboxed embed iframe and attach the bridge listener. The src is
+  // the Cinatra-served `/embed/assistant` route carrying only the NON-SECRET
+  // disambiguators (instanceId, assistant). Tokens are NEVER in the URL — they
+  // arrive only via BOOTSTRAP. The sandbox grants scripts + same-origin (the frame
+  // needs its own origin's storage/streaming) but NOT top-navigation, forms,
+  // popups, modals, downloads, or pointer-lock.
+  function mountBridgeIframe() {
+    if (iframeEl) return;
+    var src = config.cinatraUrl + '/embed/assistant' +
+      '?instanceId=' + encodeURIComponent(config.instanceId || '') +
+      '&assistant=' + encodeURIComponent(EMBED_ASSISTANT);
+    iframeEl = document.createElement('iframe');
+    iframeEl.className = 'cw-frame';
+    iframeEl.setAttribute('title', 'Cinatra assistant');
+    iframeEl.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    iframeEl.setAttribute('referrerpolicy', 'no-referrer');
+    iframeEl.setAttribute('allow', '');
+    // Keep the captured frame window current across loads (source-window binding +
+    // outbound posts target exactly this frame). The bootstrap release does not
+    // depend on this — it is synchronous with READY and posts to the verified
+    // event.source — so a same-WindowProxy navigation cannot receive credentials.
+    iframeEl.addEventListener('load', function () {
+      frameWindow = iframeEl.contentWindow;
+    });
+    frameHost.appendChild(iframeEl);
+    // contentWindow is available synchronously once appended; set it now so a READY
+    // that races the load event is still source-bound.
+    frameWindow = iframeEl.contentWindow;
+    window.addEventListener('message', onBridgeMessage);
+    iframeEl.setAttribute('src', src);
   }
 
-  // ---------------------------------------------------------------------------
-  // Render message bubble
-  // ---------------------------------------------------------------------------
-  function renderMessage(role, content, asAssistant) {
-    var el = document.createElement('div');
-    el.className = 'cw-msg cw-msg-' + role;
-    if (asAssistant) renderAssistantInto(el, content);
-    else el.textContent = content;
-    messagesEl.appendChild(el);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    return el;
-  }
-
-  for (var i = 0; i < history.length; i++) {
-    var h = history[i];
-    renderMessage(h.role, h.content, h.role === 'assistant');
-    if (h.diff && Array.isArray(h.diff)) {
-      messagesEl.appendChild(renderDiffCard(h.diff));
+  // Tear down the frame + bridge state (used on close-to-login / re-auth). The
+  // NEXT conversation entry mounts a FRESH frame (single bootstrap per frame).
+  function teardownBridge() {
+    try { window.removeEventListener('message', onBridgeMessage); } catch (_) {}
+    if (iframeEl && iframeEl.parentNode) {
+      try { iframeEl.parentNode.removeChild(iframeEl); } catch (_) {}
     }
+    iframeEl = null;
+    frameWindow = null;
+    frameNonce = null;
+    correlationId = null;
+    bootstrapped = false;
+    inboundSeqLast = null;
+    outboundSeqLast = null;
+    appliedLru = [];
+  }
+
+  // Enter conversation mode: a valid cwu_ token is held. PRE-MINT the short-lived
+  // cit_ site token BEFORE mounting the frame, so the READY→BOOTSTRAP release is
+  // fully SYNCHRONOUS (getCachedCitToken reads it without an await) and no async
+  // gap exists for a frame navigation to interleave. Only after the pre-mint
+  // succeeds do we mount the frame (which then posts READY).
+  function enterConversation() {
+    if (!userTokenValid()) { forceReLogin(); return; }
+    panelMode = 'conversation';
+    applyPanelMode();
+    getStreamToken().then(function () {
+      // The user may have backed out / re-logged during the mint.
+      if (panelMode !== 'conversation' || iframeEl) { return; }
+      if (!userTokenValid()) { forceReLogin(); return; }
+      mountBridgeIframe();
+    }).catch(function (err) {
+      forceReLogin((err && err.message) ? err.message : 'Could not start the assistant.');
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -861,86 +1129,43 @@
     setWidgetSize();
     cwWidget.style.display = 'block';
     // If a long-idle widget is reopened in conversation mode but the per-user
-    // token has since expired, drop back to login rather than show a dead
-    // conversation (the stream would 401 anyway). applyPanelMode() reflects it.
+    // token has since expired, drop back to login rather than show a dead frame.
     if (panelMode === 'conversation' && !userTokenValid()) { forceReLogin(); }
-    if (panelMode === 'conversation') { textarea.focus(); }
-    messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   function collapseWidget() {
     isOpen = false;
-    closeFlyout();
     cwWidget.style.display = 'none';
     circle.style.zIndex = '';
   }
 
-  function closeFlyout() {
-    isFlyoutOpen = false;
-    flyoutMenu.style.display = 'none';
-  }
-
   // ---------------------------------------------------------------------------
-  // Auto-resize textarea
+  // Event wiring
   // ---------------------------------------------------------------------------
-  function resizeTextarea() {
-    textarea.style.height = 'auto';
-    textarea.style.height = textarea.scrollHeight + 'px';
-    var pillH = pill.offsetHeight || PILL_MIN_H;
-    var deltaH = Math.max(0, pillH - PILL_MIN_H);
-    var spacerH = PILL_GAP + Math.floor(PILL_MIN_H / 2);
-    panel.style.height = (currentPanelHeight + spacerH - deltaH) + 'px';
-  }
-  textarea.addEventListener('input', resizeTextarea);
-  textarea.addEventListener('input', function () {
-    if (!isStreaming) submitBtn.disabled = textarea.value.trim() === '';
-  });
-
-  // ---------------------------------------------------------------------------
-  // Submit
-  // ---------------------------------------------------------------------------
-  function doSubmit() {
-    var text = textarea.value.trim();
-    if (text && !isStreaming) {
-      textarea.value = '';
-      resizeTextarea();
-      sendMessage(text);
-    }
-  }
-
   circle.addEventListener('click', function(e) {
     if (circleDragMoved) { circleDragMoved = false; e.stopPropagation(); return; }
     if (isOpen) { collapseWidget(); } else { openWidget(); }
   });
   closeBtn.addEventListener('click', function() { collapseWidget(); });
-  submitBtn.addEventListener('click', function() { doSubmit(); });
   loginBtn.addEventListener('click', function() { startLogin(); });
 
   // ---------------------------------------------------------------------------
-  // Required-login (cinatra#410): listen ONCE for the hosted /widget-auth popup's
-  // postMessage. The handshake is bound three ways — the message must come from
-  // the configured instance ORIGIN, carry the exact type, and its `state` must
-  // match the in-flight PKCE tuple. We additionally bind to the popup's window
-  // (ev.source === pkce.popup) so another same-origin Cinatra window/frame can
-  // never complete a handshake even if `state` were ever confused/leaked.
+  // Required-login (cinatra#410): the hosted /widget-auth popup postMessage
+  // listener. Bound three ways — the message must come from the configured
+  // instance ORIGIN, carry the exact type, and its `state` must match the
+  // in-flight PKCE tuple; we additionally bind to the popup window
+  // (ev.source === pkce.popup) so no other same-origin window can complete it.
+  // This is a SEPARATE listener from the bridge (which is bound to the iframe
+  // window): the popup and the frame are distinct source windows.
   // ---------------------------------------------------------------------------
   window.addEventListener('message', function (ev) {
-    var instOrigin;
-    try { instOrigin = new URL(config.cinatraUrl).origin; } catch (_) { return; }
-    if (ev.origin !== instOrigin) { return; }
+    if (ev.origin !== cinatraOrigin) { return; }
     var d = ev.data;
     if (!d || d.type !== 'cinatra-widget-auth' || typeof d.code !== 'string') { return; }
     if (!pkce) { return; }                              // no handshake in flight
-    if (!pkce.popup || ev.source !== pkce.popup) { return; } // source binding (fail-closed: a null/foreign source is rejected)
+    if (!pkce.popup || ev.source !== pkce.popup) { return; } // source binding (fail-closed)
     if (d.state !== pkce.state) { return; }             // CSRF/state binding
     redeemCode(d.code);                                 // single-use; pkce consumed inside
-  });
-
-  textarea.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' && !e.shiftKey && !isStreaming) {
-      e.preventDefault();
-      doSubmit();
-    }
   });
 
   document.addEventListener('click', function(e) {
@@ -950,18 +1175,9 @@
     collapseWidget();
   });
 
-  flyoutBtn.addEventListener('click', function(e) {
-    e.stopPropagation();
-    isFlyoutOpen = !isFlyoutOpen;
-    flyoutMenu.style.display = isFlyoutOpen ? 'block' : 'none';
-  });
-
-  clearItem.addEventListener('click', function() {
-    history = []; saveHistory(); resetThreadId(); messagesEl.innerHTML = ''; closeFlyout();
-  });
-
   // ---------------------------------------------------------------------------
-  // Resize: drag top-left corner to adjust width (left) and panel height (up)
+  // Resize: drag top-left corner to adjust width (left) and panel height (up). A
+  // manual drag pins the height (disables the iframe-driven auto-grow).
   // ---------------------------------------------------------------------------
   var resizeDragging = false;
   var resizeStartX = 0, resizeStartY = 0;
@@ -995,8 +1211,9 @@
     if (!resizeDragging) return;
     var dw = resizeStartX - e.clientX; // drag left = wider
     var dh = resizeStartY - e.clientY; // drag up = taller
+    userResizedPanel = true;
     currentWidth = Math.max(320, Math.min(window.innerWidth - 48, resizeStartWidth + dw));
-    currentPanelHeight = Math.max(200, Math.min(window.innerHeight - 200, resizeStartPanelH + dh));
+    currentPanelHeight = Math.max(MIN_PANEL_HEIGHT, Math.min(maxPanelHeight(), resizeStartPanelH + dh));
     setWidgetSize();
   });
 
@@ -1008,504 +1225,14 @@
     resizeDragging = false;
   });
 
-  // ---------------------------------------------------------------------------
-  // Short-lived token exchange via the same-origin WordPress REST broker.
-  // The browser never holds the long-lived integration key; the broker (PHP)
-  // holds it and performs the server-to-server exchange with the instance.
-  // Tokens are cached in-memory and reused across turns until ~10s before expiry.
-  // ---------------------------------------------------------------------------
-  var cachedToken = null;        // { token, expiresAtMs }
-  async function getStreamToken() {
-    var now = Date.now();
-    if (cachedToken && cachedToken.expiresAtMs - 10000 > now) {
-      return cachedToken.token;
-    }
-    var headers = { 'Content-Type': 'application/json' };
-    if (config.nonce) headers['X-WP-Nonce'] = config.nonce;
-    var resp = await fetch(config.tokenEndpoint, {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: headers,
-      body: JSON.stringify({ contractVersion: negotiated.contractVersion }),
-    });
-    if (!resp.ok) {
-      var detail = 'HTTP ' + resp.status;
-      try {
-        var errRaw = await resp.text();
-        var errParsed = null;
-        try { errParsed = JSON.parse(errRaw); } catch (_) {}
-        if (errParsed && (errParsed.message || errParsed.error)) {
-          detail = errParsed.message || errParsed.error;
-        } else if (errRaw) {
-          detail += ': ' + errRaw.slice(0, 200);
-        }
-      } catch (_) {}
-      throw new Error('Could not obtain a Cinatra session token (' + detail + ').');
-    }
-    var body = await resp.json();
-    if (!body || !body.token) {
-      throw new Error('Cinatra session-token response was malformed.');
-    }
-    var ttlMs = (typeof body.expiresIn === 'number' ? body.expiresIn : 300) * 1000;
-    cachedToken = { token: body.token, expiresAtMs: now + ttlMs };
-    return body.token;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Required-login (cinatra#410): the per-user PKCE handshake against the hosted
-  // /widget-auth surface (#407), the dual-token stream gate (#408), and the
-  // login-window mode toggle. The browser never holds the long-lived cnx_ key:
-  // both the init and token redemptions go through the same-origin PHP broker,
-  // which presents cnx_ server-to-server (exactly like the cit_ stream-token
-  // mint above). The opaque cwu_ user token is short-lived (15-min TTL, no
-  // refresh) and held in memory only.
-  // ---------------------------------------------------------------------------
-
-  // base64url(no padding) of a byte array.
-  function b64url(bytes) {
-    var s = '';
-    for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
-    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  }
-  function randB64url(n) {
-    var a = new Uint8Array(n);
-    crypto.getRandomValues(a);
-    return b64url(a);
-  }
-  async function sha256b64url(str) {
-    var data = new TextEncoder().encode(str);
-    var dig = await crypto.subtle.digest('SHA-256', data);
-    return b64url(new Uint8Array(dig));
-  }
-
-  // CSRF/auth headers for the same-origin broker POSTs (WP REST convention:
-  // the wp_rest nonce in X-WP-Nonce; the broker permission_callback + nonce
-  // check are the cross-site-POST defense).
-  function brokerHeaders() {
-    var h = { 'Content-Type': 'application/json' };
-    if (config.nonce) { h['X-WP-Nonce'] = config.nonce; }
-    return h;
-  }
-
-  // A per-user token is valid when present and at least 5s from expiry (skew).
-  function userTokenValid() {
-    return !!(userToken && userToken.token && (userToken.expiresAtMs - 5000) > Date.now());
-  }
-
-  // Reflect panelMode into the DOM. The header (wordmark + close) stays in both
-  // modes; the conversation surfaces are display:none in login mode so they are
-  // never visible without a valid token.
-  function applyPanelMode() {
-    var login = panelMode === 'login';
-    loginEl.style.display = login ? 'flex' : 'none';
-    messagesEl.style.display = login ? 'none' : 'flex';
-    spacerEl.style.display = login ? 'none' : 'block';
-    pill.style.display = login ? 'none' : 'flex';
-  }
-
-  // Tear down any in-flight handshake state (timer + popup-close watch). Does
-  // NOT close the popup — the caller decides that (success closes it).
-  function clearHandshake() {
-    if (popupTimer) { try { clearInterval(popupTimer); } catch (_) {} popupTimer = null; }
-    pkce = null;
-  }
-
-  // Drop the user token and return to the login window. Used on expiry and on a
-  // fail-closed 401 from the dual-token stream. Cleans up streaming UI state so
-  // a stale "Thinking…" bubble never implies a response is still in progress.
-  function forceReLogin(message) {
-    userToken = null;
-    isStreaming = false;
-    clearHandshake();
-    panelMode = 'login';
-    applyPanelMode();
-    submitBtn.disabled = textarea.value.trim() === '';
-    loginErr.textContent = message || 'Your session expired. Please sign in again.';
-  }
-
-  // Poll for a manually-closed/blocked popup so we can re-enable the button and
-  // drop the dangling handshake (the postMessage may never arrive).
-  function watchPopupClosed() {
-    if (popupTimer) { try { clearInterval(popupTimer); } catch (_) {} popupTimer = null; }
-    var ticks = 0;
-    popupTimer = setInterval(function () {
-      ticks++;
-      var closed = false;
-      try { closed = !pkce || !pkce.popup || pkce.popup.closed; } catch (_) { closed = false; }
-      // Give up after ~5 minutes regardless (the auth code TTL is short anyway).
-      if (closed || ticks > 600) {
-        try { clearInterval(popupTimer); } catch (_) {}
-        popupTimer = null;
-        // Only treat this as an abort if a handshake is still in flight (a
-        // successful redeem already consumed pkce and swapped to conversation).
-        if (pkce) {
-          pkce = null;
-          loginBtn.disabled = false;
-        }
-      }
-    }, 500);
-  }
-
-  // Start the login handshake: generate PKCE, init via the broker, open the
-  // hosted login popup. The postMessage listener (installed once at mount) does
-  // the redeem when the popup posts back.
-  async function startLogin() {
-    if (pkce) { return; }                  // reject concurrent handshakes
-    loginErr.textContent = '';
-    loginBtn.disabled = true;
-    try {
-      if (typeof window.crypto === 'undefined' || !window.crypto || !crypto.subtle || typeof btoa === 'undefined') {
-        throw new Error('Secure sign-in is not available in this browser.');
-      }
-      var verifier = randB64url(48);
-      var challenge = await sha256b64url(verifier);
-      var state = randB64url(24);
-
-      // 1) init via OUR same-origin broker (cnx_ presented server-to-server).
-      var initResp = await fetch(config.authInitEndpoint, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: brokerHeaders(),
-        body: JSON.stringify({
-          client: AUTH_CLIENT,
-          agentSlug: AGENT_SLUG,
-          codeChallenge: challenge,
-          codeChallengeMethod: 'S256',
-          state: state,
-          instanceId: config.instanceId || undefined,
-        }),
-      });
-      if (!initResp.ok) { throw new Error('Could not start sign-in.'); }
-      var initBody = await initResp.json();
-      if (!initBody || !initBody.authorizeUrl) { throw new Error('Could not start sign-in.'); }
-
-      // SECURITY: the popup destination MUST be same-origin with the configured
-      // instance — defense against a compromised broker steering the login popup
-      // off-instance. Resolve and re-assert the origin here.
-      var instOrigin = new URL(config.cinatraUrl).origin;
-      var authUrl = new URL(initBody.authorizeUrl, instOrigin + '/');
-      if (authUrl.origin !== instOrigin) { throw new Error('Refusing off-origin sign-in.'); }
-
-      pkce = { codeVerifier: verifier, state: state, popup: null };
-
-      // 2) open the hosted login popup. We need window.opener for the popup's
-      // postMessage back, so we do NOT pass noopener; the message listener's
-      // origin + type + state + source binding are the controls.
-      var popup = window.open(authUrl.href, 'cinatra-login',
-        'width=460,height=640,menubar=no,toolbar=no,location=yes,status=no');
-      if (!popup) {
-        pkce = null;
-        throw new Error('Pop-up blocked. Allow pop-ups for this site and try again.');
-      }
-      pkce.popup = popup;
-      watchPopupClosed();
-    } catch (err) {
-      clearHandshake();
-      loginErr.textContent = (err && err.message) ? err.message : 'Sign-in failed.';
-      loginBtn.disabled = false;
-    }
-  }
-
-  // Redeem the authorization code for the opaque cwu_ user token via the broker
-  // (which forwards to /api/widget-auth/token with cnx_), then swap to the
-  // conversation. Single-use: the in-flight pkce is consumed immediately.
-  async function redeemCode(code) {
-    var local = pkce;
-    clearHandshake();                      // consume handshake + stop popup watch
-    loginBtn.disabled = true;
-    try {
-      var resp = await fetch(config.authTokenEndpoint, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: brokerHeaders(),
-        body: JSON.stringify({
-          grantType: 'authorization_code',
-          client: AUTH_CLIENT,
-          agentSlug: AGENT_SLUG,
-          code: code,
-          codeVerifier: local.codeVerifier,
-        }),
-      });
-      if (!resp.ok) { throw new Error('Sign-in could not be completed.'); }
-      var body = await resp.json();
-      // Validate the token shape before trusting it (defends against a malformed
-      // broker/upstream response): opaque Bearer cwu_ token + a sane TTL.
-      if (!body || typeof body.token !== 'string' || body.token.indexOf('cwu_') !== 0) {
-        throw new Error('Sign-in could not be completed.');
-      }
-      if (body.tokenType && String(body.tokenType).toLowerCase() !== 'bearer') {
-        throw new Error('Sign-in could not be completed.');
-      }
-      var ttlSec = (typeof body.expiresIn === 'number' && body.expiresIn > 0) ? body.expiresIn : 900;
-      if (ttlSec > 900) { ttlSec = 900; }   // clamp to the backend max (15-min TTL)
-      userToken = { token: body.token, expiresAtMs: Date.now() + (ttlSec * 1000) };
-      try { if (local.popup && !local.popup.closed) { local.popup.close(); } } catch (_) {}
-      loginErr.textContent = '';
-      panelMode = 'conversation';
-      applyPanelMode();
-      textarea.focus();
-      submitBtn.disabled = textarea.value.trim() === '';
-    } catch (err) {
-      try { if (local && local.popup && !local.popup.closed) { local.popup.close(); } } catch (_) {}
-      loginErr.textContent = (err && err.message) ? err.message : 'Sign-in failed.';
-    } finally {
-      loginBtn.disabled = false;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // SSE streaming chat
-  // ---------------------------------------------------------------------------
-  async function sendMessage(userText) {
-    // DUAL-TOKEN GATE (cinatra#408): a valid per-user token is REQUIRED to
-    // stream. If it is missing/expired, force re-login BEFORE appending any
-    // message bubble — the conversation must never proceed without a token.
-    if (!userTokenValid()) { forceReLogin(); return; }
-    history.push({ role: 'user', content: userText });
-    renderMessage('user', userText, false);
-    saveHistory();
-
-    var assistantEl = document.createElement('div');
-    assistantEl.className = 'cw-msg cw-msg-assistant cw-thinking';
-    assistantEl.innerHTML = '<span class="cw-thinking-dot"></span><span class="cw-thinking-label">Thinking…</span>';
-    messagesEl.appendChild(assistantEl);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-
-    // Turn state. The unified route streams AG-UI events over a durable log; the
-    // widget accumulates the text deltas into one bubble and tracks the run id +
-    // last SSE event id for a best-effort resume.
-    var assistantText = '';
-    var streamingStarted = false;
-    var pendingSeparator = false;   // insert a blank line when a new text segment opens after a tool round
-    var hadContentEdit = false;     // a *_content_editor_run tool call happened this turn
-    var sawTerminal = false;        // a RUN_FINISHED / RUN_ERROR frame arrived
-    var currentRunId = null;        // captured from the AG-UI events (resume target)
-    var lastEventId = '';           // SSE `id:` cursor for Last-Event-ID resume
-    isStreaming = true;
-    submitBtn.disabled = true;
-
-    // Extract a single SSE field value ("id" / "data") from a record line, or
-    // null if the line is not that field. Tolerates the one-space form the host
-    // emits ("id: x", "data: {...}") and a no-space form.
-    function sseField(line, name) {
-      if (line.indexOf(name + ':') !== 0) { return null; }
-      var v = line.slice(name.length + 1);
-      if (v.charAt(0) === ' ') { v = v.slice(1); }
-      return v;
-    }
-
-    // Apply one decoded AG-UI event. The unified harness (ag-ui-sink-adapter)
-    // maps the runtime's bespoke sink onto the AG-UI union — the `type` lives in
-    // the JSON, NOT on an SSE `event:` line. We render TEXT_MESSAGE_CONTENT
-    // deltas, key the content-edit reload on a *_content_editor_run TOOL_CALL,
-    // and treat RUN_ERROR / RUN_FINISHED as terminal (exactly once).
-    function handleAgUiEvent(ev) {
-      if (!ev || typeof ev !== 'object' || typeof ev.type !== 'string') { return; }
-      if (typeof ev.runId === 'string' && ev.runId) { currentRunId = ev.runId; }
-      switch (ev.type) {
-        case 'TEXT_MESSAGE_START':
-          // A fresh text segment after existing content (e.g. resumed prose after
-          // a tool round) is separated by a blank line for readability.
-          if (assistantText) { pendingSeparator = true; }
-          break;
-        case 'TEXT_MESSAGE_CONTENT':
-          if (typeof ev.delta === 'string' && ev.delta) {
-            if (!streamingStarted) { streamingStarted = true; assistantEl.classList.remove('cw-thinking'); }
-            if (pendingSeparator) { assistantText += '\n\n'; pendingSeparator = false; }
-            assistantText += ev.delta;
-            renderAssistantInto(assistantEl, assistantText);
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-          }
-          break;
-        case 'TOOL_CALL_START':
-          // The AG-UI wire deliberately carries NO tool RESULT payload, so the
-          // old field-level `changes` diff is gone. We detect that a content edit
-          // occurred by the tool NAME and reload the editor on completion so the
-          // applied change becomes visible (the content-editor demotes a
-          // published post to draft; the edit lives in the post's revisions).
-          if (typeof ev.toolCallName === 'string' && /_content_editor_run$/.test(ev.toolCallName)) {
-            hadContentEdit = true;
-            if (!streamingStarted) { streamingStarted = true; assistantEl.classList.remove('cw-thinking'); }
-          }
-          break;
-        case 'RUN_ERROR':
-          sawTerminal = true;
-          assistantEl.classList.remove('cw-thinking');
-          if (assistantText) { renderAssistantInto(assistantEl, assistantText); }
-          else { assistantEl.textContent = 'Error: ' + (typeof ev.message === 'string' && ev.message ? ev.message : 'The assistant stream failed.'); }
-          break;
-        case 'RUN_FINISHED':
-          sawTerminal = true;
-          if (assistantText) { renderAssistantInto(assistantEl, assistantText); }
-          break;
-        default:
-          // RUN_STARTED / TEXT_MESSAGE_END / TOOL_CALL_END / DATA_PART: no UI.
-          break;
-      }
-    }
-
-    // Consume an AG-UI SSE reader to a terminal frame (or the stream end). Frames
-    // are `id: <redisId>\n data: <json>\n\n`; `:`-comment/keepalive lines and
-    // blank lines are ignored. Returns once a terminal event is seen so a later
-    // resume tail cannot double-apply.
-    async function pumpReader(reader) {
-      var decoder = new TextDecoder();
-      var buffer = '';
-      while (true) {
-        var chunk = await reader.read();
-        if (chunk.done) { break; }
-        buffer += decoder.decode(chunk.value, { stream: true });
-        var records = buffer.split('\n\n');
-        buffer = records.pop() || '';
-        for (var r = 0; r < records.length; r++) {
-          if (!records[r]) { continue; }
-          var lines = records[r].split('\n');
-          var dataParts = [];
-          for (var j = 0; j < lines.length; j++) {
-            var idv = sseField(lines[j], 'id');
-            if (idv !== null) { if (idv) { lastEventId = idv; } continue; }
-            var dv = sseField(lines[j], 'data');
-            if (dv !== null) { dataParts.push(dv); }
-          }
-          if (!dataParts.length) { continue; }
-          var ev; try { ev = JSON.parse(dataParts.join('\n')); } catch (_) { continue; }
-          handleAgUiEvent(ev);
-          if (sawTerminal) { return; }
-        }
-      }
-    }
-
-    try {
-      // SECURITY: build the stream URL from the configured instance origin + the
-      // FIXED unified chat path. It is a constant root-absolute path (not a
-      // server-advertised one), but we still re-resolve + re-assert the origin
-      // BEFORE minting the token so the cit_ Bearer can never leave the
-      // configured instance origin. The off-origin `throw` MUST precede
-      // getStreamToken() (the last-line-of-defense ordering).
-      var streamBase = new URL(config.cinatraUrl);
-      var streamUrl = new URL(CHAT_ROUTE_PATH, streamBase.origin + '/');
-      if (streamUrl.origin !== streamBase.origin) {
-        throw new Error('Refusing to stream to an off-origin endpoint.');
-      }
-
-      // Capabilities are already negotiated (mount is gated on success), so the
-      // broker token-exchange path is guaranteed available. Mint a short-lived
-      // token only AFTER the origin re-assertion above; the browser never holds
-      // the long-lived key.
-      var token = await getStreamToken();
-
-      var response = await fetch(streamUrl.href, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + token,
-          // DUAL-TOKEN (cinatra#408): the per-user token is required by the
-          // fail-closed broker-auth route in addition to the cit_ Bearer above.
-          'X-Cinatra-Widget-User-Token': userToken.token,
-        },
-        // UNIFIED CONTRACT (cinatra#1221 S5). The route requires a `threadId` and
-        // resolves the widget binding from `assistant` (the connector kind /
-        // handle). The OLD relay's `contractVersion` + `context` fields are not
-        // part of this schema and are dropped.
-        body: JSON.stringify({
-          threadId: getThreadId(),
-          assistant: AUTH_CLIENT,
-          messages: history.map(function(m) { return { role: m.role, content: m.content }; }),
-        }),
-      });
-
-      // FAIL-CLOSED RE-LOGIN (cinatra#408): an expired/revoked/invalid per-user
-      // token returns 401 with X-Cinatra-Widget-Auth: required. Drop the token,
-      // remove the in-flight "Thinking…" bubble, and return to the login window.
-      if (response.status === 401 && response.headers.get('X-Cinatra-Widget-Auth') === 'required') {
-        try { if (assistantEl && assistantEl.parentNode) { assistantEl.parentNode.removeChild(assistantEl); } } catch (_) {}
-        // The user turn never produced a response; drop it from history so the
-        // re-login does not replay a half-sent turn on the next send.
-        if (history.length && history[history.length - 1].role === 'user') { history.pop(); saveHistory(); }
-        forceReLogin();
-        return;
-      }
-
-      if (!response.ok || !response.body) {
-        var errText = 'Error ' + response.status;
-        try {
-          var raw = await response.text();
-          var parsed = null;
-          try { parsed = JSON.parse(raw); } catch (_) {}
-          if (parsed && parsed.error && parsed.error.message) { errText = parsed.error.message; }
-          else if (parsed && typeof parsed.error === 'string') { errText = parsed.error; }
-          else { errText += ': ' + raw.slice(0, 200); }
-        } catch (_) {}
-        assistantEl.classList.remove('cw-thinking');
-        assistantEl.textContent = errText;
-        return;
-      }
-
-      // RESUME CREDENTIAL (cinatra#1221 S5, OPTION A). The run-bound resume token
-      // is delivered on a response header; the browser re-presents it on the
-      // AG-UI resume/tail GET if the primary stream drops before a terminal
-      // frame. NOTE: cross-origin, this header is readable ONLY once the host
-      // adds it to Access-Control-Expose-Headers AND CORS-reflects the resume GET
-      // (both core follow-ups); until then this is null and resume degrades to a
-      // fresh turn. Never persisted; in-memory for this turn only.
-      var resumeToken = null;
-      try { resumeToken = response.headers.get('X-Cinatra-Chat-Resume-Token'); } catch (_) {}
-
-      await pumpReader(response.body.getReader());
-
-      // BEST-EFFORT RESUME: the primary stream ended WITHOUT a terminal frame
-      // (transport drop) and we hold a run-bound resume token — reconnect ONCE to
-      // the AG-UI resume/tail route with Last-Event-ID and continue. Any failure
-      // (network / 401 / cross-origin CORS block) degrades silently to whatever
-      // already streamed. Same-origin re-assertion mirrors the POST.
-      if (!sawTerminal && resumeToken && currentRunId) {
-        try {
-          var resumeUrl = new URL('/api/assistants/runs/' + encodeURIComponent(currentRunId) + '/stream', streamBase.origin + '/');
-          if (resumeUrl.origin === streamBase.origin) {
-            var resumeHeaders = { 'Authorization': 'Bearer ' + resumeToken };
-            if (lastEventId) { resumeHeaders['Last-Event-ID'] = lastEventId; }
-            var resumeResp = await fetch(resumeUrl.href, { method: 'GET', headers: resumeHeaders });
-            if (resumeResp && resumeResp.ok && resumeResp.body) {
-              await pumpReader(resumeResp.body.getReader());
-            }
-          }
-        } catch (_) { /* degrade: keep whatever streamed */ }
-      }
-
-      if (assistantText) { history.push({ role: 'assistant', content: assistantText }); saveHistory(); }
-      else if (!streamingStarted) { assistantEl.classList.remove('cw-thinking'); assistantEl.textContent = '(no response)'; }
-
-      // A content edit was applied — reload the editor so the change is visible.
-      if (hadContentEdit && sawTerminal) {
-        try { window.sessionStorage.setItem('cinatra-reopen', '1'); } catch (_) {}
-        setTimeout(function() { window.location.reload(); }, 1500);
-      }
-    } catch (err) {
-      assistantEl.classList.remove('cw-thinking');
-      assistantEl.textContent = (err && err.message) ? err.message : 'Network error';
-    } finally {
-      isStreaming = false;
-      submitBtn.disabled = textarea.value.trim() === '';
-    }
-  }
-
   // Synchronous mount construction is complete: mark mounted (this hides the
   // fallback chrome). Set LAST so any throw above leaves the fallback visible.
   rootEl.dataset.cinatraMounted = 'true';
 
-  // Required-login (cinatra#410): render in login mode first (conversation
-  // surfaces hidden). On a fresh mount there is never a valid per-user token, so
-  // the login window is shown until the user signs in. Placed AFTER the marker
-  // so a throw still leaves the fallback chrome rather than a half-built widget.
+  // Required-login (cinatra#410): render in login mode first (the iframe is not
+  // mounted until a valid per-user token is held), so the conversation is never
+  // shown pre-login.
   applyPanelMode();
-
-  // Reopen widget after an auto-reload triggered by a content edit.
-  try {
-    if (window.sessionStorage.getItem('cinatra-reopen') === '1') {
-      window.sessionStorage.removeItem('cinatra-reopen');
-      openWidget();
-    }
-  } catch (_) {}
 
   } // end mountWidget()
 
