@@ -1,36 +1,37 @@
 #!/usr/bin/env node
-// Widget source-of-truth DRIFT / LOCKSTEP gate (cinatra#411).
+// Widget source-of-truth DRIFT / LOCKSTEP gate (cinatra#411, S5 cinatra#1221).
 //
 // Runs under plain `node tools/widget-parity-check.mjs` — no bundler, no npm
 // install, no WordPress/Drupal. Exit 0 = all invariants hold; exit 1 = drift was
 // found. Mirrors the dependency-free spirit of the repo's existing standalone
-// harnesses (tests/test-widget-negotiation.mjs, tests/test-token-broker.php) and
-// cinatra's `vendor:skills --check`.
+// harnesses (tests/test-widget-negotiation.mjs, tests/test-token-broker.php).
 //
 // WHAT THIS IS (and is NOT)
 // -------------------------
 // This is a lightweight, NO-DEPENDENCY DRIFT GUARD — a structural/grep-level
 // invariant check, NOT a parser-based security firewall and NOT a substitute for
 // review. It cheaply catches the regressions that matter most on the canonical
-// widget: a long-lived apiKey creeping back into the browser, the token broker
-// being bypassed, the contract-version set diverging across CMSs, and the dead
-// host bundle route being re-advertised. A determined obfuscation could still
-// evade a regex (e.g. computed property access) — the real defense is review +
-// the runtime capability/negotiation tests; this gate is the cheap tripwire that
-// makes the COMMON drift loud in CI.
+// widget. A determined obfuscation could still evade a regex (e.g. computed
+// property access) — the real defense is review + the runtime bridge/negotiation
+// tests; this gate is the cheap tripwire that makes the COMMON drift loud in CI.
 //
-// WHY IT EXISTS
-// -------------
-// The shipped, canonical CMS assistant widget is the VENDORED IIFE in each
-// plugin/module repo:
-//     cinatra-ai/wordpress-plugin/assets/cinatra-widget.js   (authored first)
-//     cinatra-ai/drupal-module/js/cinatra-widget.js          (hand-mirrored)
-// There is NO generator; the two are kept in lockstep by review (see the
-// contract: cinatra docs/widget-source-of-truth.md). Cross-repo byte parity is
-// impossible in a single-repo CI, so this gate asserts — on THIS repo's OWN
-// copy — the invariants that must never drift, plus a shared contract-version
-// marker. Note: a per-repo gate cannot, by itself, FORCE the other repo to
-// mirror a change; that lockstep is a review discipline (see INVARIANT 6).
+// ARCHITECTURE (S5 cinatra#1221) — WHY THE INVARIANT SET CHANGED
+// --------------------------------------------------------------
+// The assistant conversation now lives in a Cinatra-served `/embed/assistant`
+// iframe that the widget frames as the SOLE session owner. The vanilla AG-UI
+// renderer + SSE stream loop that used to live in the widget are DELETED: the
+// widget NO LONGER streams and holds NO `Authorization: Bearer` fetch. It relays
+// the short-lived cit_/cwu_ tokens ONLY into a single postMessage BOOTSTRAP.
+//
+// The OLD gate asserted the OPPOSITE of the new trust boundary — it REQUIRED a
+// `Authorization: Bearer <getStreamToken()>` stream fetch (INV3). That invariant
+// is now a LIABILITY: keeping it would force a Bearer stream back into the browser
+// or fail every widget PR. It is REPLACED, in lockstep with the widget rewrite, by
+// the §12 trust-boundary invariants below. KEPT unchanged: no-apiKey (INV1), the
+// cit_ broker mint (INV2, now feeding BOOTSTRAP not a header), the shared
+// contract-version set (INV4), the dead-bundle-route ban (INV5), and the
+// login-gate marker (INV6). KEPT because AC2 has not landed everywhere yet:
+// CLIENT_CONTRACT_VERSIONS + negotiateCapabilities.
 //
 // This SAME file is shipped verbatim to both repos (it auto-detects the WP vs
 // Drupal config accessor + widget path). Keeping it identical is itself part of
@@ -65,25 +66,19 @@ const src = fs.readFileSync(WIDGET_PATH, "utf8");
 
 // `code` = the widget with line- and block-comments stripped, so an invariant
 // that must hold in EXECUTABLE code is not satisfied (or violated) by prose in a
-// comment. The token broker comments legitimately MENTION `apiKey` ("the browser
-// holds no apiKey"), so the apiKey-absence check must run against `code`, never
-// the raw source.
+// comment. The header comments legitimately MENTION `apiKey`, `Bearer`, `"*"`,
+// `/wp-json`, etc. to explain their ABSENCE, so those bans must run against
+// `code`, never the raw source.
 function stripComments(s) {
-  // Remove /* ... */ blocks first, then // ... line comments. The widget is a
-  // single template-literal-free IIFE string returned from the route, but here
-  // it is plain JS source; this conservative strip is sufficient for the
-  // substring invariants below (it does not need to be a full JS parser).
   return s
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .split("\n")
     .map((line) => {
       // Strip a // comment, but not inside a string. Cheap heuristic: only treat
-      // `//` as a comment start when it is NOT preceded by a quote on the line up
-      // to that point. The widget never embeds `//` inside a string literal
-      // except in URLs, which are not relevant to these invariants — and even if
-      // one slips through, stripping it cannot create a FALSE PASS (it can only
-      // hide a token, which would surface as a missing-required-token FAIL, i.e.
-      // fail-closed).
+      // `//` as a comment start when it is NOT preceded by an odd number of
+      // quotes on the line up to that point. Stripping a real token can only
+      // surface as a missing-required-token FAIL (fail-closed), never a false
+      // pass; the URL `//` inside `https://` is even-quoted so it is preserved.
       const idx = line.indexOf("//");
       if (idx === -1) return line;
       const before = line.slice(0, idx);
@@ -123,27 +118,26 @@ assert(
 );
 
 // ---------------------------------------------------------------------------
-// INVARIANT 1 — no long-lived apiKey token appears anywhere in EXECUTABLE widget
-// code. Banning the whole `apiKey` identifier (not just `config.apiKey`) closes
-// the fallback-contamination hole: a `token = token || config.apiKey` or a
-// `config["apiKey"]` / `apiKey` local would otherwise slip past a narrow
-// `config.apiKey` check while still feeding a Bearer header. Comments may MENTION
-// apiKey to explain its ABSENCE ("the browser holds no apiKey"); that is why we
-// check `code` (comments stripped), not the raw source.
+// INVARIANT 1 (UNCHANGED) — no long-lived apiKey token appears anywhere in
+// EXECUTABLE widget code. Banning the whole `apiKey` identifier closes the
+// fallback-contamination hole. Comments may MENTION apiKey to explain its
+// ABSENCE; that is why we check `code` (comments stripped).
 // ---------------------------------------------------------------------------
 const apiKeyMatch = code.match(/\bapiKey\b/);
 assert(
-  "no long-lived apiKey token in executable widget code (any `apiKey` reference, not just config.apiKey)",
+  "no long-lived apiKey token in executable widget code (any `apiKey` reference)",
   apiKeyMatch === null,
   apiKeyMatch
-    ? "the identifier `apiKey` appears in executable code — the long-lived key must never reach the browser (no config.apiKey, no apiKey fallback, no apiKey local)"
+    ? "the identifier `apiKey` appears in executable code — the long-lived key must never reach the browser"
     : undefined,
 );
 
 // ---------------------------------------------------------------------------
-// INVARIANT 2 — the same-origin token broker is used.
-// The widget reads config.tokenEndpoint AND mints via a getStreamToken()-style
-// broker fetch.
+// INVARIANT 2 (KEPT; sink changed) — the same-origin cit_ token broker is used.
+// The widget reads config.tokenEndpoint AND mints via getStreamToken(). Under
+// the new architecture the minted cit_ token feeds the BOOTSTRAP message (§4),
+// NOT a Bearer stream header — but the broker mint itself is unchanged and still
+// the ONLY sanctioned credential source.
 // ---------------------------------------------------------------------------
 assert(
   "same-origin token broker referenced (config.tokenEndpoint read)",
@@ -151,88 +145,332 @@ assert(
   "config.tokenEndpoint is not read — the broker is the only sanctioned credential source",
 );
 assert(
-  "broker mint present (getStreamToken)",
+  "cit_ broker mint present (getStreamToken)",
   /function\s+getStreamToken\b/.test(code) && /getStreamToken\s*\(/.test(code),
   "getStreamToken() mint not found",
 );
 
 // ---------------------------------------------------------------------------
-// INVARIANT 3 — the stream is Bearer-authenticated with the SHORT-LIVED token
-// (the value returned by getStreamToken), NOT a config-derived credential.
-//
-// PRIMARY DEFENSE is INVARIANT 1: with NO `apiKey` token allowed anywhere in
-// executable code, a Bearer header CANNOT be built from an apiKey regardless of
-// how the header is spelled (quotes/case/template-literal/headers.set). INV3
-// below is the positive complement: it confirms a Bearer stream header EXISTS
-// and that the var it uses is the getStreamToken() mint sink. We accept several
-// header spellings so a stylistic rewrite does not silently drop the positive
-// assertion (which would otherwise fail-closed and mask a real regression).
+// INVARIANT 3 (REPLACES the old Bearer-stream invariant) — the §12 sandboxed
+// iframe trust boundary. The widget no longer streams; it frames the Cinatra
+// `/embed/assistant` surface and speaks the parent↔iframe bridge. Five checks:
+//   3a  a sandboxed iframe is created (allow-scripts + allow-same-origin ONLY;
+//       NO escalation flags: top-nav / forms / popups / modals / downloads /
+//       pointer-lock / popups-to-escape-sandbox).
+//   3b  its src targets the Cinatra `/embed/assistant` route built from
+//       config.cinatraUrl and carries the instanceId + assistant disambiguators.
+//   3c  every postMessage uses an EXPLICIT targetOrigin — NEVER "*".
+//   3d  inbound frame messages are gated on BOTH `event.origin === <cinatra
+//       origin>` AND `event.source === <frame window>` (source-window binding).
+//   3e  the widget holds NO `Authorization: Bearer` fetch header anywhere (the
+//       stream moved into the iframe; the OLD required-Bearer invariant is now a
+//       banned-Bearer invariant — the crux of the trust-boundary flip).
 // ---------------------------------------------------------------------------
-// Tolerate single/double quotes, optional-quote key, any case, `Bearer ` + var.
-// The key is anchored to an object-literal boundary (`{`/`,`/line start) so a
-// substring like `XAuthorization:` cannot match, and the `i` flag makes the
-// case-insensitivity real (not just `Authorization`/`authorization`).
-const BEARER_SINK_RE =
-  /(?:^|[,{])\s*["']?authorization["']?\s*:\s*["']Bearer ["']\s*\+\s*([A-Za-z_$][\w$]*)/gim;
-const bearerMatches = [...code.matchAll(BEARER_SINK_RE)];
+
+// 3a — sandbox attribute with the exact minimal grant, no escalation flags.
+const sandboxMatch = code.match(
+  /setAttribute\(\s*['"]sandbox['"]\s*,\s*['"]([^'"]*)['"]\s*\)/,
+);
+const sandboxVal = sandboxMatch ? sandboxMatch[1] : null;
 assert(
-  "at least one Bearer-authenticated stream fetch exists",
-  bearerMatches.length > 0,
-  "no `Authorization: Bearer ` + <var> header found (a stylistic rewrite may have changed the header shape — update BEARER_SINK_RE)",
+  "embed iframe is created with a sandbox attribute",
+  sandboxVal !== null,
+  "no `setAttribute('sandbox', '…')` on the embed iframe",
 );
-// The short-lived token is assigned from getStreamToken() — capture the var name
-// it is bound to so the assertion is sink-aware, not just a name allowlist.
-// Accept BOTH binding forms the two copies use:
-//   WordPress:  `var token = await getStreamToken();`        (declaration)
-//   Drupal:     `var streamToken; ... streamToken = await getStreamToken();`
-//               (declaration then bare assignment)
-const tokenVarMatch = code.match(
-  /(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*await\s+getStreamToken\s*\(/,
-);
-const tokenVar = tokenVarMatch ? tokenVarMatch[1] : null;
+const sandboxTokens = sandboxVal ? sandboxVal.trim().split(/\s+/) : [];
 assert(
-  "a variable is bound to `await getStreamToken()` (short-lived token mint sink)",
-  !!tokenVar,
-  "no `<var> = await getStreamToken()` assignment found",
+  "iframe sandbox grants allow-scripts and allow-same-origin",
+  sandboxTokens.includes("allow-scripts") &&
+    sandboxTokens.includes("allow-same-origin"),
+  `sandbox='${sandboxVal ?? ""}' is missing allow-scripts / allow-same-origin`,
 );
-// cinatra#1221 S5 — the run-bound RESUME token is a SECOND sanctioned short-lived
-// Bearer credential. The unified chat turn (POST /api/assistants/chat) delivers
-// it on the `X-Cinatra-Chat-Resume-Token` RESPONSE header, and the widget
-// re-presents it on the AG-UI resume/tail GET when the primary stream drops.
-// Capture the var it is bound to so this remains a SINK-AWARE allowance (not a
-// blanket name allowlist): the binding MUST come from
-// `<resp>.headers.get('X-Cinatra-Chat-Resume-Token')`, which proves the value is
-// a server-issued short-lived token and NOT a config-derived credential — so the
-// "no long-lived / config credential in a Bearer header" invariant still holds
-// for EVERY Bearer sink. If the widget carries no resume path, resumeVar is null
-// and the only allowed sink stays the getStreamToken() value.
-const resumeVarMatch = code.match(
-  /([A-Za-z_$][\w$]*)\s*=\s*[A-Za-z_$][\w$.]*\.headers\.get\(\s*['"]X-Cinatra-Chat-Resume-Token['"]\s*\)/,
-);
-const resumeVar = resumeVarMatch ? resumeVarMatch[1] : null;
-// The sanctioned Bearer-sink SET: the cit_ mint value ∪ (when present) the
-// resume-header token. A Bearer header using ANY other var fails closed.
-const allowedBearerVars = new Set([tokenVar, resumeVar].filter(Boolean));
-const everyBearerIsShortLivedToken = bearerMatches.every(
-  (m) => allowedBearerVars.has(m[1]),
+const FORBIDDEN_SANDBOX = [
+  "allow-top-navigation",
+  "allow-top-navigation-by-user-activation",
+  "allow-top-navigation-to-custom-protocols",
+  "allow-forms",
+  "allow-popups",
+  "allow-popups-to-escape-sandbox",
+  "allow-modals",
+  "allow-downloads",
+  "allow-pointer-lock",
+  "allow-presentation",
+  "allow-orientation-lock",
+];
+const grantedForbidden = sandboxTokens.filter((t) =>
+  FORBIDDEN_SANDBOX.includes(t),
 );
 assert(
-  "every Bearer header uses a sanctioned short-lived token (getStreamToken() cit_, or the X-Cinatra-Chat-Resume-Token response-header token) — no config-derived credential",
-  everyBearerIsShortLivedToken,
-  allowedBearerVars.size
-    ? `a Bearer header uses a var outside the sanctioned sink set {${[...allowedBearerVars].join(
-        ", ",
-      )}}: ${bearerMatches.map((m) => m[1]).join(", ")}`
-    : "no sanctioned short-lived-token sink to compare against",
+  "iframe sandbox grants NO escalation flags (no top-nav/forms/popups/modals/downloads)",
+  grantedForbidden.length === 0,
+  grantedForbidden.length
+    ? `sandbox grants forbidden flag(s): ${grantedForbidden.join(", ")}`
+    : undefined,
+);
+
+// 3b — the iframe src is the Cinatra /embed/assistant route with the
+// disambiguators, built from config.cinatraUrl (NOT a hardcoded origin).
+assert(
+  "iframe src targets the Cinatra /embed/assistant route from config.cinatraUrl",
+  /config\.cinatraUrl\s*\+\s*['"]\/embed\/assistant/.test(code),
+  "no `config.cinatraUrl + '/embed/assistant'` iframe src construction found",
+);
+assert(
+  "iframe src carries the instanceId + assistant disambiguators",
+  /instanceId=/.test(code) && /assistant=/.test(code),
+  "the embed src does not carry both instanceId= and assistant= query params",
+);
+
+// 3c — targetOrigin discipline: NO wildcard, AND every outbound post is addressed
+// to the resolved Cinatra origin variable (an explicit non-"*" literal or a
+// different origin would be a leak). We (i) ban a "*" 2nd arg, (ii) require a
+// `.postMessage(<x>, cinatraOrigin)` to exist, and (iii) require that EVERY
+// `.postMessage(` in executable code targets `cinatraOrigin` (no post to any
+// other/computed origin). A rewrite that posts elsewhere fails here.
+// Ban a "*" literal ANYWHERE in a postMessage argument list (not just
+// immediately before `)`), so a `postMessage(msg, cinatraOrigin || "*")`
+// short-circuit fallback is caught too.
+const WILDCARD_POSTMESSAGE_RE = /\.postMessage\s*\([^;)]*?(['"])\*\1/;
+assert(
+  'no postMessage uses a wildcard "*" targetOrigin (anywhere in the args)',
+  !WILDCARD_POSTMESSAGE_RE.test(code),
+  'a postMessage with a "*" argument was found — every post must be addressed to the exact Cinatra origin',
+);
+const postMessageCalls = [...code.matchAll(/\.postMessage\s*\(([^;)]*?)\)/g)];
+assert(
+  "at least one postMessage to the frame exists (BOOTSTRAP is delivered)",
+  postMessageCalls.length > 0,
+  "no postMessage call found — the bridge never bootstraps the frame",
+);
+// The 2nd argument must be EXACTLY `cinatraOrigin` — the arg list ENDS with
+// `, cinatraOrigin` and nothing appended. This rejects a computed/short-circuit
+// target such as `cinatraOrigin || "*"` or a ternary (which a loose `\b` form
+// would have accepted).
+const everyPostToCinatraOrigin = postMessageCalls.every((m) =>
+  /,\s*cinatraOrigin\s*$/.test(m[1].trim()),
+);
+assert(
+  "every postMessage's targetOrigin is EXACTLY `cinatraOrigin` (no computed/short-circuit origin)",
+  everyPostToCinatraOrigin,
+  "a postMessage targetOrigin is not exactly `cinatraOrigin` — the outbound target must be the resolved Cinatra origin with nothing appended",
+);
+
+// 3d — inbound gate MUST be the REJECT form (a `!==` early-return), not merely a
+// mention of the identifiers: `if (event.origin === cinatraOrigin) return` would
+// invert the gate yet pass a loose "mentions both sides" check. Require the
+// `!==` reject spelling for BOTH the origin and the source-window binding.
+assert(
+  "inbound bridge REJECTS on event.origin !== the Cinatra origin (reject-form gate)",
+  /event\.origin\s*!==\s*cinatraOrigin/.test(code),
+  "no `event.origin !== cinatraOrigin` reject-form gate on the inbound bridge",
+);
+assert(
+  "inbound bridge REJECTS on event.source !== the frame window (source-window binding)",
+  /event\.source\s*!==\s*frameWindow/.test(code),
+  "no `event.source !== frameWindow` reject-form binding on the inbound bridge",
+);
+
+// 3e — THE FLIP: the widget must hold NO Authorization: Bearer fetch header. The
+// stream (and thus every Bearer-authenticated request) moved into the iframe;
+// tokens travel ONLY via the postMessage BOOTSTRAP now.
+const BEARER_HEADER_RE =
+  /(?:^|[,{])\s*["']?authorization["']?\s*:\s*["']Bearer\b/gim;
+const bearerMatches = [...code.matchAll(BEARER_HEADER_RE)];
+assert(
+  "widget holds NO Authorization: Bearer fetch header (streaming moved into the iframe)",
+  bearerMatches.length === 0,
+  bearerMatches.length
+    ? "an `Authorization: Bearer` header is still present — the widget must not direct-stream-auth; tokens go via BOOTSTRAP"
+    : undefined,
 );
 
 // ---------------------------------------------------------------------------
-// INVARIANT 4 — the shared contract-version marker matches the cross-CMS set.
-// The two copies legitimately ORDER the array differently (their negotiation
-// loops differ by design: WP first-match-wins newest-first, Drupal last-match
-// -wins oldest-first), so we assert the SET, not the order.
-// EXPECTED_CONTRACT_VERSIONS is the single shared marker both repos must carry;
-// bump it in lockstep when the wire contract gains a version.
+// INVARIANT 3f — the §12 bridge speaks the pinned protocol. Structural markers
+// so a rename/version drift from the core `bridge-protocol.ts` is loud.
+// ---------------------------------------------------------------------------
+assert(
+  "bridge references the ready + bootstrap message types",
+  /cinatra\.embed\.ready/.test(code) && /cinatra\.embed\.bootstrap/.test(code),
+  "the 'cinatra.embed.ready' / 'cinatra.embed.bootstrap' message types are missing",
+);
+assert(
+  "bridge pins EMBED_PROTOCOL_VERSION = 1",
+  /EMBED_PROTOCOL_VERSION\s*=\s*1\b/.test(code),
+  "EMBED_PROTOCOL_VERSION is not pinned to 1",
+);
+// The BOOTSTRAP is the ONLY credential carrier: it relays both tokens.
+assert(
+  "BOOTSTRAP carries the cit_ + cwu_ tokens (citToken/cwuToken in auth)",
+  /citToken\s*:/.test(code) && /cwuToken\s*:/.test(code),
+  "the bootstrap auth object does not carry both citToken and cwuToken",
+);
+
+// ---------------------------------------------------------------------------
+// INVARIANT 3f-2 — the bridge's runtime trust controls each leave a structural
+// marker so a rewrite that DROPS one is loud (the grep can't prove the runtime
+// behavior, but a missing marker means the control is almost certainly gone):
+//   * nonce echo (parent echoes the frame's READY nonce),
+//   * single bootstrap per frame (a guarded flag),
+//   * per-frame binding of the async bootstrap (frame generation),
+//   * uplink correlationId binding (drop a message whose correlationId differs),
+//   * a monotonic inbound seq gate (drop a non-increasing seq).
+// ---------------------------------------------------------------------------
+assert(
+  "bridge echoes the frame nonce (nonceEcho)",
+  /nonceEcho\s*:/.test(code),
+  "no `nonceEcho:` in the bootstrap — the parent must echo the frame's READY nonce",
+);
+assert(
+  "bridge enforces single-bootstrap-per-frame (a guarded `bootstrapped` flag)",
+  /\bbootstrapped\b/.test(code) && /if\s*\(\s*bootstrapped\b/.test(code),
+  "no `if (bootstrapped …` single-bootstrap guard found",
+);
+// The cit_ token is PRE-MINTED before the frame mounts so the READY->BOOTSTRAP
+// release is SYNCHRONOUS (no await between receiving READY and posting the
+// bootstrap). A same-origin frame navigation cannot interleave within one
+// synchronous task, so credentials can never reach a document that navigated in
+// mid-release. Two markers: (a) the pre-mint precedes the mount; (b) the release
+// reads the token from the synchronous cache, never an inline `await`.
+const enterConvMatch = code.match(
+  /function\s+enterConversation\b[\s\S]{0,600}?\n\s{0,4}\}/,
+);
+const enterConvBody = enterConvMatch ? enterConvMatch[0] : "";
+assert(
+  "cit_ is PRE-MINTED before the frame mounts (getStreamToken precedes mountBridgeIframe)",
+  /getStreamToken\s*\(/.test(enterConvBody) &&
+    /mountBridgeIframe\s*\(/.test(enterConvBody) &&
+    enterConvBody.indexOf("getStreamToken") < enterConvBody.indexOf("mountBridgeIframe"),
+  "enterConversation does not pre-mint cit_ (getStreamToken) BEFORE mounting the frame — the bootstrap release would not be synchronous",
+);
+assert(
+  "BOOTSTRAP is released SYNCHRONOUSLY from the pre-minted cache (getCachedCitToken)",
+  /getCachedCitToken\s*\(/.test(code) &&
+    /bootstrapped\s*=\s*true\s*;\s*postToFrame\s*\(\s*buildBootstrap/.test(code),
+  "the READY handler does not release the bootstrap synchronously from getCachedCitToken() — an async mint-then-post reopens the navigation-release gap",
+);
+assert(
+  "bridge binds uplinks to the minted correlationId (drop on mismatch)",
+  /\.correlationId\s*!==\s*correlationId/.test(code),
+  "no `<msg>.correlationId !== correlationId` binding on uplinks",
+);
+assert(
+  "bridge enforces a monotonic inbound seq gate (drop non-increasing seq)",
+  /seq\s*<=\s*inboundSeqLast/.test(code),
+  "no `seq <= inboundSeqLast` monotonic drop found",
+);
+
+// ---------------------------------------------------------------------------
+// INVARIANT 3f-3 — TOKENS NOT IN THE FRAME URL. The embed src carries ONLY the
+// non-secret disambiguators (instanceId, assistant); a token in the URL would
+// leak it via history/referrer/logs. Assert the `/embed/assistant` src builder
+// contains no token identifier.
+// ---------------------------------------------------------------------------
+const embedSrcBuild = code.match(
+  /config\.cinatraUrl\s*\+\s*['"]\/embed\/assistant[\s\S]{0,400}?;/,
+);
+assert(
+  "embed iframe src carries NO token (tokens travel ONLY via BOOTSTRAP)",
+  !!embedSrcBuild && !/token|cit_|cwu_/i.test(embedSrcBuild[0]),
+  embedSrcBuild
+    ? "the /embed/assistant src builder references a token — tokens must never be in the frame URL"
+    : "could not locate the /embed/assistant src builder",
+);
+
+// ---------------------------------------------------------------------------
+// INVARIANT 3g — TOKEN NON-DISCLOSURE. The cit_/cwu_ tokens are relayed ONLY into
+// the BOOTSTRAP message: never persisted, never logged, never in a URL.
+//   * No web storage at all in the widget (nothing is persisted now — history
+//     moved into the iframe), so a token can never land in storage.
+//   * No token variable is passed to console.* (no log/telemetry disclosure).
+// ---------------------------------------------------------------------------
+assert(
+  "no web storage in the widget (localStorage/sessionStorage) — tokens cannot be persisted",
+  !/\b(?:local|session)Storage\b/.test(code),
+  "the widget references localStorage/sessionStorage — the iframe owns persistence; a token in storage is XSS-exfiltratable",
+);
+const TOKEN_LOG_RE =
+  /console\s*\.\s*\w+\s*\([^)]*\b(?:citToken|cwuToken|userToken|cachedToken|getStreamToken)\b/;
+assert(
+  "no token value is passed to console.* (no log disclosure)",
+  !TOKEN_LOG_RE.test(code),
+  "a token identifier appears inside a console.* call",
+);
+
+// ---------------------------------------------------------------------------
+// INVARIANT 3h — #1214 NO-DIRECT-EGRESS on apply. Field-apply happens server-side
+// via the CMS MCP integration; on apply_intent the parent does an IN-PLACE draft
+// refresh through the CMS's OWN data layer — it never constructs a /wp-json (or
+// /wp/v2 / JSON:API) content fetch and never reloads the page. So:
+//   * no literal `/wp-json` or `/wp/v2/` or `/jsonapi/` request string in the
+//     widget (broker endpoints arrive as opaque config.* values, not literals);
+//   * no `window.location.reload` (the old post-apply reload is gone).
+// ---------------------------------------------------------------------------
+assert(
+  "no direct WP/Drupal content-egress URL literal in the widget (#1214)",
+  !/\/wp-json\b/.test(code) && !/\/wp\/v2\//.test(code) && !/\/jsonapi\b/.test(code),
+  "a /wp-json | /wp/v2/ | /jsonapi content-egress literal is present — apply must not direct-egress; the CMS MCP integration applies fields",
+);
+assert(
+  "no page reload on apply (#1214 in-place draft refresh, not a reload)",
+  !/location\s*\.\s*reload\s*\(/.test(code),
+  "window.location.reload() is present — apply must do an in-place draft refresh, not a reload",
+);
+
+// ---------------------------------------------------------------------------
+// INVARIANT 3i — apply_intent selector discipline + resize clamp. The apply path
+// must (a) route through the in-place refresh, (b) re-check edit permission, (c)
+// enforce presence-XOR of the selector, (d) use the parent's OWN canonical
+// resource (buildContentContext) — never the message id — as the refresh target,
+// (e) bound-dedup via an LRU, and (f) never dynamically egress a message-supplied
+// URL. Structural markers so removing any of these is loud.
+// ---------------------------------------------------------------------------
+assert(
+  "apply_intent is handled and routes through an in-place draft refresh",
+  /cinatra\.embed\.apply_intent/.test(code) &&
+    /refreshCurrentDraft\s*\(/.test(code),
+  "the apply_intent handler / refreshCurrentDraft() in-place refresh is missing",
+);
+assert(
+  "apply_intent re-checks edit permission (currentUserMayEdit)",
+  /currentUserMayEdit\s*\(/.test(code),
+  "no currentUserMayEdit() permission re-check in the apply path",
+);
+assert(
+  "apply_intent enforces selector presence-XOR (proposalPresent === changeSetPresent -> drop)",
+  /proposalPresent\s*===\s*changeSetPresent/.test(code),
+  "no presence-XOR guard — a message carrying both/neither selector could slip through",
+);
+assert(
+  "apply refresh targets the parent's OWN canonical resource (buildContentContext)",
+  /buildContentContext\s*\(/.test(code),
+  "the apply path does not derive the resource from buildContentContext() (the message id must never be the selector)",
+);
+assert(
+  "apply_intent bounded LRU dedup (appliedLru)",
+  /appliedLru/.test(code) && /appliedLru\.indexOf/.test(code),
+  "no bounded-LRU dedup (appliedLru) in the apply path",
+);
+// No dynamic egress: the widget must never fetch a URL taken from a bridge
+// message (the closed uplink schema carries no URL; a `fetch(d.<x>)` /
+// `fetch(msg…)` would be an exfiltration/SSRF-style regression).
+const DYNAMIC_EGRESS_RE = /fetch\s*\(\s*(?:d|msg|message|event|payload)\b/;
+assert(
+  "no dynamic egress of a bridge-message-supplied URL (no fetch(d.…)/fetch(msg…))",
+  !DYNAMIC_EGRESS_RE.test(code),
+  "a fetch() takes its URL from a bridge message — the uplink schema carries no URL and none may be egressed",
+);
+assert(
+  "resize height is clamped (Math.min against a panel cap), not trusted",
+  /Math\.min\s*\([^)]*maxPanelHeight\s*\(\)/.test(code) ||
+    /Math\.min\s*\([^)]*RESIZE_MAX_HEIGHT/.test(code),
+  "no Math.min clamp of the resize height against the panel cap found",
+);
+
+// ---------------------------------------------------------------------------
+// INVARIANT 4 (UNCHANGED) — the shared contract-version marker matches the
+// cross-CMS set. Assert the SET, not the order (the two copies order the array
+// differently by design). Bump EXPECTED_CONTRACT_VERSIONS in lockstep when the
+// wire contract gains a version.
 // ---------------------------------------------------------------------------
 const EXPECTED_CONTRACT_VERSIONS = ["v1", "v2"];
 const cvMatch = code.match(/CLIENT_CONTRACT_VERSIONS\s*=\s*\[([^\]]*)\]/);
@@ -244,7 +482,7 @@ if (cvMatch) {
 }
 const sortedSet = (a) => [...new Set(a)].sort();
 assert(
-  "CLIENT_CONTRACT_VERSIONS is declared",
+  "CLIENT_CONTRACT_VERSIONS is declared (negotiation path KEPT until AC2)",
   cvMatch !== null,
   "no CLIENT_CONTRACT_VERSIONS array found",
 );
@@ -258,14 +496,16 @@ assert(
     ", ",
   )}}`,
 );
+// The negotiation entry point itself must remain (mount HARD PREREQUISITE).
+assert(
+  "negotiateCapabilities() is present (mount hard-prerequisite, KEPT until AC2)",
+  /function\s+negotiateCapabilities\b/.test(code),
+  "negotiateCapabilities() was removed — negotiation is kept until AC2 lands everywhere",
+);
 
 // ---------------------------------------------------------------------------
-// INVARIANT 5 — the dead host bundle route must not creep back in.
-// Neither the widget NOR any shipped admin/embed/schema string may reference
-// /api/wordpress/bundle.js or /api/drupal/bundle.js. The widget is checked here;
-// the admin/embed/schema files are checked below across the shipped tree.
-// (The retired routes live in cinatra-ai/cinatra and are scheduled for removal;
-// see cinatra docs/widget-source-of-truth.md.)
+// INVARIANT 5 (UNCHANGED) — the dead host bundle route must not creep back in.
+// The widget is checked here; the admin/embed/schema/js tree is scanned below.
 // ---------------------------------------------------------------------------
 const DEAD_ROUTE_RE = /\/api\/(?:wordpress|drupal)\/bundle\.js/;
 assert(
@@ -274,13 +514,6 @@ assert(
   "the widget references a retired bundle.js route",
 );
 
-// Scan the shipped/admin/embed/schema surfaces (PHP, .module, .info.yml, JSON,
-// templates, AND shipped .js — an admin/embed JS file could otherwise advertise
-// the dead route past this gate) for a dead-route reference. Test files and dev
-// docs are EXEMPT: they legitimately ASSERT the route is NOT used (e.g.
-// responseNotContains '/api/drupal/bundle.js') or narrate the vendoring history.
-// README.md is also exempt (repo doc, not shipped admin/embed config) but should
-// still describe the canonical model — enforced by review, not this grep.
 const SHIPPED_EXTS = new Set([
   ".php",
   ".module",
@@ -299,13 +532,14 @@ const EXEMPT_DIR_PARTS = new Set([
   "node_modules",
   ".git",
   "docs",
+  // Gitignored build-output staging (bin/build-wporg.sh regenerates it from the
+  // current source). It is not tracked and never present in a fresh CI checkout;
+  // a stale local copy must not fail the source-of-truth scan.
+  "build",
 ]);
-// Two files legitimately contain the dead-route TOKEN and must be exempt from
-// the raw-bytes scan:
-//   - the widget itself: its header comment NAMES the retired route to explain
-//     it is NOT re-vendored from it. Its EXECUTABLE code was already checked
-//     (comments stripped) above; a raw-bytes match here would be the comment.
-//   - this parity script: it contains DEAD_ROUTE_RE as a literal.
+// Two files legitimately contain the dead-route TOKEN and must be exempt from the
+// raw-bytes scan: the widget itself (its executable code was already checked,
+// comments stripped) and this parity script (it contains DEAD_ROUTE_RE literally).
 const DEAD_ROUTE_SCAN_EXEMPT = new Set([
   path.resolve(WIDGET_PATH),
   path.resolve(SELF_PATH),
@@ -343,38 +577,23 @@ assert(
 );
 
 // ---------------------------------------------------------------------------
-// INVARIANT 6 — login-required panel gate (#410). NET-NEW; not present yet.
-//
-// HONEST SCOPE: this gate runs PER-REPO on THIS repo's OWN copy, so it CANNOT by
-// itself force the other repo to mirror a change — if WordPress adds the login
-// marker, the WordPress gate enforces it but the Drupal gate stays green with no
-// marker (it INFO-warns). Cross-repo mirroring is a REVIEW discipline (this gate
-// does not, and cannot single-repo, guarantee it).
-//
-// HARD ENFORCEMENT begins ONLY after LOGIN_GATE_REQUIRED is flipped to true. This
-// is a STATELESS source check: while the flag is false it cannot detect that a
-// marker was REMOVED in a later commit (it only sees the current source). So
-// durable "the login gate can't be dropped" protection requires the flag flip,
-// NOT merely a marker once being present.
-//
-// When #410 lands, flip LOGIN_GATE_REQUIRED to true IN BOTH repos in the same
-// lockstep change (ideally tied to a contract-version bump), so a MISSING marker
-// becomes a hard FAIL everywhere. Until then absence is the correct shared state
-// and only INFO-warns.
+// INVARIANT 6 (UNCHANGED, now HARD) — login-required panel gate (#410). The gate
+// is present in BOTH copies, so it is enforced unconditionally. This is a
+// STATELESS source check (it sees only the current source), so durable protection
+// is the flag being true here.
 // ---------------------------------------------------------------------------
-const LOGIN_GATE_REQUIRED = false; // flip to true in BOTH repos when #410 lands.
+const LOGIN_GATE_REQUIRED = true; // #410 landed: the login gate is required.
 const LOGIN_GATE_RE = /panelMode|loginRequired|widget-auth|userToken/;
 const hasLoginGate = LOGIN_GATE_RE.test(code);
 if (LOGIN_GATE_REQUIRED || hasLoginGate) {
-  // Required globally (post-#410 flag flip), OR present in this run: assert it.
   assert(
     "login-required panel gate present (#410 marker; mirror across both CMSs)",
     hasLoginGate,
-    "the #410 login gate is required/present-here but its marker is missing",
+    "the #410 login gate marker is required/present-here but missing",
   );
 } else {
   console.log(
-    "  INFO  login-required panel gate (#410) not yet present — expected until #410 lands. NOTE: cross-repo mirroring is a review discipline; flip LOGIN_GATE_REQUIRED in BOTH repos when #410 ships.",
+    "  INFO  login-required panel gate (#410) not present (unexpected once #410 landed).",
   );
 }
 
