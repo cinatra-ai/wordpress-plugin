@@ -221,38 +221,75 @@ assert(
   "the embed src does not carry both instanceId= and assistant= query params",
 );
 
-// 3c — targetOrigin discipline: NO wildcard, AND every outbound post is addressed
-// to the resolved Cinatra origin variable (an explicit non-"*" literal or a
-// different origin would be a leak). We (i) ban a "*" 2nd arg, (ii) require a
-// `.postMessage(<x>, cinatraOrigin)` to exist, and (iii) require that EVERY
-// `.postMessage(` in executable code targets `cinatraOrigin` (no post to any
-// other/computed origin). A rewrite that posts elsewhere fails here.
-// Ban a "*" literal ANYWHERE in a postMessage argument list (not just
-// immediately before `)`), so a `postMessage(msg, cinatraOrigin || "*")`
-// short-circuit fallback is caught too.
+// 3c — outbound transport discipline (§12b). There are now TWO sanctioned
+// transports for parent->iframe messages:
+//   * the §12b PORT transport — the token-bearing bootstrap (and any later
+//     parent->iframe traffic) rides the RETAINED MessagePort the iframe
+//     transferred in READY: `bridgePort.postMessage(<msg>)`, carrying NO
+//     targetOrigin (the origin-targeted READY transfer that delivered the port IS
+//     the binding);
+//   * the LEGACY WINDOW transport (negotiated transition) — a window post that
+//     MUST be addressed to the resolved Cinatra origin: `<win>.postMessage(<msg>,
+//     cinatraOrigin)`, NEVER "*".
+// We (i) ban a "*" literal anywhere in any postMessage arg list; (ii) require at
+// least one post (the bootstrap is delivered); (iii) require EVERY post to be one
+// of the two sanctioned forms. A post to any other/computed origin, or a BARE
+// window post that drops the targetOrigin, fails here.
+// Ban a "*" literal ANYWHERE in a postMessage argument list (not just immediately
+// before `)`), so a `postMessage(msg, cinatraOrigin || "*")` short-circuit is
+// caught too.
 const WILDCARD_POSTMESSAGE_RE = /\.postMessage\s*\([^;)]*?(['"])\*\1/;
 assert(
   'no postMessage uses a wildcard "*" targetOrigin (anywhere in the args)',
   !WILDCARD_POSTMESSAGE_RE.test(code),
-  'a postMessage with a "*" argument was found — every post must be addressed to the exact Cinatra origin',
+  'a postMessage with a "*" argument was found — every window post must be addressed to the exact Cinatra origin, and a port post carries no target',
 );
-const postMessageCalls = [...code.matchAll(/\.postMessage\s*\(([^;)]*?)\)/g)];
+// Capture BOTH the receiver and the arg list of every call so a port post
+// (`bridgePort`, no targetOrigin) is told apart from a window post (targetOrigin
+// required). `[^;)]*?` stops at the first `)`; the widget's args are plain
+// identifiers so this is exact.
+const POSTMESSAGE_CALL_RE = /([A-Za-z_$][\w$.]*)\.postMessage\s*\(([^;)]*?)\)/g;
+const postMessageCalls = [...code.matchAll(POSTMESSAGE_CALL_RE)].map((m) => ({
+  receiver: m[1],
+  args: m[2].trim(),
+}));
 assert(
   "at least one postMessage to the frame exists (BOOTSTRAP is delivered)",
   postMessageCalls.length > 0,
   "no postMessage call found — the bridge never bootstraps the frame",
 );
-// The 2nd argument must be EXACTLY `cinatraOrigin` — the arg list ENDS with
-// `, cinatraOrigin` and nothing appended. This rejects a computed/short-circuit
-// target such as `cinatraOrigin || "*"` or a ternary (which a loose `\b` form
-// would have accepted).
-const everyPostToCinatraOrigin = postMessageCalls.every((m) =>
-  /,\s*cinatraOrigin\s*$/.test(m[1].trim()),
+// A window post's arg list ENDS with `, cinatraOrigin` and nothing appended (this
+// rejects a computed/short-circuit target such as `cinatraOrigin || "*"`). A port
+// post is a SINGLE argument (no top-level comma) on the retained `bridgePort`.
+const isWindowPostToCinatraOrigin = (c) => /,\s*cinatraOrigin\s*$/.test(c.args);
+const isRetainedPortPost = (c) =>
+  c.receiver === "bridgePort" && !/,/.test(c.args);
+const everyPostSanctioned = postMessageCalls.every(
+  (c) => isWindowPostToCinatraOrigin(c) || isRetainedPortPost(c),
 );
 assert(
-  "every postMessage's targetOrigin is EXACTLY `cinatraOrigin` (no computed/short-circuit origin)",
-  everyPostToCinatraOrigin,
-  "a postMessage targetOrigin is not exactly `cinatraOrigin` — the outbound target must be the resolved Cinatra origin with nothing appended",
+  "every postMessage is a window post to EXACTLY `cinatraOrigin` OR a targetless post on the retained bridgePort (§12b)",
+  everyPostSanctioned,
+  "a postMessage is neither an origin-pinned `<win>.postMessage(<msg>, cinatraOrigin)` nor a `bridgePort.postMessage(<msg>)` — no computed/short-circuit origin, and no bare window post that drops the targetOrigin",
+);
+
+// 3c-2 (§12b) — the token-bearing bootstrap rides a DOCUMENT-BOUND MessagePort.
+// The iframe transfers ONE MessageChannel endpoint in the token-free READY; the
+// parent RETAINS it (`event.ports`) and sends the bootstrap over it
+// (`bridgePort.postMessage`) — never via a window post — so a same-origin
+// replacement of the frame's browsing context (a fresh realm that never inherits
+// the entangled endpoint) can never receive the tokens. Two structural markers so
+// a rewrite that drops the port transport (and silently falls back to a
+// window-only bootstrap) is loud.
+assert(
+  "§12b: the parent retains the port the iframe transferred in READY (event.ports)",
+  /event\s*\.\s*ports\b/.test(code),
+  "no `event.ports` read — the iframe transfers a MessagePort in READY that the parent must retain",
+);
+assert(
+  "§12b: the token-bearing bootstrap is sent over the retained port (bridgePort.postMessage)",
+  /bridgePort\s*\.\s*postMessage\s*\(/.test(code),
+  "no `bridgePort.postMessage(` — the parent must send the bootstrap over the retained transferred port, not a window post",
 );
 
 // 3d — inbound gate MUST be the REJECT form (a `!==` early-return), not merely a
@@ -345,7 +382,7 @@ assert(
 assert(
   "BOOTSTRAP is released SYNCHRONOUSLY from the pre-minted cache (getCachedCitToken)",
   /getCachedCitToken\s*\(/.test(code) &&
-    /bootstrapped\s*=\s*true\s*;\s*postToFrame\s*\(\s*buildBootstrap/.test(code),
+    /bootstrapped\s*=\s*true\s*;\s*sendBootstrap\s*\(\s*buildBootstrap/.test(code),
   "the READY handler does not release the bootstrap synchronously from getCachedCitToken() — an async mint-then-post reopens the navigation-release gap",
 );
 assert(

@@ -244,6 +244,86 @@ const HEALTHY = {
   },
 };
 
+// Boot a fresh widget, negotiate a healthy instance, and drive the hosted-PKCE
+// login through to a mounted iframe — the common prefix the bridge TRANSPORT
+// drives share. Returns the env, the capture sink, the fetch log, the mounted
+// iframe + its frame window, and a window-message deliverer.
+async function bootLoggedInBridge() {
+  let initState = null;
+  const fetched = [];
+  const fetchImpl = (url, opts) => {
+    const u = String(url);
+    const body = (opts && opts.body) ? JSON.parse(opts.body) : null;
+    fetched.push({ url: u, method: (opts && opts.method) || "GET", headers: (opts && opts.headers) || {}, body });
+    if (u.indexOf("/capabilities") !== -1) { return jsonResponse(200, HEALTHY); }
+    if (u === AUTH_INIT) {
+      initState = body && body.state;
+      return jsonResponse(200, { txnId: "txn1", authorizeUrl: INSTANCE_ORIGIN + "/widget-auth?txn=txn1", instanceId: "i1" });
+    }
+    if (u === AUTH_TOKEN) { return jsonResponse(200, { token: "cwu_user-tok", tokenType: "Bearer", expiresIn: 900 }); }
+    if (u === TOKEN_ENDPOINT) { return jsonResponse(200, { token: "cit_site-tok", expiresIn: 300 }); }
+    return jsonResponse(200, {});
+  };
+  const captured = newCaptured();
+  const env = makeEnv(fetchImpl, undefined, captured);
+  env.sandbox.window.wp = {
+    data: {
+      select(store) {
+        if (store === "core") { return { canUser() { return true; } }; }
+        if (store === "core/editor") {
+          return { getCurrentPostId() { return 5; }, getEditedPostAttribute() { return "draft"; } };
+        }
+        return {};
+      },
+      dispatch(store) {
+        if (store === "core") {
+          return { invalidateResolution(sel, args) { captured.invalidations.push({ sel, args }); } };
+        }
+        return {};
+      },
+    },
+  };
+  vm.runInNewContext(WIDGET_SRC, env.sandbox, { filename: "cinatra-widget.js" });
+  await flush();
+  if (captured.loginBtnEl && captured.loginBtnEl._clickHandlers.length) {
+    for (const h of captured.loginBtnEl._clickHandlers) { try { h({}); } catch (_) {} }
+    await flush();
+    const popup = env.openedPopups[env.openedPopups.length - 1];
+    for (const listener of env.messageListeners) {
+      try { listener({ origin: INSTANCE_ORIGIN, source: popup, data: { type: "cinatra-widget-auth", code: "auth-code-1", state: initState } }); } catch (_) {}
+    }
+    await flush(30);
+  }
+  const iframe = captured.iframeEl;
+  const frameWin = iframe && iframe.contentWindow;
+  const deliverToWindow = (ev) => { for (const l of env.messageListeners) { try { l(ev); } catch (_) {} } };
+  return { env, captured, fetched, iframe, frameWin, deliverToWindow };
+}
+
+// A synchronous MessagePort double for the §12b transport: records posts (a port
+// send carries NO targetOrigin), supports onmessage-assignment (a real port
+// implicitly starts on onmessage set) + addEventListener/start/close, and lets a
+// test simulate the iframe posting an uplink to the parent over the entangled port.
+function makePortStub() {
+  const port = {
+    posts: [],
+    onmessage: null,
+    closed: false,
+    _listeners: [],
+    postMessage(msg) { port.posts.push(msg); },
+    addEventListener(t, fn) { if (t === "message") port._listeners.push(fn); },
+    removeEventListener(t, fn) { if (t === "message") { const i = port._listeners.indexOf(fn); if (i !== -1) port._listeners.splice(i, 1); } },
+    start() {},
+    close() { port.closed = true; },
+    _fromIframe(data) {
+      const ev = { data };
+      if (typeof port.onmessage === "function") port.onmessage(ev);
+      for (const l of port._listeners.slice()) l(ev);
+    },
+  };
+  return port;
+}
+
 async function main() {
   console.log("widget negotiation + §12 embed bridge");
 
@@ -492,8 +572,63 @@ async function main() {
       ecRegion.indexOf("getStreamToken") < ecRegion.indexOf("mountBridgeIframe");
     const syncRelease =
       /function\s+getCachedCitToken/.test(WIDGET_SRC) &&
-      /bootstrapped\s*=\s*true;\s*\n?\s*postToFrame\s*\(\s*buildBootstrap/.test(WIDGET_SRC);
+      /bootstrapped\s*=\s*true;\s*\n?\s*sendBootstrap\s*\(\s*buildBootstrap/.test(WIDGET_SRC);
     check("frame-safety: cit_ pre-minted before mount AND READY->BOOTSTRAP released synchronously from cache (no async gap)", preMintsBeforeMount && syncRelease);
+  }
+
+  // -------------------------------------------------------------------------
+  // §12b PORT-BOUND TRANSPORT. When the iframe transfers a MessageChannel endpoint
+  // on READY (event.ports[0]), the parent RETAINS it and sends the token-bearing
+  // BOOTSTRAP over THAT PORT — never a window post — so a same-origin replacement
+  // of the frame (a fresh realm that never inherits the entangled endpoint) can
+  // never receive the tokens. Steady-state uplinks then ride the same port; a
+  // window-delivered uplink is IGNORED (the transport cannot be split/downgraded).
+  // -------------------------------------------------------------------------
+  {
+    const { captured, frameWin, deliverToWindow } = await bootLoggedInBridge();
+    const readyMsg = { type: "cinatra.embed.ready", protocolVersion: 1, nonce: "portNonce0123456789abcd", seq: 0 };
+    const port = makePortStub();
+    // READY carries the transferred port; origin + source-window gated as usual.
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg, ports: [port] });
+    await flush(30);
+
+    // (1) The bootstrap rode the PORT (no targetOrigin), NOT the window.
+    const bmsg = port.posts[0];
+    const portBootstrapOk =
+      port.posts.length === 1 &&
+      captured.bootstrapPosts.length === 0 &&
+      !!bmsg &&
+      bmsg.type === "cinatra.embed.bootstrap" &&
+      bmsg.protocolVersion === 1 &&
+      ID_PATTERN.test(bmsg.correlationId) &&
+      bmsg.nonceEcho === readyMsg.nonce &&
+      bmsg.seq === 0 &&
+      bmsg.auth && bmsg.auth.citToken === "cit_site-tok" && bmsg.auth.cwuToken === "cwu_user-tok" &&
+      bmsg.session && bmsg.session.assistant === "wordpress";
+    check("§12b: transferred port -> BOOTSTRAP rides the PORT, token-bearing, NO window post", portBootstrapOk);
+
+    const correlationId = bmsg && bmsg.correlationId;
+    const cwWidget = captured.byClass["cw-widget"];
+
+    // (2) A PORT-delivered uplink (resize) is handled -> the panel is clamped.
+    port._fromIframe({ type: "cinatra.embed.resize", protocolVersion: 1, correlationId, seq: 1, height: 5000 });
+    await flush();
+    const clampedH = cwWidget && parseInt(String(cwWidget.style.height || "0"), 10);
+    check("§12b: a PORT-delivered uplink is handled (resize clamped to 680px)", clampedH === 680);
+
+    // (3) A WINDOW-delivered uplink in PORT mode is IGNORED (no transport split):
+    //     height 100 would clamp to MIN_PANEL_HEIGHT (260) if wrongly processed;
+    //     it stays 680 because the window path is inert once a port is bound.
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.resize", protocolVersion: 1, correlationId, seq: 2, height: 100 } });
+    await flush();
+    const afterWindowUplink = cwWidget && parseInt(String(cwWidget.style.height || "0"), 10);
+    check("§12b: a WINDOW-delivered uplink in PORT mode is IGNORED (height unchanged)", afterWindowUplink === 680);
+
+    // (4) Single bootstrap per frame holds on the port transport: a second READY
+    //     (even with a fresh port) does not re-bootstrap.
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.ready", protocolVersion: 1, nonce: "portNonce2ndabcdefghij0", seq: 0 }, ports: [makePortStub()] });
+    await flush();
+    check("§12b: single bootstrap per frame holds on the port transport (second READY ignored)", port.posts.length === 1 && captured.bootstrapPosts.length === 0);
   }
 
   console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
