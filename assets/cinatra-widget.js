@@ -1090,6 +1090,49 @@
     dispatchUplink(d);
   }
 
+  // TEST-ONLY render-parity seam carrier (cinatra#1998 (c), epic #1216 S6). The
+  // Cinatra render-parity E2E frames THIS widget's `/embed/assistant` iframe and
+  // needs the deterministic corpus-render seam params (`parityThread` /
+  // `parityTheme`, cinatra#1998 (b)) to ride the iframe src the plugin builds —
+  // the harness cannot reach into the plugin's fixed src otherwise. This reads a
+  // NAMESPACED signal the test stages on the host admin page — a
+  // `window.__cinatraParitySeam` global (STORAGE-FREE: the widget persists
+  // nothing — the iframe owns storage — so this trips no web-storage invariant),
+  // with a same-named query param as a fallback. PRODUCTION never stages it, so
+  // the returned suffix is '' and the src is BYTE-IDENTICAL to before. It is
+  // doubly inert in prod: even a forged signal is a no-op because the Cinatra
+  // server IGNORES `parityThread` unless its server-only `EMBED_PARITY_SEAM` gate
+  // is on (off in prod) — the seam is server-gated, so this can NEVER inject
+  // content or bypass auth in production. Carries NO token (only the two
+  // non-secret render-parity disambiguators), exactly like instanceId/assistant.
+  function embedParitySeamParams() {
+    try {
+      var thread = '';
+      var theme = '';
+      // 1) A namespaced global the harness stages (survives host-page URL
+      //    rewrites; storage-free so the token non-disclosure invariant holds).
+      var g = window.__cinatraParitySeam;
+      if (g && typeof g === 'object') {
+        thread = typeof g.thread === 'string' ? g.thread : '';
+        theme = typeof g.theme === 'string' ? g.theme : '';
+      }
+      // 2) Fallback: a namespaced query param on the host admin URL.
+      if (!thread && window.location && window.location.search && window.URLSearchParams) {
+        var q = new URLSearchParams(window.location.search);
+        thread = q.get('cinatra_parity_thread') || '';
+        theme = q.get('cinatra_parity_theme') || '';
+      }
+      if (!thread) return '';
+      var suffix = '&parityThread=' + encodeURIComponent(thread);
+      if (theme === 'github-dark' || theme === 'github-light') {
+        suffix += '&parityTheme=' + encodeURIComponent(theme);
+      }
+      return suffix;
+    } catch (_) {
+      return '';
+    }
+  }
+
   // Build the sandboxed embed iframe and attach the bridge listener. The src is
   // the Cinatra-served `/embed/assistant` route carrying only the NON-SECRET
   // disambiguators (instanceId, assistant). Tokens are NEVER in the URL — they
@@ -1100,7 +1143,8 @@
     if (iframeEl) return;
     var src = config.cinatraUrl + '/embed/assistant' +
       '?instanceId=' + encodeURIComponent(config.instanceId || '') +
-      '&assistant=' + encodeURIComponent(EMBED_ASSISTANT);
+      '&assistant=' + encodeURIComponent(EMBED_ASSISTANT) +
+      embedParitySeamParams();
     iframeEl = document.createElement('iframe');
     iframeEl.className = 'cw-frame';
     iframeEl.setAttribute('title', 'Cinatra assistant');
