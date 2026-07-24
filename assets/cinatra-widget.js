@@ -11,10 +11,20 @@
 // `/embed/assistant` and THIS widget mounts it in a sandboxed <iframe> as the
 // SOLE session owner. This shell keeps only the host-side concerns that MUST live
 // on the CMS origin: the launcher/panel chrome, the required-login PKCE handshake
-// (cwu_ per-user token) + the short-lived cit_ site-token broker mint, capability
-// negotiation, and the parent half of the §12/§12b parent↔iframe bridge — a
-// document-bound MessagePort transport with an origin-pinned legacy window
-// fallback for the negotiated transition.
+// (cwu_ per-user token) + the short-lived cit_ site-token broker mint, and the
+// parent half of the §12/§12b parent↔iframe bridge — a document-bound MessagePort
+// transport with an origin-pinned legacy window fallback for the negotiated
+// transition.
+//
+// CAPABILITY/CONTRACT NEGOTIATION IS THE IFRAME'S JOB (S5 cutover, cinatra#2029).
+// The retired shell pre-flight against the bespoke `GET /api/agents/{slug}/
+// capabilities` (deleted by cinatra#1991 — no migration window) is GONE. The
+// unified assistant broker negotiates the AG-UI contract CLIENT-SIDE inside the
+// `/embed/assistant` iframe (against `GET /api/assistants/chat/capabilities` with
+// the cit_/cwu_ dual-token broker headers, per cinatra#1998 Lane A / #2004) and
+// the conversational wire is `POST /api/assistants/chat` (cinatra#1221). This
+// shell therefore MOUNTS UNCONDITIONALLY (login-gated) and no longer fetches any
+// capabilities endpoint or holds a client-negotiated contract version.
 //
 // The vanilla AG-UI renderer (markdown/diff-card/history/SSE-stream loop) that
 // previously lived here is DELETED: the iframe owns the turn (textarea + submit +
@@ -53,8 +63,8 @@
 //
 // Security-critical invariants (no apiKey in the browser; tokenEndpoint broker;
 // sandbox iframe; explicit targetOrigin; source-window binding; token-in-bootstrap
-// only; no apply-time egress; contract-version set) are gated by
-// tools/widget-parity-check.mjs in CI.
+// only; no apply-time egress; no legacy /api/agents/{slug}/capabilities pre-flight)
+// are gated by tools/widget-parity-check.mjs in CI.
 //
 // ---------------------------------------------------------------------------
 // NOTICE (Apache License 2.0)
@@ -93,9 +103,10 @@
   var rootEl = document.getElementById('cinatra-root');
   if (!rootEl) { console.warn('[cinatra] #cinatra-root not found'); return; }
   if (rootEl.dataset.cinatraMounted === 'true') return;
-  // NOTE: data-cinatra-mounted is set ONLY after capability negotiation succeeds
-  // (see boot() at the bottom). Setting it earlier would hide the fallback chrome
-  // even when the instance is unavailable/incompatible.
+  // NOTE: data-cinatra-mounted is set at the END of synchronous mount construction
+  // (see mountWidget()). The shell no longer pre-flight-negotiates, so it mounts
+  // unconditionally at boot; a throw mid-mount still leaves the fallback chrome
+  // visible (the marker that hides it is set LAST).
 
   var AGENT_SLUG = 'wordpress-content-editor';
   // Required-login (cinatra#410): the per-user auth handshake (#407 hosted PKCE)
@@ -105,8 +116,6 @@
   // §4: the `?assistant` value; == the cit_-bound kind. MUST equal the embed
   // page's `session.assistant` agreement check.
   var EMBED_ASSISTANT = 'wordpress';
-  // Contract versions this vendored widget understands, newest first.
-  var CLIENT_CONTRACT_VERSIONS = ['v2', 'v1'];
 
   // ---------------------------------------------------------------------------
   // §12/§12b bridge protocol constants (the byte-level contract both halves pin).
@@ -141,100 +150,17 @@
     return;
   }
 
-  // Negotiated state — populated ONLY by a SUCCESSFUL negotiateCapabilities().
-  // The iframe renders the turn now, so the shell needs only the mutually-agreed
-  // contractVersion (passed to the cit_ broker mint). No optimistic defaults: if
-  // negotiation fails the widget never mounts.
-  var negotiated = {
-    contractVersion: null,
-  };
-
-  // ---------------------------------------------------------------------------
-  // Bounded-timeout fetch helper. AbortSignal.timeout() is not universal, so we
-  // drive an AbortController ourselves; the timer is always cleared.
-  // ---------------------------------------------------------------------------
-  function fetchWithTimeout(url, opts, timeoutMs) {
-    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    var timer = null;
-    var options = opts || {};
-    if (controller) {
-      options = Object.assign({}, options, { signal: controller.signal });
-      timer = setTimeout(function () { try { controller.abort(); } catch (_) {} }, timeoutMs);
-    }
-    var p;
-    try {
-      p = fetch(url, options);
-    } catch (err) {
-      if (timer) clearTimeout(timer);
-      return Promise.reject(err);
-    }
-    return p.then(
-      function (resp) { if (timer) clearTimeout(timer); return resp; },
-      function (err) { if (timer) clearTimeout(timer); throw err; }
-    );
-  }
-
-  // ---------------------------------------------------------------------------
-  // Capability + contract-version negotiation (HARD PREREQUISITE — AC2 interlock).
-  //
-  // The /capabilities endpoint is auth-free and returns only static contract
-  // metadata. It MUST succeed and validate before the widget mounts. Any failure
-  // (HTTP not-ok / network / timeout / non-JSON / missing capabilities / no
-  // mutually-supported contract version / supportsTokenExchange !== true / missing
-  // tokenPath) returns false and the caller aborts the mount. There are NO
-  // optimistic defaults and NO legacy long-lived fallback.
-  //
-  // The iframe owns streaming now, so the shell no longer resolves/validates a
-  // `streamPath` for its own fetch (it makes no stream fetch). Negotiation still
-  // gates the mount and yields the contractVersion the cit_ broker mint needs. The
-  // negotiation/capabilities path is KEPT until AC2 (the follow-up slice) lands
-  // everywhere; widgets still negotiate until then.
-  // ---------------------------------------------------------------------------
-  function pickContractVersion(serverVersions) {
-    if (!Array.isArray(serverVersions)) { return null; }
-    for (var ci = 0; ci < CLIENT_CONTRACT_VERSIONS.length; ci++) {
-      if (serverVersions.indexOf(CLIENT_CONTRACT_VERSIONS[ci]) !== -1) {
-        return CLIENT_CONTRACT_VERSIONS[ci];
-      }
-    }
-    return null;
-  }
-
-  function negotiateCapabilities() {
-    return fetchWithTimeout(
-      config.cinatraUrl + '/api/agents/' + AGENT_SLUG + '/capabilities',
-      { method: 'GET', cache: 'no-store' },
-      5000
-    ).then(function (resp) {
-      if (!resp || !resp.ok) { return false; }
-      return resp.json().then(function (data) {
-        if (!data || typeof data !== 'object') { return false; }
-        var caps = data.capabilities;
-        if (!caps || typeof caps !== 'object') { return false; }
-        // Required: a mutually-supported contract version.
-        var version = pickContractVersion(data.supportedContractVersions);
-        if (!version) { return false; }
-        // Required: the broker token-exchange path is the ONLY client credential
-        // model. An instance that cannot mint short-lived tokens is incompatible —
-        // there is no long-lived key in the browser to fall back to.
-        if (caps.supportsTokenExchange !== true) { return false; }
-        if (typeof caps.tokenPath !== 'string' || !caps.tokenPath) { return false; }
-        negotiated.contractVersion = version;
-        return true;
-      }).catch(function () { return false; });
-    }).catch(function () {
-      // Network error, timeout (abort), or transport failure.
-      return false;
-    });
-  }
-
   // ---------------------------------------------------------------------------
   // mountWidget() — builds the Shadow DOM + wires the launcher, login, and the
-  // parent-side bridge. Called ONLY after negotiateCapabilities() resolved true.
+  // parent-side bridge. Called UNCONDITIONALLY at boot: the capability/contract
+  // handshake now runs CLIENT-SIDE inside the /embed/assistant iframe against the
+  // unified broker surface (see the header), so there is no shell pre-flight to
+  // gate the mount. The login gate still holds — the iframe is not framed until a
+  // per-user cwu_ token is held, so the conversation never appears token-less.
   // ---------------------------------------------------------------------------
   function mountWidget() {
-  // Re-check after the async negotiation gap: a second copy of this IIFE could
-  // have mounted while we awaited /capabilities.
+  // Idempotency guard: a second copy of this IIFE (a double script include) could
+  // already have mounted.
   if (rootEl.dataset.cinatraMounted === 'true' || rootEl.shadowRoot) { return; }
   var shadow = rootEl.attachShadow({ mode: 'open' });
   // The data-cinatra-mounted marker (which hides the fallback chrome) is set at
@@ -587,11 +513,15 @@
     }
     var headers = { 'Content-Type': 'application/json' };
     if (config.nonce) headers['X-WP-Nonce'] = config.nonce;
+    // The shell no longer negotiates a client-side contract version (the iframe
+    // owns the AG-UI handshake). The token-exchange contract version is supplied
+    // authoritatively by the same-origin PHP broker (CINATRA_CONTRACT_VERSION),
+    // so the browser posts no contractVersion here.
     var resp = await fetch(config.tokenEndpoint, {
       method: 'POST',
       credentials: 'same-origin',
       headers: headers,
-      body: JSON.stringify({ contractVersion: negotiated.contractVersion }),
+      body: JSON.stringify({}),
     });
     if (!resp.ok) {
       var detail = 'HTTP ' + resp.status;
@@ -1353,18 +1283,13 @@
   } // end mountWidget()
 
   // ---------------------------------------------------------------------------
-  // Boot: capabilities is a HARD PREREQUISITE. Negotiate FIRST; mount ONLY on
-  // success. On any failure we never attachShadow and never set
-  // data-cinatra-mounted, so the always-visible fallback button remains as the
-  // "instance unavailable / incompatible" chrome.
+  // Boot: mount UNCONDITIONALLY. The capability/contract handshake moved into the
+  // /embed/assistant iframe (unified broker surface — see the header), so the
+  // shell has no pre-flight to gate on. The login gate still holds inside
+  // mountWidget() (no iframe/token until the per-user cwu_ handshake), and the
+  // always-visible fallback button remains until data-cinatra-mounted is set at
+  // the end of synchronous mount construction.
   // ---------------------------------------------------------------------------
-  negotiateCapabilities().then(function (ok) {
-    if (ok) { mountWidget(); }
-    else {
-      console.warn('[cinatra] capability negotiation failed — instance unavailable or incompatible; widget not mounted');
-    }
-  }).catch(function () {
-    console.warn('[cinatra] capability negotiation error — instance unavailable; widget not mounted');
-  });
+  mountWidget();
 
 })();

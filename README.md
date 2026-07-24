@@ -73,20 +73,23 @@ links to the GitHub release if it is not active.
 
 ## Plugin ↔ core contract
 
-The widget negotiates a contract version with the instance at boot by calling
-the capabilities endpoint. Both v2 and v1 are understood by the widget; the
-instance advertises which it supports and the widget picks the newest mutual
-version. In all cases `supportsTokenExchange: true` is required — there is no
-long-lived-key fallback. An instance that cannot mint short-lived tokens, or
-that returns no mutually-supported version, causes the widget to show the
-fallback chrome rather than mounting. The contract schemas live in the cinatra
-repository under `contracts/wp-drupal-assistant/`.
+The assistant conversation renders inside a sandboxed, Cinatra-served
+`/embed/assistant` iframe that the widget frames as the sole session owner. The
+AG-UI capability/contract handshake runs **client-side inside that iframe**
+against the unified assistant broker (`GET /api/assistants/chat/capabilities`,
+using the short-lived `cit_`/`cwu_` broker tokens), and the conversational wire
+is `POST /api/assistants/chat`. The shell no longer pre-flight-negotiates a
+contract version; it mounts unconditionally (login-gated) and mints the
+short-lived `cit_` site token through the same-origin PHP broker. The
+token-exchange contract schemas live in the cinatra repository under
+`contracts/wp-drupal-assistant/`.
 
 > Requires the matching Cinatra instance changes for the token-exchange
-> (`/api/agents/{slug}/token`), capabilities (`/api/agents/{slug}/capabilities`),
-> and one-click connect (`/connect/authorize` + `/api/connect/token`) endpoints.
-> Until those are deployed, the assistant degrades gracefully against an
-> un-upgraded instance.
+> (`/api/agents/{slug}/token`), the unified assistant broker
+> (`POST /api/assistants/chat` + `GET /api/assistants/chat/capabilities`), and
+> one-click connect (`/connect/authorize` + `/api/connect/token`) endpoints. The
+> legacy `/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
+> relay were retired (cinatra#1991); a pre-cutover instance is no longer supported.
 
 ## Development
 

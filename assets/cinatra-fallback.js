@@ -3,7 +3,8 @@
  *
  * Always-visible button shown until the main widget mounts (#cinatra-root gets
  * data-cinatra-mounted="true"). On click, if the widget has not mounted, it
- * probes the instance capabilities endpoint and shows a diagnostic message.
+ * probes the instance's public embed page (the widget host) and shows a
+ * diagnostic message.
  *
  * Reads its instance URL from window.CinatraFallback.cinatraUrl (localized by
  * PHP) — no inline <script> is emitted, satisfying Plugin Check.
@@ -62,20 +63,26 @@
 				box.style.display = 'block';
 				return;
 			}
-			// Bounded-timeout probe via a guarded AbortController (AbortSignal.timeout
-			// is not universal and can throw synchronously on older browsers).
+			// Bounded-timeout reachability probe via a guarded AbortController
+			// (AbortSignal.timeout is not universal and can throw synchronously on
+			// older browsers). The legacy auth-free /api/agents/{slug}/capabilities
+			// probe was removed with the unified-broker cutover (cinatra#2029); the
+			// widget host is now the public /embed/assistant page. It is cross-origin
+			// and emits no CORS headers, so this is a `no-cors` probe: a resolved
+			// (opaque) response means the instance answered — reachable; a rejection
+			// (DNS / connection refused / timeout) means it did not — unreachable. The
+			// opaque response status is intentionally not read.
 			var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
 			var timer = controller ? setTimeout(function () { try { controller.abort(); } catch (e) {} }, 4000) : null;
-			fetch(cu + '/api/agents/wordpress-content-editor/capabilities', {
+			fetch(cu + '/embed/assistant', {
 				method: 'GET',
+				mode: 'no-cors',
 				cache: 'no-store',
 				signal: controller ? controller.signal : undefined
 			})
-				.then(function (r) {
+				.then(function () {
 					if (timer) { clearTimeout(timer); }
-					msg.textContent = r.ok
-						? (i18n.reachableNoWidget || 'Cinatra is reachable but the widget has not loaded yet. Try refreshing the page.')
-						: format(i18n.httpStatus || 'Cinatra returned HTTP %s. Check your instance.', r.status);
+					msg.textContent = i18n.reachableNoWidget || 'Cinatra is reachable but the widget has not loaded yet. Try refreshing the page.';
 					box.style.display = 'block';
 				})
 				.catch(function () {
