@@ -28,10 +28,17 @@
 // is now a LIABILITY: keeping it would force a Bearer stream back into the browser
 // or fail every widget PR. It is REPLACED, in lockstep with the widget rewrite, by
 // the §12 trust-boundary invariants below. KEPT unchanged: no-apiKey (INV1), the
-// cit_ broker mint (INV2, now feeding BOOTSTRAP not a header), the shared
-// contract-version set (INV4), the dead-bundle-route ban (INV5), and the
-// login-gate marker (INV6). KEPT because AC2 has not landed everywhere yet:
-// CLIENT_CONTRACT_VERSIONS + negotiateCapabilities.
+// cit_ broker mint (INV2, now feeding BOOTSTRAP not a header), the dead-bundle-route
+// ban (INV5), and the login-gate marker (INV6).
+//
+// UNIFIED-BROKER CUTOVER (cinatra#2029; the "AC2" follow-up slice). The retired
+// shell capability pre-flight — CLIENT_CONTRACT_VERSIONS + negotiateCapabilities
+// against the bespoke `GET /api/agents/{slug}/capabilities` — has NOW landed its
+// removal everywhere: that route was DELETED by cinatra#1991 (no migration window)
+// and the AG-UI handshake moved CLIENT-SIDE into the /embed/assistant iframe
+// (against the unified broker `GET /api/assistants/chat/capabilities`). So INV4
+// FLIPPED from "REQUIRE the pre-flight is present" to "BAN the deleted route +
+// BAN the retired pre-flight from creeping back in" (no dual-pathing).
 //
 // This SAME file is shipped verbatim to both repos (it auto-detects the WP vs
 // Drupal config accessor + widget path). Keeping it identical is itself part of
@@ -504,40 +511,35 @@ assert(
 );
 
 // ---------------------------------------------------------------------------
-// INVARIANT 4 (UNCHANGED) — the shared contract-version marker matches the
-// cross-CMS set. Assert the SET, not the order (the two copies order the array
-// differently by design). Bump EXPECTED_CONTRACT_VERSIONS in lockstep when the
-// wire contract gains a version.
+// INVARIANT 4 (FLIPPED by the unified-broker cutover, cinatra#2029) — the shell
+// no longer runs its own capability pre-flight. The AG-UI capability/contract
+// handshake moved CLIENT-SIDE into the /embed/assistant iframe (unified broker
+// `GET /api/assistants/chat/capabilities`); the bespoke `GET /api/agents/{slug}/
+// capabilities` it used was DELETED by cinatra#1991 (no migration window). So this
+// invariant now BANS, in EXECUTABLE code (comments stripped, so the header may
+// still name the retired paths to explain their absence):
+//   4a  any reference to the deleted `/capabilities` route (the shell must not
+//       fetch it — a live proof was the widget never mounting on a 404);
+//   4b  the retired pre-flight machinery (CLIENT_CONTRACT_VERSIONS /
+//       negotiateCapabilities) creeping back in — re-adding either is a dual-path
+//       regression (the #1991 ruling left NO migration window).
+// The unchanged cit_ broker mint (INV2) and the /embed/assistant framing (INV3b)
+// are what remain of the credential + wire path.
 // ---------------------------------------------------------------------------
-const EXPECTED_CONTRACT_VERSIONS = ["v1", "v2"];
-const cvMatch = code.match(/CLIENT_CONTRACT_VERSIONS\s*=\s*\[([^\]]*)\]/);
-let declaredVersions = [];
-if (cvMatch) {
-  declaredVersions = [...cvMatch[1].matchAll(/'([^']+)'|"([^"]+)"/g)].map(
-    (m) => m[1] || m[2],
-  );
-}
-const sortedSet = (a) => [...new Set(a)].sort();
 assert(
-  "CLIENT_CONTRACT_VERSIONS is declared (negotiation path KEPT until AC2)",
-  cvMatch !== null,
-  "no CLIENT_CONTRACT_VERSIONS array found",
+  "4a — no reference to the DELETED /api/agents/{slug}/capabilities route in executable widget code",
+  !/\/capabilities\b/.test(code) && !/\/api\/agents\//.test(code),
+  "the widget references the retired `/capabilities` (or `/api/agents/…`) negotiation route — it was deleted by cinatra#1991; the iframe negotiates against the unified broker now",
 );
 assert(
-  `contract-version SET matches the shared marker {${EXPECTED_CONTRACT_VERSIONS.join(
-    ", ",
-  )}} (order may differ by design)`,
-  JSON.stringify(sortedSet(declaredVersions)) ===
-    JSON.stringify(sortedSet(EXPECTED_CONTRACT_VERSIONS)),
-  `declared {${declaredVersions.join(", ")}} != expected {${EXPECTED_CONTRACT_VERSIONS.join(
-    ", ",
-  )}}`,
+  "4b — the retired shell pre-flight is GONE (no CLIENT_CONTRACT_VERSIONS)",
+  !/\bCLIENT_CONTRACT_VERSIONS\b/.test(code),
+  "CLIENT_CONTRACT_VERSIONS reappeared — the shell no longer negotiates a client-side contract version (the iframe owns the AG-UI handshake); re-adding it is a dual-path regression",
 );
-// The negotiation entry point itself must remain (mount HARD PREREQUISITE).
 assert(
-  "negotiateCapabilities() is present (mount hard-prerequisite, KEPT until AC2)",
-  /function\s+negotiateCapabilities\b/.test(code),
-  "negotiateCapabilities() was removed — negotiation is kept until AC2 lands everywhere",
+  "4b — the retired shell pre-flight is GONE (no negotiateCapabilities)",
+  !/\bnegotiateCapabilities\b/.test(code),
+  "negotiateCapabilities() reappeared — the shell mounts unconditionally now (login-gated); the capability handshake runs inside the /embed/assistant iframe",
 );
 
 // ---------------------------------------------------------------------------

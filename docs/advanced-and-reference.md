@@ -33,14 +33,16 @@ redirect flow is not usable.
 
 ## The plugin–core contract
 
-At boot, the widget negotiates a contract version with the instance by calling
-the capabilities endpoint. The widget understands both the current and previous
-contract versions; the instance advertises what it supports, and the widget picks
-the newest mutually-supported version. Server-side token exchange is always
-required — an instance that cannot mint short-lived tokens, or that offers no
-mutually-supported version, causes the widget to show fallback chrome instead of
-mounting. This is why the integration degrades gracefully against an un-upgraded
-instance.
+The assistant conversation renders inside a sandboxed, Cinatra-served
+`/embed/assistant` iframe. The AG-UI capability/contract handshake runs
+client-side **inside that iframe** against the unified assistant broker
+(`GET /api/assistants/chat/capabilities`), and the conversational wire is
+`POST /api/assistants/chat`. The shell no longer pre-flight-negotiates a contract
+version; it mounts unconditionally (login-gated) and mints the short-lived `cit_`
+site token through the same-origin PHP broker. Server-side token exchange is
+always required — the browser never holds a long-lived key. The legacy
+`/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
+relay were retired (cinatra#1991); a pre-cutover instance is no longer supported.
 
 ## REST surface (high level)
 

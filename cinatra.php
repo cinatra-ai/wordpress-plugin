@@ -1445,8 +1445,6 @@ function cinatra_enqueue_widget(): void {
 			'i18n'       => array(
 				'noUrl'             => __( 'No Cinatra instance URL is configured.', 'cinatra' ),
 				'reachableNoWidget' => __( 'Cinatra is reachable but the widget has not loaded yet. Try refreshing the page.', 'cinatra' ),
-				/* translators: %s: HTTP status code */
-				'httpStatus'        => __( 'Cinatra returned HTTP %s. Check your instance.', 'cinatra' ),
 				/* translators: %s: instance URL */
 				'unreachable'       => __( 'Cannot reach %s. Check that your Cinatra instance is running.', 'cinatra' ),
 			),
@@ -2961,8 +2959,12 @@ function cinatra_mcp_content_server_permission( $request ): bool { // phpcs:igno
 }
 
 /**
- * Agent slug for the WordPress content-editor assistant. The token + stream +
- * capabilities endpoints all live under /api/agents/{slug}/ on the instance.
+ * Agent slug for the WordPress content-editor assistant. The short-lived cit_
+ * token is minted at /api/agents/{slug}/token on the instance (unchanged by the
+ * S5 unified-broker cutover, cinatra#1221). The legacy /capabilities negotiation
+ * and /stream relay under /api/agents/{slug}/ were deleted (cinatra#1991); the
+ * conversation now runs against the unified broker (POST /api/assistants/chat)
+ * inside the /embed/assistant iframe.
  */
 const CINATRA_AGENT_SLUG = 'wordpress-content-editor';
 
