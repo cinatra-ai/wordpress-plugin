@@ -3724,3 +3724,392 @@ function cinatra_emit_post_published( $new_status, $old_status, $post ): void {
 }
 add_action( 'transition_post_status', 'cinatra_emit_post_published', 10, 3 );
 
+// ---------------------------------------------------------------------------
+// S6 — integrated-render review: server-emitted region anchors + an
+// authenticated preview URL (cinatra-ai/cinatra#2044, plugin half).
+//
+// Two host-facing capabilities, kept deliberately narrow:
+//
+// 1. REGION ANCHORS. The reviewer surface highlights the site's OWNED regions
+// (the scope-manifest fields: title / content / excerpt) inside the captured
+// page. Anchors come EXCLUSIVELY from this adapter — never reviewer-side CSS
+// guessing (issue #2044). They are emitted at the content-filter level
+// (the_title / the_content / the_excerpt) as invisible `data-cinatra-region`
+// attributes, and ONLY while THIS plugin is rendering the previewed post
+// (the `cinatra_preview_target` render flag is set). A normal front-end
+// visitor never sets that flag, so the public page is byte-identical to
+// before — no visual change, no DOM change, no unpublished data. This is the
+// safe alternative to always-wrapping the_title (which fires for nav-menu
+// items, widget titles, etc. and would inject markup site-wide).
+//
+// 2. AUTHENTICATED PREVIEW URL. A host-callable REST route,
+// GET /wp-json/cinatra/v1/preview/<id>, returns the FULLY RENDERED page for
+// a post — INCLUDING draft / pending / future — with the region anchors
+// present, so the host's capture pipeline can screenshot the staged page.
+// It is authenticated with the SAME connect-provisioned shared credential
+// the publish emitter already uses: the Standard-Webhooks secret paired at
+// connect time (`cinatra_webhook_secret`). The host proves knowledge of that
+// secret with an HMAC signature over the request (webhook-id /
+// webhook-timestamp / webhook-signature headers, verified byte-for-byte by
+// the SAME cinatra_webhook_sign() used outbound) — the secret itself is
+// never transmitted, and the comparison is constant-time. No valid signature
+// (or the site is not host-connected) => the permission callback denies and
+// WordPress returns 401 before any draft is loaded. This reuses the ESTABLISHED
+// host<->plugin auth from prior waves rather than inventing a new credential:
+// the browser-facing short-lived `cit_` site token is host-ISSUED and cannot
+// be verified plugin-side, whereas the webhook secret is the one credential
+// both ends already share and the plugin can verify locally.
+// ---------------------------------------------------------------------------
+
+/**
+ * The scope-manifest field names this adapter owns and anchors. These are the
+ * exact `data-cinatra-region` values the reviewer surface keys on.
+ */
+const CINATRA_PREVIEW_REGION_TITLE   = 'title';
+const CINATRA_PREVIEW_REGION_CONTENT = 'content';
+const CINATRA_PREVIEW_REGION_EXCERPT = 'excerpt';
+
+/**
+ * Replay/freshness window (seconds) for a signed preview request, mirroring the
+ * Standard-Webhooks recommended tolerance the host signs with.
+ */
+const CINATRA_PREVIEW_TS_TOLERANCE = 300;
+
+/**
+ * The id of the post currently being rendered by the authenticated preview
+ * endpoint, or 0 when not in a preview render. Read by the anchor filters so
+ * they stay INERT on every normal front-end request (no visitor-visible change).
+ *
+ * @return int
+ */
+function cinatra_preview_target(): int {
+	return (int) ( $GLOBALS['cinatra_preview_target'] ?? 0 );
+}
+
+/**
+ * Title-region anchor (the_title filter): wrap ONLY the previewed post's title
+ * in a title-region anchor, and ONLY during a preview render. Guarded on the id so the many
+ * other the_title callers (nav-menu items, widget titles, adjacent-post links)
+ * are never wrapped. Idempotent and inert outside preview.
+ *
+ * @param string   $title The post title.
+ * @param int|null $id    The post id the title belongs to (the_title's 2nd arg).
+ * @return string
+ */
+function cinatra_anchor_the_title( $title, $id = null ) {
+	$target = cinatra_preview_target();
+	if ( 0 === $target || (int) $id !== $target ) {
+		return $title;
+	}
+	if ( false !== strpos( (string) $title, 'data-cinatra-region="' . CINATRA_PREVIEW_REGION_TITLE . '"' ) ) {
+		return $title; // already anchored — deterministic, no double-wrap.
+	}
+	return sprintf(
+		'<span class="cinatra-region" data-cinatra-region="%1$s" data-cinatra-post="%2$d">%3$s</span>',
+		esc_attr( CINATRA_PREVIEW_REGION_TITLE ),
+		$target,
+		$title
+	);
+}
+
+/**
+ * Content-region anchor (the_content filter): wrap the previewed post's rendered content in a
+ * content-region anchor, ONLY during a preview render and ONLY for the target
+ * post (guarded on the global post id). Runs late so it wraps the fully-formed
+ * content. Idempotent and inert outside preview.
+ *
+ * @param string $content The rendered post content.
+ * @return string
+ */
+function cinatra_anchor_the_content( $content ) {
+	$target = cinatra_preview_target();
+	if ( 0 === $target ) {
+		return $content;
+	}
+	$post = get_post();
+	if ( ! ( $post instanceof WP_Post ) || (int) $post->ID !== $target ) {
+		return $content;
+	}
+	if ( false !== strpos( (string) $content, 'data-cinatra-region="' . CINATRA_PREVIEW_REGION_CONTENT . '"' ) ) {
+		return $content;
+	}
+	return sprintf(
+		'<div class="cinatra-region" data-cinatra-region="%1$s" data-cinatra-post="%2$d">%3$s</div>',
+		esc_attr( CINATRA_PREVIEW_REGION_CONTENT ),
+		$target,
+		$content
+	);
+}
+
+/**
+ * Excerpt-region anchor (the_excerpt filter): wrap the previewed post's excerpt in an excerpt-region
+ * anchor, ONLY during a preview render and ONLY for the target post. Idempotent
+ * and inert outside preview.
+ *
+ * @param string $excerpt The rendered post excerpt.
+ * @return string
+ */
+function cinatra_anchor_the_excerpt( $excerpt ) {
+	$target = cinatra_preview_target();
+	if ( 0 === $target ) {
+		return $excerpt;
+	}
+	$post = get_post();
+	if ( ! ( $post instanceof WP_Post ) || (int) $post->ID !== $target ) {
+		return $excerpt;
+	}
+	if ( false !== strpos( (string) $excerpt, 'data-cinatra-region="' . CINATRA_PREVIEW_REGION_EXCERPT . '"' ) ) {
+		return $excerpt;
+	}
+	return sprintf(
+		'<div class="cinatra-region" data-cinatra-region="%1$s" data-cinatra-post="%2$d">%3$s</div>',
+		esc_attr( CINATRA_PREVIEW_REGION_EXCERPT ),
+		$target,
+		$excerpt
+	);
+}
+
+// Registered globally but INERT unless a preview render sets the target flag, so
+// there is zero effect on a normal front-end request. Late priority on content/
+// excerpt so anchors wrap the finished markup.
+add_filter( 'the_title', 'cinatra_anchor_the_title', 20, 2 );
+add_filter( 'the_content', 'cinatra_anchor_the_content', 999 );
+add_filter( 'the_excerpt', 'cinatra_anchor_the_excerpt', 999 );
+
+/**
+ * Permission callback for the preview route. Authenticates a HOST call with the
+ * connect-provisioned Standard-Webhooks shared secret: the host signs the
+ * canonical content "preview.<id>" and presents webhook-id / webhook-timestamp /
+ * webhook-signature headers; we recompute with cinatra_webhook_sign() and
+ * constant-time compare. Fails CLOSED — an unconnected site (no secret), a
+ * missing/stale/forged signature, or a malformed stored secret all deny, so
+ * WordPress returns 401 before any draft is loaded.
+ *
+ * @param WP_REST_Request $request The incoming request.
+ * @return bool True only for a verified host signature.
+ */
+function cinatra_preview_authorize( WP_REST_Request $request ): bool {
+	$secret = (string) get_option( 'cinatra_webhook_secret', '' );
+	if ( '' === $secret ) {
+		return false; // Site not host-connected: there is no preview credential.
+	}
+
+	$id_hdr  = (string) $request->get_header( 'webhook-id' );
+	$ts_hdr  = (string) $request->get_header( 'webhook-timestamp' );
+	$sig_hdr = (string) $request->get_header( 'webhook-signature' );
+	if ( '' === $id_hdr || '' === $ts_hdr || '' === $sig_hdr || ! ctype_digit( $ts_hdr ) ) {
+		return false;
+	}
+
+	$timestamp = (int) $ts_hdr;
+	if ( abs( time() - $timestamp ) > CINATRA_PREVIEW_TS_TOLERANCE ) {
+		return false; // Outside the freshness window — reject a replay.
+	}
+
+	$post_id = (int) $request->get_param( 'id' );
+	if ( $post_id <= 0 ) {
+		return false;
+	}
+
+	// The signed content binds the signature to THIS post id: a signature minted
+	// for one post cannot be replayed against another.
+	$expected = cinatra_webhook_sign( $secret, $id_hdr, $timestamp, 'preview.' . $post_id );
+	if ( null === $expected ) {
+		return false; // Malformed stored secret — fail closed, never guess.
+	}
+
+	// Standard-Webhooks permits a space-separated list of "vN,<base64>" values.
+	foreach ( explode( ' ', $sig_hdr ) as $candidate ) {
+		if ( '' !== $candidate && hash_equals( $expected, $candidate ) ) {
+			// SINGLE-USE (best-effort): consume the webhook-id so a captured
+			// request replayed SEQUENTIALLY is rejected inside the freshness
+			// window. This is a read-only GET over TLS that only re-renders the
+			// same draft, so the freshness window (300s) + transport is the
+			// primary replay bound; the transient consume-once is added hardening.
+			// The check→set is not cross-process atomic without a persistent
+			// object cache (where wp_cache/transient add IS atomic), so a
+			// simultaneous double-replay could still slip through — an accepted,
+			// low-severity residual for a side-effect-free render. The host mints
+			// a fresh id per attempt (like the outbound publish emitter), so a
+			// legitimate retry is unaffected.
+			$replay_key = 'cinatra_preview_seen_' . substr( hash( 'sha256', $id_hdr ), 0, 40 );
+			if ( '' !== (string) get_transient( $replay_key ) ) {
+				return false; // Already consumed — reject the replay.
+			}
+			set_transient( $replay_key, '1', CINATRA_PREVIEW_TS_TOLERANCE );
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Render a post (any status — draft/pending/future included) to a full HTML
+ * page with the owned regions anchored. Sets the preview render flag for the
+ * duration so the anchor filters activate for exactly this post, then restores
+ * the previous global state. Theme header/footer are included as NON-decisional
+ * context when the theme provides them (opt-out via the
+ * `cinatra_preview_include_theme_chrome` filter); when it does not, a clean,
+ * deterministic standalone document is returned so the capture is stable.
+ *
+ * @param WP_Post $post The post to render.
+ * @return string The rendered HTML page.
+ */
+function cinatra_preview_render_post( WP_Post $post ): string {
+	$prev_post                         = $GLOBALS['post'] ?? null;
+	$prev_target                       = $GLOBALS['cinatra_preview_target'] ?? 0;
+	$GLOBALS['post']                   = $post; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- Deliberately scope the global post to the previewed post so the_content/the_excerpt anchor the right region; restored below.
+	$GLOBALS['cinatra_preview_target'] = (int) $post->ID;
+
+	// try/finally so a thrown theme/filter hook can NEVER leave the render flag
+	// or the global post contaminated for the rest of the request (which would
+	// leak anchors into a later render). Restoration always runs.
+	try {
+		$title   = apply_filters( 'the_title', $post->post_title, $post->ID );
+		$content = apply_filters( 'the_content', $post->post_content );
+		$excerpt = apply_filters( 'the_excerpt', $post->post_excerpt );
+
+		$body  = sprintf(
+			'<article class="cinatra-preview" data-cinatra-preview-post="%1$d" data-cinatra-preview-status="%2$s">',
+			(int) $post->ID,
+			esc_attr( (string) $post->post_status )
+		);
+		$body .= '<h1 class="cinatra-preview-title">' . $title . '</h1>';
+		$body .= '<div class="cinatra-preview-content">' . $content . '</div>';
+		if ( '' !== trim( (string) $post->post_excerpt ) ) {
+			$body .= '<div class="cinatra-preview-excerpt">' . $excerpt . '</div>';
+		}
+		$body .= '</article>';
+
+		// Best-effort theme chrome as non-decisional context. Buffered so a theme
+		// notice/echo can't corrupt the page boundary; degrades to a clean document
+		// when the theme provides nothing (or is disabled by the filter).
+		$header = '';
+		$footer = '';
+		if ( apply_filters( 'cinatra_preview_include_theme_chrome', true ) && function_exists( 'get_header' ) && function_exists( 'get_footer' ) ) {
+			ob_start();
+			get_header();
+			$header = (string) ob_get_clean();
+			ob_start();
+			get_footer();
+			$footer = (string) ob_get_clean();
+		}
+
+		if ( '' !== $header || '' !== $footer ) {
+			return $header . $body . $footer;
+		}
+
+		return "<!DOCTYPE html>\n"
+			. '<html><head><meta charset="utf-8">'
+			. '<meta name="robots" content="noindex, nofollow">'
+			. '<title>' . esc_html( wp_strip_all_tags( (string) $post->post_title ) ) . '</title>'
+			. '</head><body>' . $body . '</body></html>';
+	} finally {
+		$GLOBALS['cinatra_preview_target'] = $prev_target;
+		$GLOBALS['post']                   = $prev_post; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- Restore the global post captured above; always runs.
+	}
+}
+
+/**
+ * REST callback for the authenticated preview route. Auth is already enforced by
+ * cinatra_preview_authorize(); here we load the post (any status), reject
+ * non-previewable objects (missing / revision / autosave / non-public type), and
+ * return the fully rendered, anchored page. The raw HTML is served as text/html
+ * by cinatra_preview_serve_html() below; the structured payload is the carrier.
+ *
+ * @param WP_REST_Request $request The incoming request.
+ * @return WP_REST_Response|WP_Error
+ */
+function cinatra_rest_render_preview( WP_REST_Request $request ) {
+	$post_id = (int) $request->get_param( 'id' );
+	$post    = get_post( $post_id );
+	if ( ! ( $post instanceof WP_Post ) ) {
+		return new WP_Error( 'cinatra_preview_not_found', __( 'Post not found.', 'cinatra' ), array( 'status' => 404 ) );
+	}
+	if ( wp_is_post_revision( $post ) || wp_is_post_autosave( $post ) ) {
+		return new WP_Error( 'cinatra_preview_not_previewable', __( 'This object cannot be previewed.', 'cinatra' ), array( 'status' => 404 ) );
+	}
+	$type_object = get_post_type_object( $post->post_type );
+	if ( null === $type_object || empty( $type_object->public ) ) {
+		return new WP_Error( 'cinatra_preview_not_previewable', __( 'This post type cannot be previewed.', 'cinatra' ), array( 'status' => 404 ) );
+	}
+
+	$html = cinatra_preview_render_post( $post );
+
+	$response = new WP_REST_Response(
+		array(
+			'cinatra_preview_html' => $html,
+			'postId'               => (int) $post->ID,
+			'postStatus'           => (string) $post->post_status,
+			'regions'              => array(
+				CINATRA_PREVIEW_REGION_TITLE,
+				CINATRA_PREVIEW_REGION_CONTENT,
+				CINATRA_PREVIEW_REGION_EXCERPT,
+			),
+		)
+	);
+	return $response;
+}
+
+/**
+ * Serve the preview route as raw text/html (a screenshot-able page) instead of a
+ * JSON envelope. Scoped strictly to the preview route AND to a response carrying
+ * the `cinatra_preview_html` marker, so no other REST response is affected.
+ *
+ * @param bool             $served  Whether the request has already been served.
+ * @param WP_REST_Response $result  The response object.
+ * @param WP_REST_Request  $request The request object.
+ * @return bool True when we served the raw HTML.
+ */
+function cinatra_preview_serve_html( $served, $result, $request ) {
+	if ( $served || ! ( $result instanceof WP_REST_Response ) || ! ( $request instanceof WP_REST_Request ) ) {
+		return $served;
+	}
+	// Match the EXACT preview route only (not a mere prefix), so a future sibling
+	// route under the same namespace can never be captured by this handler.
+	if ( ! preg_match( '#^/cinatra/v1/preview/\d+$#', (string) $request->get_route() ) ) {
+		return $served;
+	}
+	$data = $result->get_data();
+	if ( ! is_array( $data ) || ! isset( $data['cinatra_preview_html'] ) ) {
+		return $served;
+	}
+	if ( ! headers_sent() ) {
+		header( 'Content-Type: text/html; charset=utf-8' );
+		header( 'X-Robots-Tag: noindex, nofollow' );
+		header( 'Cache-Control: no-store, private' );
+	}
+	// The payload is a full post render produced through the same the_content /
+	// the_title / the_excerpt filter chain that renders the public page; it is
+	// the page markup itself, so it is emitted verbatim (escaping it again would
+	// double-encode the very HTML the capture pipeline must screenshot).
+	echo $data['cinatra_preview_html']; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Rendered post markup from the the_content/the_title/the_excerpt filter chain (identical trust boundary to a normal front-end template render); re-escaping would corrupt the captured page.
+	return true;
+}
+add_filter( 'rest_pre_serve_request', 'cinatra_preview_serve_html', 10, 3 );
+
+add_action(
+	'rest_api_init',
+	function () {
+		register_rest_route(
+			'cinatra/v1',
+			'/preview/(?P<id>\d+)',
+			array(
+				'methods'             => 'GET',
+				'callback'            => 'cinatra_rest_render_preview',
+				'permission_callback' => 'cinatra_preview_authorize',
+				'args'                => array(
+					'id' => array(
+						'required'          => true,
+						'type'              => 'integer',
+						'sanitize_callback' => 'absint',
+						'validate_callback' => function ( $value ) {
+							return ctype_digit( (string) $value ) && (int) $value > 0;
+						},
+					),
+				),
+			)
+		);
+	}
+);
+
