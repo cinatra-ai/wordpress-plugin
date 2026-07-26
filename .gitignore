@@ -1,6 +1,9 @@
 # Dependencies
 /vendor/
 
+# Build output (wp.org SVN layout + release zip from bin/build-wporg.sh)
+/build/
+
 # Logs
 *.log
 
@@ -11,3 +14,5 @@
 .idea/
 .vscode/
 .planning/
+# Superpowers planning/design artifacts (local-only)
+docs/superpowers/

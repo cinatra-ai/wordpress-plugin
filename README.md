@@ -1,42 +1,146 @@
-# Cinatra — WordPress plugin
+# Cinatra for WordPress
 
-Embeds the [Cinatra](https://cinatra.ai) AI assistant in the WordPress admin so
-editors can draft and revise content with an in-context chat assistant. The
-plugin talks to your Cinatra instance over HTTP only — it bundles no Cinatra
-code (Apache-2.0 ↔ GPL-2.0-or-later HTTP boundary).
+Embeds the [Cinatra](https://cinatra.ai) AI assistant in your WordPress admin
+so content editors and administrators can draft, rewrite, and improve content in
+a chat panel right where they work. The assistant talks to your own Cinatra
+instance — you choose which one, and all traffic runs over HTTP only. Access is
+restricted to WordPress administrators (`manage_options` capability).
 
-## What it does
+## Documentation
 
-- Adds a floating assistant button in the WordPress admin that opens a chat panel.
-- Loads the assistant bundle from `{your-cinatra-url}/api/wordpress/bundle.js`.
+The canonical documentation for this integration is the WordPress hub on
+docs.cinatra.ai: **https://docs.cinatra.ai/integrations/wordpress/**. It is the
+six-part hub (Overview, Quick start, Use it, Settings & permissions,
+Troubleshooting, Advanced & reference) and is published from this repository's
+[`docs/`](docs/) folder at each release.
+
+## Works with
+
+- WordPress (5.9 or later; tested up to 7.0)
+- Your self-hosted or cloud Cinatra instance
+- [WordPress MCP Adapter](https://github.com/WordPress/mcp-adapter) (optional
+  companion — required only for AI content-editing tools)
+
+## Capabilities
+
+- Adds a floating assistant button in the WordPress admin that opens a chat
+  panel.
+- Ships the assistant widget JavaScript **locally** (`assets/cinatra-widget.js`,
+  served via `plugins_url()`) — no executable code is fetched from a remote
+  server at runtime.
+- Keeps the long-lived integration key on the server. A server-side REST
+  endpoint (`/wp-json/cinatra/v1/token`, gated to `manage_options` + a
+  `wp_rest` nonce) performs a server-to-server exchange with the instance and
+  hands the browser only a short-lived, scope-bound stream token. The
+  integration key never reaches the browser.
+- Negotiates capabilities and contract version with the instance at boot and
+  degrades gracefully against older instances.
 - Provides a webhook-subscription REST registry (`/wp-json/cinatra/v1/webhooks`)
-  and stores an HMAC secret that Cinatra uses to sign the `X-Cinatra-Sig-256`
-  header on webhook requests it sends to this site.
-- Exposes a **Settings → Cinatra** admin page for the Cinatra URL, API key,
-  agent instance ID, and webhook secret.
+  that enables `post_published` notifications per post type. When a post is
+  published, the plugin signs the notification as a
+  [Standard-Webhooks](https://www.standardwebhooks.com/) request and delivers it
+  to the connected Cinatra instance's generic webhook endpoint, using a signing
+  secret and webhook binding id issued by the instance during Connect (there is
+  nothing to paste manually; reconnect once after upgrading to provision them).
+  The plugin sends outbound signed webhooks; it does not receive or verify
+  inbound webhooks.
+- Offers one-click **Connect with Cinatra** provisioning: an admin enters the
+  instance URL and approves a consent screen; the site exchanges an
+  authorization code (PKCE S256) server-side at `/api/connect/token` and stores
+  the credential server-side — no key is copy-pasted or exposed to the browser.
+  A connection-string (install-code) fallback is available.
+- Exposes a **Settings → Cinatra** admin page for Connect, plus manual/advanced
+  fields for the Cinatra URL, API key, and agent instance ID. (The webhook
+  signing credentials are provisioned by Connect and are not manually
+  editable.)
 
-## Install (end users)
+## Install
 
-1. Install & activate the plugin (from WordPress.org once published, or upload the zip).
-2. (Recommended) Install the WordPress MCP Adapter plugin for AI tool access.
-3. In Cinatra, open `/settings/connectors/wordpress-widget` and generate credentials.
-4. In WordPress, open **Settings → Cinatra** and paste the Cinatra URL, API key,
-   agent instance ID, and webhook secret. Save.
+1. Install and activate the plugin (from WordPress.org once published, or upload
+   the zip).
+2. (Recommended) Install the [WordPress MCP Adapter](https://github.com/WordPress/mcp-adapter/releases/latest)
+   for AI content-editing tools. The adapter is distributed via GitHub Releases;
+   download the ZIP and install it from **Plugins → Add New → Upload Plugin**.
+3. In WordPress, open **Settings → Cinatra**, enter your Cinatra instance URL,
+   and click **Connect with Cinatra**.
+4. Approve the connection on the Cinatra consent screen. The credential is
+   provisioned and stored automatically — no manual key entry is needed.
+   (Advanced: manual fields remain available for environments where Connect is
+   not used.)
+
+The Settings → Cinatra page shows a status indicator for the MCP Adapter and
+links to the GitHub release if it is not active.
 
 ## Plugin ↔ core contract
 
-The plugin sends `contractVersion: "v1"` in its bootstrap. Cinatra validates it
-and rejects unknown versions with an admin-visible error. The contract schemas
-live in the cinatra repo under `contracts/wp-drupal-assistant/`.
+The assistant conversation renders inside a sandboxed, Cinatra-served
+`/embed/assistant` iframe that the widget frames as the sole session owner. The
+AG-UI capability/contract handshake runs **client-side inside that iframe**
+against the unified assistant broker (`GET /api/assistants/chat/capabilities`,
+using the short-lived `cit_`/`cwu_` broker tokens), and the conversational wire
+is `POST /api/assistants/chat`. The shell no longer pre-flight-negotiates a
+contract version; it mounts unconditionally (login-gated) and mints the
+short-lived `cit_` site token through the same-origin PHP broker. The
+token-exchange contract schemas live in the cinatra repository under
+`contracts/wp-drupal-assistant/`.
+
+> Requires the matching Cinatra instance changes for the token-exchange
+> (`/api/agents/{slug}/token`), the unified assistant broker
+> (`POST /api/assistants/chat` + `GET /api/assistants/chat/capabilities`), and
+> one-click connect (`/connect/authorize` + `/api/connect/token`) endpoints. The
+> legacy `/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
+> relay were retired (cinatra#1991); a pre-cutover instance is no longer supported.
 
 ## Development
 
-This repo is the source of truth for the plugin. Cinatra developers consume it
-as a local clone for the dev docker stack. See
-<https://docs.cinatra.ai/guides/developer/wp-drupal-plugin-development/> for the
-multi-repo workflow, the contract-version bump checklist, and dirty-tree
-recovery.
+### Requirements
+
+- PHP 7.4 or later
+- [Composer](https://getcomposer.org/)
+- WordPress 5.9 or later (for local testing)
+
+### Setup
+
+```sh
+git clone https://github.com/cinatra-ai/wordpress-plugin
+cd wordpress-plugin
+composer install
+```
+
+### Linting
+
+```sh
+composer lint          # PHP_CodeSniffer with WordPress Coding Standards
+```
+
+The project uses [PHP_CodeSniffer](https://github.com/squizlabs/PHP_CodeSniffer)
+with `wp-coding-standards/wpcs` and `phpcompatibility/phpcompatibility-wp`.
+The ruleset is in `phpcs.xml.dist`.
+
+### Tests
+
+```sh
+node tools/generate-wordpress-org-assets.mjs   # regenerate .wordpress-org assets (see .wordpress-org/README.md for prerequisites)
+node tests/test-widget-negotiation.mjs         # widget bootstrap negotiation tests
+php tests/test-token-broker.php                # token-broker unit tests
+php tests/test-publish-emitter.php             # publish-emitter unit tests
+```
+
+### Regenerating WordPress.org assets
+
+The banner and icon images in `.wordpress-org/` are generated deterministically
+from the Cinatra design system. See [`.wordpress-org/README.md`](.wordpress-org/README.md)
+for full instructions.
+
+### Releasing
+
+The plugin is released to WordPress.org via the SVN deploy workflow. Bump the
+`Stable tag` in `readme.txt` and the `Version` in `cinatra.php`, then push the
+tag. See the repo's release workflow for the full steps.
 
 ## License
 
-GPL-2.0-or-later. See [LICENSE](LICENSE).
+GPL-2.0-or-later. See [LICENSE](LICENSE). The bundled assistant widget
+(`assets/cinatra-widget.js`) is derived from the Cinatra project under
+Apache-2.0 (see the file's SPDX header and [NOTICE](NOTICE));
+the plugin as a whole remains GPL-2.0-or-later.

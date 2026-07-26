@@ -1,0 +1,25 @@
+name: docs-contract-gate
+
+# Validates this repo's docs/ against the integration docs contract BEFORE a
+# release can publish. The reusable gate lives in cinatra-ai/ci (the same gate
+# the docs publish path runs at compile time), so this repo's per-repo docs stay
+# consistent with the contract without central control.
+#
+# Both the workflow ref (`@<sha>`) and the `ref` input are pinned to the SAME
+# cinatra-ai/ci commit SHA, so the gate code is not pulled from mutable main.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-contract-gate:
+    uses: cinatra-ai/ci/.github/workflows/docs-contract-gate.yml@1e0b01d53cecb920550e92370f4f2b41f2eca997 # v0.1.0
+    with:
+      docs: "docs"
+      slug: "wordpress"
+      ref: 1e0b01d53cecb920550e92370f4f2b41f2eca997

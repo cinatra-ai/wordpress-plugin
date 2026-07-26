@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<ruleset name="Cinatra WordPress plugin">
+    <description>
+        WordPress Coding Standards + PHPCompatibilityWP for the Cinatra plugin.
+        Informational until the initial findings are triaged (see the gating
+        follow-up issue). Scope: tracked first-party PHP only.
+    </description>
+
+    <!-- Tracked first-party PHP files. -->
+    <file>cinatra.php</file>
+    <file>uninstall.php</file>
+
+    <!-- Never scan dependencies or test stubs. -->
+    <exclude-pattern>*/vendor/*</exclude-pattern>
+    <exclude-pattern>*/node_modules/*</exclude-pattern>
+    <exclude-pattern>*/tests/*</exclude-pattern>
+
+    <!-- WordPress Coding Standards. -->
+    <rule ref="WordPress"/>
+
+    <!-- PHP cross-version compatibility down to the declared minimum (7.4). -->
+    <rule ref="PHPCompatibilityWP"/>
+    <config name="testVersion" value="7.4-"/>
+
+    <!-- Plugin text domain (so i18n sniffs validate against the right domain). -->
+    <rule ref="WordPress.WP.I18n">
+        <properties>
+            <property name="text_domain" type="array">
+                <element value="cinatra"/>
+            </property>
+        </properties>
+    </rule>
+
+    <arg name="extensions" value="php"/>
+    <arg value="ps"/>
+    <arg name="colors"/>
+</ruleset>
