@@ -1,12 +1,18 @@
 name: docs-meta-commentary
 
 # Runs the reusable meta-commentary gate (cinatra-ai/ci) against this repo's
-# published Markdown surfaces — the docs/ tree plus the top-level README.md:
-# fails a PR when a published, user-facing page carries meta/implementation
-# commentary about how the docs THEMSELVES are produced — generation mechanics,
+# published Markdown surfaces — the docs/ tree, the top-level README.md, and the
+# WordPress.org listing copy in .wordpress-org/README.md: fails a PR when a
+# published, user-facing page carries meta/implementation commentary about how
+# the docs or the listing assets THEMSELVES are produced — generation mechanics,
 # "forthcoming"/placeholder transition notes, editorial TODOs, and the like.
 # Wires cinatra-ai/docs#119 into this repo, widened to the multi-path scan set
 # from cinatra-ai/docs#156 (README.md is published surface too).
+#
+# .wordpress-org/ is staged listing copy for wordpress.org/plugins/cinatra/, so
+# it is gated as a published surface rather than exempted as maintainer-only
+# (cinatra-ai/docs#156 AC5): asset-production notes there are removed, not
+# allowlisted.
 #
 # Structured like the sibling docs-contract-gate.yml caller: both the workflow
 # ref (`@<sha>`) and the `ref` input are pinned to the SAME cinatra-ai/ci commit
@@ -27,4 +33,5 @@ jobs:
       paths: |
         docs
         README.md
+        .wordpress-org/README.md
       ref: 0a0152451b3a5bd80a47e728b38a46e65a2faa32
