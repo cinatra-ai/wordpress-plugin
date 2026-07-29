@@ -369,6 +369,7 @@ function cinatra_render_settings_page() {
 		</div>
 
 		<?php cinatra_render_setup_checklist(); ?>
+		<?php cinatra_render_installer_actions(); ?>
 
 		<h2><?php echo esc_html__( 'Advanced / manual configuration', 'cinatra' ); ?></h2>
 		<p class="description"><?php echo esc_html__( 'Most sites should use Connect above. These fields let you set or override the connection manually.', 'cinatra' ); ?></p>
@@ -1271,6 +1272,603 @@ function cinatra_connect_apply_result( array $result ): void {
 	// instance keeps its working pair; a changed instance was already cleared
 	// by the option hooks).
 	cinatra_set_connect_result( 'success', __( 'Connected to Cinatra. The integration credential is stored on this server.', 'cinatra' ) );
+}
+
+// ---------------------------------------------------------------------------
+// One-click plugin installer (cinatra-ai/cinatra#2021 S6, PR zeta).
+//
+// This is the plugin's FIRST-EVER code that WRITES to the site's own plugin
+// directory (installing/activating a plugin) rather than reading from or
+// relaying through WordPress -- a new, higher-trust capability, not a variant
+// of an existing one. See the CODEOWNERS entry on this file (cinatra-ai/
+// wordpress-plugin#99): a human reviewer is structurally required on any
+// change in this region, not just conventionally requested.
+//
+// Two independent install flows, both reachable ONLY from a single
+// nonce-protected admin-post handler for an explicit admin form submit --
+// never admin_init, WP-Cron, REST, or AJAX:
+//
+// 1. MCP Adapter (GitHub Releases ZIP, not on wordpress.org) -- a
+// checksum-verified side-load. download_url() -> temp file -> reject a
+// symlinked/escaped path -> hash_file('sha256') against the baked pin
+// below -> a mismatch aborts closed, nothing is installed, ever -> a
+// SECOND hash check immediately before Plugin_Upgrader::install()
+// (closes as much of the TOCTOU window as PHP allows -- see the
+// disclosed residual below) -> a post-install identity check against
+// the same pin before offering activation.
+// 2. Catalog plugin (enable-abilities-for-mcp, wordpress.org) -- the
+// standard plugins_api()+Plugin_Upgrader flow every "Add Plugins" screen
+// in WordPress core uses. No checksum step: wordpress.org's own
+// signed-transport infrastructure is the trust anchor here, not this
+// plugin.
+//
+// DISCLOSED, NOT-CLOSED RESIDUAL (accepted during the design's security review): PHP/Plugin_Upgrader
+// has no atomic "hash-then-use" primitive. A same-host, same-filesystem-user
+// attacker with write access to the WP temp directory could in principle
+// mutate the verified file between the second hash check below and
+// Plugin_Upgrader's own read of it. That attacker already has arbitrary code
+// execution as the webserver user -- a strictly larger compromise than
+// anything this installer could cause -- so it is explicitly out of scope,
+// recorded here rather than silently omitted.
+//
+// Zip-slip / path traversal during extraction is NOT re-implemented here: the
+// installer hands off to WP core's own Plugin_Upgrader::install(), which
+// unpacks via WP core's own unzip_file() -- already hardened against
+// traversal entries. No custom unzip code is written by this plugin.
+//
+// Both flows require current_user_can('install_plugins') AND
+// current_user_can('activate_plugins'), re-checked FRESH in the handler
+// (never cached/inferred from the button's mere presence in the DOM -- a
+// common WP plugin bug class), take a short-lived lock so a double-click is
+// a no-op rather than a race, and audit every outcome (success, checksum
+// failure, identity mismatch, install failure) via an admin-visible notice
+// plus a small bounded log option -- no silent failures.
+// ---------------------------------------------------------------------------
+
+// Pin for the GitHub side-load (D4): release-time-derived from cinatra's own
+// docker/wordpress/pins.lock `mcpAdapter` block -- the SAME canonical pin the
+// cinatra core repo's community-stack Docker image verifies against via
+// `sha256sum -c` -- never an independently-typed literal that could silently
+// drift from what cinatra's own gateway verifies against.
+//
+// Provenance: derived from cinatra-ai/cinatra @
+// db9803e6509384d151af9e7791b7bcea9d2a77cc (the most recent commit to touch
+// that file at pin-bake time). tests/fixtures/pins-lock-mcp-adapter.json is a
+// checked-in fixture copy of the same block; tests/test-installer-pin-provenance.php
+// diffs the two, so drift between them fails the build rather than diverging
+// silently -- bump both, in the SAME reviewed PR, whenever this changes.
+//
+// EMERGENCY-UPDATE POSTURE (owner-ruled, OWNER RULINGS #3 in the design
+// record): a CVE in the MCP Adapter itself has NO automatic remediation in
+// v1 -- pinning to one exact version means the response is always cutting a
+// new companion-plugin release with a new baked pin (never "just follow
+// GitHub latest" silently), reviewed like any other pin bump in this
+// codebase.
+const CINATRA_MCP_ADAPTER_PIN_VERSION           = '0.5.0';
+const CINATRA_MCP_ADAPTER_PIN_URL               = 'https://github.com/WordPress/mcp-adapter/releases/download/v0.5.0/mcp-adapter.zip';
+const CINATRA_MCP_ADAPTER_PIN_SHA256            = 'a13f253c7bf4314b6cce7e238be2d5857eee66242bfe5ff5cb5576f74dc41593';
+const CINATRA_MCP_ADAPTER_PIN_PROVENANCE_COMMIT = 'db9803e6509384d151af9e7791b7bcea9d2a77cc';
+
+// Catalog plugin (wordpress.org) -- slug only, ALWAYS hardcoded, NEVER a
+// user-controlled or remote-controlled value; nothing else about this flow's
+// "identity" needs pinning since wp.org's own transport is the trust anchor.
+const CINATRA_INSTALLER_EAFM_SLUG = 'enable-abilities-for-mcp';
+
+// Install-lock TTL: long enough to cover a full download+verify+install round
+// trip, short enough that a genuinely stuck lock self-clears quickly.
+const CINATRA_INSTALLER_LOCK_TTL          = 90; // Seconds.
+const CINATRA_INSTALLER_RESULT_KEY_PREFIX = 'cinatra_installer_result_';
+const CINATRA_INSTALLER_AUDIT_LOG_OPTION  = 'cinatra_installer_audit_log';
+const CINATRA_INSTALLER_AUDIT_LOG_MAX     = 20; // Bounded -- unbounded-option / DoS guard, same pattern as CINATRA_MAX_WEBHOOK_SUBSCRIPTIONS.
+
+/**
+ * Store a short-lived installer result message for the current user, surfaced
+ * once on the settings page. Mirrors cinatra_set_connect_result()'s shape.
+ *
+ * @param string $type    'success' or 'error'.
+ * @param string $message Human-readable, admin-facing message.
+ * @return void
+ */
+function cinatra_set_installer_result( string $type, string $message ): void {
+	set_transient(
+		CINATRA_INSTALLER_RESULT_KEY_PREFIX . get_current_user_id(),
+		array(
+			'type'    => $type,
+			'message' => $message,
+		),
+		60
+	);
+}
+
+/** Render + clear the one-time installer result notice on the settings page. */
+function cinatra_render_installer_result_notice(): void {
+	$key    = CINATRA_INSTALLER_RESULT_KEY_PREFIX . get_current_user_id();
+	$result = get_transient( $key );
+	if ( ! is_array( $result ) || empty( $result['message'] ) ) {
+		return;
+	}
+	delete_transient( $key );
+	$class = ( 'success' === $result['type'] ) ? 'notice-success' : 'notice-error';
+	printf(
+		'<div class="notice %1$s is-dismissible"><p>%2$s</p></div>',
+		esc_attr( $class ),
+		esc_html( (string) $result['message'] )
+	);
+}
+
+/**
+ * Append one entry to the bounded installer audit log and fire an action hook
+ * for any consuming code (e.g. an ensure-panel "last install attempt" line).
+ * Never logs the download URL, a token, or a credential -- only the flow
+ * name, a fixed-vocabulary outcome, and a short, sanitized detail string.
+ *
+ * @param string $flow    'mcp_adapter' or 'eafm'.
+ * @param string $outcome One of: success, checksum_mismatch, identity_mismatch,
+ *                        path_escape_rejected, download_failed, install_failed,
+ *                        locked.
+ * @param string $detail  Optional short, non-sensitive detail for the log line.
+ * @return void
+ */
+function cinatra_installer_audit_log( string $flow, string $outcome, string $detail = '' ): void {
+	$log   = get_option( CINATRA_INSTALLER_AUDIT_LOG_OPTION, array() );
+	$log   = is_array( $log ) ? $log : array();
+	$log[] = array(
+		'time'    => time(),
+		'user_id' => get_current_user_id(),
+		'flow'    => $flow,
+		'outcome' => $outcome,
+		'detail'  => sanitize_text_field( $detail ),
+	);
+	if ( count( $log ) > CINATRA_INSTALLER_AUDIT_LOG_MAX ) {
+		$log = array_slice( $log, -CINATRA_INSTALLER_AUDIT_LOG_MAX );
+	}
+	update_option( CINATRA_INSTALLER_AUDIT_LOG_OPTION, $log );
+	/**
+	 * Fires after EVERY installer attempt, success or failure (design §3 step
+	 * 10) -- no silent failures. Args match the audit log entry above.
+	 *
+	 * @param string $flow    'mcp_adapter' or 'eafm'.
+	 * @param string $outcome Fixed-vocabulary outcome (see cinatra_installer_audit_log()).
+	 * @param string $detail  Short, sanitized, non-sensitive detail.
+	 */
+	do_action( 'cinatra_installer_attempt', $flow, $outcome, sanitize_text_field( $detail ) );
+}
+
+/**
+ * Take a short-lived install lock so a double form-submit is a no-op rather
+ * than a race on the same temp file / plugin directory.
+ *
+ * DISCLOSED LIMITATION (from the adversarial security review; not a bypass): a
+ * transient backed by the options table is a best-effort duplicate-click
+ * guard, not an atomic distributed lock -- two requests landing in the exact
+ * same instant could both observe "not locked". Worst case is a duplicate
+ * install attempt (each independently capability/nonce/checksum-gated on its
+ * own merits), never a privilege or checksum bypass.
+ *
+ * @param string $flow 'mcp_adapter' or 'eafm'.
+ * @return bool True if the lock was acquired (false = a lock is already held).
+ */
+function cinatra_installer_acquire_lock( string $flow ): bool {
+	$key = 'cinatra_installer_lock_' . $flow;
+	if ( false !== get_transient( $key ) ) {
+		return false;
+	}
+	set_transient( $key, 1, CINATRA_INSTALLER_LOCK_TTL );
+	return true;
+}
+
+/**
+ * Release the install lock. Called on EVERY exit path (success or failure) so
+ * a finished request never leaves a later click waiting out the full TTL.
+ *
+ * @param string $flow 'mcp_adapter' or 'eafm'.
+ * @return void
+ */
+function cinatra_installer_release_lock( string $flow ): void {
+	delete_transient( 'cinatra_installer_lock_' . $flow );
+}
+
+/**
+ * Capability + nonce gate shared by both install handlers. Dies with a 403 on
+ * failure. Re-checked HERE, at the handler, never inferred from render-time
+ * gating alone (a common WP plugin bug class: the install button's mere
+ * presence in the DOM proves nothing about the submitting request).
+ *
+ * @param string $nonce_action The wp_nonce_field() action name for this flow.
+ * @return void
+ */
+function cinatra_installer_require_capability( string $nonce_action ): void {
+	if ( ! current_user_can( 'install_plugins' ) || ! current_user_can( 'activate_plugins' ) ) {
+		wp_die( esc_html__( 'You do not have permission to install plugins on this site.', 'cinatra' ), '', array( 'response' => 403 ) );
+	}
+	check_admin_referer( $nonce_action );
+}
+
+/**
+ * Best-effort temp-file cleanup, called on EVERY exit path so cleanup is
+ * never conditional on which branch (success/failure) was taken. A leftover
+ * temp file in the OS temp dir is not itself a security issue (it is cleaned
+ * up on the next attempt or by OS temp-dir GC), so failures here are swallowed.
+ *
+ * @param string $path Absolute path to the downloaded temp file.
+ * @return void
+ */
+function cinatra_installer_cleanup_tmpfile( string $path ): void {
+	if ( '' !== $path && file_exists( $path ) ) {
+		wp_delete_file( $path ); // WP core wrapper (fires the wp_delete_file filter, then unlinks) -- the WPCS-preferred way to remove a file, over a bare unlink().
+	}
+}
+
+/**
+ * Verify a downloaded temp path is safe to hash/install: rejects a symlinked
+ * temp path outright, and requires realpath() to resolve INSIDE the WP temp
+ * directory (defends against a download helper somehow handing back a path
+ * that escaped the expected directory).
+ *
+ * @param string $path Absolute path to the downloaded temp file.
+ * @return bool True if the path is safe to proceed with.
+ */
+function cinatra_installer_path_is_safe( string $path ): bool {
+	if ( '' === $path || ! file_exists( $path ) || is_link( $path ) ) {
+		return false;
+	}
+	$real = realpath( $path );
+	if ( false === $real ) {
+		return false;
+	}
+	$temp_dir = realpath( get_temp_dir() );
+	if ( false === $temp_dir ) {
+		return false;
+	}
+	// Require $real to be INSIDE $temp_dir via a normalized, trailing-slash-
+	// terminated directory prefix -- NOT a bare substring match, which a
+	// crafted sibling directory name (e.g. "/tmpevil") could defeat.
+	$temp_dir_with_slash = rtrim( $temp_dir, '/\\' ) . DIRECTORY_SEPARATOR;
+	return 0 === strpos( $real, $temp_dir_with_slash );
+}
+
+/**
+ * Verify a local file's sha256 against a pinned value. Used TWICE by the
+ * mcp_adapter flow below (design D3 steps 5 and 6 -- the first check and the
+ * re-hash immediately before install) so a same-request file mutation between
+ * the two calls is independently re-detected, not assumed away.
+ *
+ * $hash_fn is an injectable seam used ONLY by tests (defaults to the real
+ * hash_file()) -- production call sites never pass it.
+ *
+ * @param string        $path            Local file path to verify.
+ * @param string        $expected_sha256 Pinned sha256 to compare against.
+ * @param callable|null $hash_fn         Optional (string $path): string hasher, for tests.
+ * @return bool True if the file's current sha256 matches the pin.
+ */
+function cinatra_installer_verify_checksum( string $path, string $expected_sha256, ?callable $hash_fn = null ): bool {
+	if ( '' === $path || ! file_exists( $path ) ) {
+		return false;
+	}
+	if ( null === $hash_fn ) {
+		$hash_fn = static function ( string $p ): string {
+			return (string) hash_file( 'sha256', $p );
+		};
+	}
+	return hash_equals( $expected_sha256, (string) $hash_fn( $path ) );
+}
+
+/**
+ * Steps 7-9 of the installer flow (D3/§3): hand the package to WP's own
+ * Plugin_Upgrader, optionally verify the installed plugin's own header
+ * against a pinned version (skipped when $expected_version is null -- the
+ * wordpress.org catalog flow has no pin to check, by design), and optionally
+ * activate. No hashing happens in this function -- it is reached only AFTER
+ * the checksum step for the mcp_adapter flow, and not at all for the eafm
+ * flow (which has no checksum step) -- so it is independently testable with
+ * WP_Filesystem/Plugin_Upgrader/get_plugins/activate_plugin stubbed, with no
+ * cryptographic preimage requirement on the test fixtures.
+ *
+ * @param string      $package           Verified local path (mcp_adapter) or a wordpress.org download URL (eafm -- Plugin_Upgrader fetches it itself, no second checksum-relevant network leg for the side-load path either way).
+ * @param string|null $known_plugin_file Plugin file to identity-check + activate, if already known (mcp_adapter's static constant); null lets Plugin_Upgrader::plugin_info() resolve it after install (eafm).
+ * @param string|null $expected_version  Pinned version the installed header must match; null skips the identity check entirely (eafm).
+ * @param bool        $activate          Whether to activate on success.
+ * @return array{ok:bool, outcome:string, detail:string, plugin_file:string}
+ */
+function cinatra_installer_finish_install( string $package, ?string $known_plugin_file, ?string $expected_version, bool $activate ): array {
+	if ( ! class_exists( 'Plugin_Upgrader' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+	}
+	if ( ! class_exists( 'Automatic_Upgrader_Skin' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader-skin.php';
+		require_once ABSPATH . 'wp-admin/includes/class-automatic-upgrader-skin.php';
+	}
+	if ( ! function_exists( 'WP_Filesystem' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+	}
+	if ( ! WP_Filesystem() ) {
+		return array(
+			'ok'          => false,
+			'outcome'     => 'install_failed',
+			'detail'      => 'filesystem_credentials_required',
+			'plugin_file' => '',
+		);
+	}
+
+	$upgrader  = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
+	$installed = $upgrader->install( $package ); // Local path (mcp_adapter) => no second network fetch (WP_Upgrader::download_package() returns an existing local path untouched, D3 step 6/7).
+
+	if ( is_wp_error( $installed ) || true !== $installed ) {
+		return array(
+			'ok'          => false,
+			'outcome'     => 'install_failed',
+			'detail'      => is_wp_error( $installed ) ? $installed->get_error_code() : 'unknown',
+			'plugin_file' => '',
+		);
+	}
+
+	$plugin_file = $known_plugin_file ?? (string) $upgrader->plugin_info();
+	if ( '' === $plugin_file ) {
+		return array(
+			'ok'          => false,
+			'outcome'     => 'install_failed',
+			'detail'      => 'plugin_file_unresolved',
+			'plugin_file' => '',
+		);
+	}
+
+	if ( null !== $expected_version ) {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		$all_plugins       = get_plugins();
+		$installed_version = isset( $all_plugins[ $plugin_file ]['Version'] ) ? (string) $all_plugins[ $plugin_file ]['Version'] : '';
+		if ( $expected_version !== $installed_version ) {
+			// Post-install identity check FAILED: left installed-but-
+			// unactivated for manual inspection -- never auto-removed, never
+			// auto-activated, even though the checksum matched (D3 step 8).
+			return array(
+				'ok'          => false,
+				'outcome'     => 'identity_mismatch',
+				'detail'      => $installed_version,
+				'plugin_file' => $plugin_file,
+			);
+		}
+	}
+
+	if ( ! $activate ) {
+		return array(
+			'ok'          => true,
+			'outcome'     => 'success',
+			'detail'      => 'installed_only',
+			'plugin_file' => $plugin_file,
+		);
+	}
+
+	if ( ! function_exists( 'activate_plugin' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+	$activated = activate_plugin( $plugin_file );
+	if ( is_wp_error( $activated ) ) {
+		return array(
+			'ok'          => false,
+			'outcome'     => 'install_failed',
+			'detail'      => 'activate:' . $activated->get_error_code(),
+			'plugin_file' => $plugin_file,
+		);
+	}
+	return array(
+		'ok'          => true,
+		'outcome'     => 'success',
+		'detail'      => 'activated',
+		'plugin_file' => $plugin_file,
+	);
+}
+
+/**
+ * Handler for the checksum-verified MCP Adapter side-load (D3). Every
+ * download_url()/hash_file()-driven check, the Plugin_Upgrader install call,
+ * and activate_plugin() below are reachable ONLY from this one
+ * nonce-protected admin-post callback for an explicit admin form submit -- no
+ * admin_init, no WP-Cron, no REST callback, no AJAX shortcut reaches any of
+ * this anywhere else in this plugin (tests/test-installer-invariants.php
+ * asserts this statically).
+ */
+add_action(
+	'admin_post_cinatra_install_mcp_adapter',
+	function () {
+		cinatra_installer_require_capability( 'cinatra_install_mcp_adapter' );
+
+		if ( ! cinatra_installer_acquire_lock( 'mcp_adapter' ) ) {
+			cinatra_installer_audit_log( 'mcp_adapter', 'locked' );
+			cinatra_set_installer_result( 'error', __( 'An install is already in progress for the WordPress MCP Adapter. Please wait for it to finish.', 'cinatra' ) );
+			cinatra_connect_redirect_to_settings();
+		}
+
+		$tmpfile = '';
+		try {
+			if ( ! function_exists( 'download_url' ) ) {
+				require_once ABSPATH . 'wp-admin/includes/file.php';
+			}
+			$download = download_url( CINATRA_MCP_ADAPTER_PIN_URL );
+			if ( is_wp_error( $download ) ) {
+				cinatra_installer_audit_log( 'mcp_adapter', 'download_failed', $download->get_error_code() );
+				cinatra_set_installer_result( 'error', __( "Could not download the WordPress MCP Adapter. Check the server's outbound network access and try again.", 'cinatra' ) );
+				return;
+			}
+			$tmpfile = $download;
+
+			if ( ! cinatra_installer_path_is_safe( $tmpfile ) ) {
+				cinatra_installer_audit_log( 'mcp_adapter', 'path_escape_rejected' );
+				cinatra_set_installer_result( 'error', __( 'The downloaded file failed a safety check. Nothing was installed.', 'cinatra' ) );
+				return;
+			}
+
+			// First checksum check (D3 step 5): fail closed -- nothing is
+			// installed on a mismatch, ever.
+			if ( ! cinatra_installer_verify_checksum( $tmpfile, CINATRA_MCP_ADAPTER_PIN_SHA256 ) ) {
+				cinatra_installer_audit_log( 'mcp_adapter', 'checksum_mismatch' );
+				cinatra_set_installer_result(
+					'error',
+					sprintf(
+						/* translators: %s: URL of the GitHub release page */
+						__( 'Checksum mismatch — the download may be corrupted or tampered with. Nothing was installed. Install manually from %s if this persists.', 'cinatra' ),
+						CINATRA_MCP_ADAPTER_PIN_URL
+					)
+				);
+				return;
+			}
+
+			// RE-HASH immediately before handing off to the upgrader (D3 step
+			// 6) -- closes as much of the TOCTOU window as PHP allows (see
+			// the disclosed residual in the section header above). Only the
+			// verified LOCAL PATH goes to the upgrader below, never the URL.
+			if ( ! cinatra_installer_verify_checksum( $tmpfile, CINATRA_MCP_ADAPTER_PIN_SHA256 ) ) {
+				cinatra_installer_audit_log( 'mcp_adapter', 'checksum_mismatch' );
+				cinatra_set_installer_result( 'error', __( 'Checksum mismatch on re-verification. Nothing was installed.', 'cinatra' ) );
+				return;
+			}
+
+			// phpcs:ignore WordPress.Security.NonceVerification.Missing -- covered by check_admin_referer() inside cinatra_installer_require_capability() above (one nonce for the whole form).
+			$activate = isset( $_POST['cinatra_install_activate'] ) && '1' === $_POST['cinatra_install_activate'];
+			$result   = cinatra_installer_finish_install( $tmpfile, CINATRA_MCP_ADAPTER_PLUGIN_FILE, CINATRA_MCP_ADAPTER_PIN_VERSION, $activate );
+
+			cinatra_installer_audit_log( 'mcp_adapter', $result['outcome'], $result['detail'] );
+			if ( $result['ok'] ) {
+				cinatra_set_installer_result(
+					'success',
+					'activated' === $result['detail']
+						? __( 'The WordPress MCP Adapter was installed, checksum-verified, and activated.', 'cinatra' )
+						: __( 'The WordPress MCP Adapter was installed and checksum-verified. Activate it from the Plugins screen when ready.', 'cinatra' )
+				);
+			} elseif ( 'identity_mismatch' === $result['outcome'] ) {
+				cinatra_set_installer_result( 'error', __( 'The WordPress MCP Adapter was installed, but its version does not match what this plugin expects. It has been LEFT INACTIVE for manual inspection — it was NOT auto-removed or auto-activated.', 'cinatra' ) );
+			} else {
+				cinatra_set_installer_result( 'error', __( 'The WordPress MCP Adapter download passed its checksum check, but installation failed. Nothing was activated.', 'cinatra' ) );
+			}
+		} finally {
+			cinatra_installer_cleanup_tmpfile( $tmpfile );
+			cinatra_installer_release_lock( 'mcp_adapter' );
+		}
+
+		cinatra_connect_redirect_to_settings();
+	}
+);
+
+/**
+ * Handler for the standard wordpress.org catalog install of the Abilities
+ * plugin (D3). No checksum step: wordpress.org's own signed-transport
+ * infrastructure is the trust anchor for this flow, matching every other
+ * "Add Plugins" screen in WordPress core. Reachable only from this one
+ * nonce-protected admin-post callback, same invariant as the flow above.
+ */
+add_action(
+	'admin_post_cinatra_install_eafm',
+	function () {
+		cinatra_installer_require_capability( 'cinatra_install_eafm' );
+
+		if ( ! cinatra_installer_acquire_lock( 'eafm' ) ) {
+			cinatra_installer_audit_log( 'eafm', 'locked' );
+			cinatra_set_installer_result( 'error', __( 'An install is already in progress for the Abilities plugin. Please wait for it to finish.', 'cinatra' ) );
+			cinatra_connect_redirect_to_settings();
+		}
+
+		try {
+			if ( ! function_exists( 'plugins_api' ) ) {
+				require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+			}
+			$api = plugins_api(
+				'plugin_information',
+				array(
+					'slug'   => CINATRA_INSTALLER_EAFM_SLUG,
+					'fields' => array( 'sections' => false ),
+				)
+			);
+			if ( is_wp_error( $api ) || empty( $api->download_link ) ) {
+				cinatra_installer_audit_log( 'eafm', 'download_failed', is_wp_error( $api ) ? $api->get_error_code() : 'no_download_link' );
+				cinatra_set_installer_result( 'error', __( 'Could not reach the wordpress.org plugin directory. Try again later.', 'cinatra' ) );
+				return;
+			}
+
+			// phpcs:ignore WordPress.Security.NonceVerification.Missing -- covered by check_admin_referer() inside cinatra_installer_require_capability() above (one nonce for the whole form).
+			$activate = isset( $_POST['cinatra_install_activate'] ) && '1' === $_POST['cinatra_install_activate'];
+			// No checksum step here (D3): wordpress.org's own signed-transport
+			// infrastructure is the trust anchor for the catalog flow.
+			$result = cinatra_installer_finish_install( (string) $api->download_link, null, null, $activate );
+
+			cinatra_installer_audit_log( 'eafm', $result['outcome'], $result['detail'] );
+			if ( $result['ok'] ) {
+				cinatra_set_installer_result(
+					'success',
+					'activated' === $result['detail']
+						? __( 'The Abilities plugin was installed and activated.', 'cinatra' )
+						: __( 'The Abilities plugin was installed. Activate it from the Plugins screen when ready.', 'cinatra' )
+				);
+			} else {
+				cinatra_set_installer_result( 'error', __( 'Installation of the Abilities plugin failed.', 'cinatra' ) );
+			}
+		} finally {
+			cinatra_installer_release_lock( 'eafm' );
+		}
+
+		cinatra_connect_redirect_to_settings();
+	}
+);
+
+/**
+ * Render the two one-click install buttons (D3/ζ). Each is its own
+ * nonce-protected form POSTing to admin-post.php. Capability-gated at RENDER
+ * time here too (a UX courtesy that withholds the button entirely rather
+ * than merely disabling it) -- the REAL gate is the fresh re-check inside
+ * each handler above, since render-time-only gating is a common WP plugin
+ * bug class. Deliberately a self-contained function (not folded into
+ * cinatra_render_setup_checklist()) so this PR's diff stays surgically
+ * separate from the ensure-panel detection work landing in the same file.
+ *
+ * @return void
+ */
+function cinatra_render_installer_actions(): void {
+	cinatra_render_installer_result_notice();
+
+	if ( ! current_user_can( 'install_plugins' ) || ! current_user_can( 'activate_plugins' ) ) {
+		return;
+	}
+
+	$mcp_active = cinatra_mcp_adapter_active();
+	?>
+	<div class="card" style="max-width:680px;margin-top:16px;">
+		<h2 style="margin-top:0;"><?php echo esc_html__( 'One-click install', 'cinatra' ); ?></h2>
+		<p class="description">
+			<?php echo esc_html__( 'Installs are checksum-verified where applicable and never run automatically — each requires this explicit click.', 'cinatra' ); ?>
+		</p>
+		<?php if ( ! $mcp_active ) : ?>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-bottom:12px;">
+				<input type="hidden" name="action" value="cinatra_install_mcp_adapter" />
+				<?php wp_nonce_field( 'cinatra_install_mcp_adapter' ); ?>
+				<label style="display:block;margin-bottom:6px;">
+					<input type="checkbox" name="cinatra_install_activate" value="1" checked="checked" />
+					<?php echo esc_html__( 'Activate after installing', 'cinatra' ); ?>
+				</label>
+				<?php
+				submit_button(
+					sprintf(
+						/* translators: %s: pinned plugin version, e.g. 0.5.0 */
+						__( 'Install WordPress MCP Adapter v%s (checksum-verified)', 'cinatra' ),
+						CINATRA_MCP_ADAPTER_PIN_VERSION
+					),
+					'secondary',
+					'submit',
+					false
+				);
+				?>
+			</form>
+		<?php endif; ?>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<input type="hidden" name="action" value="cinatra_install_eafm" />
+			<?php wp_nonce_field( 'cinatra_install_eafm' ); ?>
+			<label style="display:block;margin-bottom:6px;">
+				<input type="checkbox" name="cinatra_install_activate" value="1" checked="checked" />
+				<?php echo esc_html__( 'Activate after installing', 'cinatra' ); ?>
+			</label>
+			<?php submit_button( __( 'Install Abilities plugin (enable-abilities-for-mcp)', 'cinatra' ), 'secondary', 'submit', false ); ?>
+		</form>
+	</div>
+	<?php
 }
 
 /**

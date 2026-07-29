@@ -1,0 +1,7 @@
+{
+  "$comment": "Checked-in fixture copy of cinatra's docker/wordpress/pins.lock `mcpAdapter` block (design D4). tests/test-installer-pin-provenance.php diffs this file against the CINATRA_MCP_ADAPTER_PIN_* constants baked into cinatra.php -- drift between the two fails the build. Bump BOTH files, in the same reviewed PR, whenever the pin changes (a CVE-driven emergency update or a routine version bump alike).",
+  "version": "0.5.0",
+  "url": "https://github.com/WordPress/mcp-adapter/releases/download/v0.5.0/mcp-adapter.zip",
+  "sha256": "a13f253c7bf4314b6cce7e238be2d5857eee66242bfe5ff5cb5576f74dc41593",
+  "provenanceCommit": "db9803e6509384d151af9e7791b7bcea9d2a77cc"
+}
