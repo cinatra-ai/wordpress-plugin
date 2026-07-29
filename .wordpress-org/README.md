@@ -22,8 +22,8 @@ established brand rules — never an ad-hoc recolour or layout.
 
 ## Regenerating
 
-The assets are deterministic. Regenerate from the design system — never hand-edit
-the PNGs:
+The assets are deterministic — the same design-system inputs always produce the
+same files:
 
 ```sh
 # from the wordpress-plugin repo root, with a Cinatra design system checkout available
