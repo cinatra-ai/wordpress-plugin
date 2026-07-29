@@ -1302,7 +1302,7 @@ function cinatra_connect_apply_result( array $result ): void {
 // signed-transport infrastructure is the trust anchor here, not this
 // plugin.
 //
-// DISCLOSED, NOT-CLOSED RESIDUAL (design round codex r1): PHP/Plugin_Upgrader
+// DISCLOSED, NOT-CLOSED RESIDUAL (accepted during the design's security review): PHP/Plugin_Upgrader
 // has no atomic "hash-then-use" primitive. A same-host, same-filesystem-user
 // attacker with write access to the WP temp directory could in principle
 // mutate the verified file between the second hash check below and
@@ -1438,7 +1438,7 @@ function cinatra_installer_audit_log( string $flow, string $outcome, string $det
  * Take a short-lived install lock so a double form-submit is a no-op rather
  * than a race on the same temp file / plugin directory.
  *
- * DISCLOSED LIMITATION (codex adversarial review, not a security bypass): a
+ * DISCLOSED LIMITATION (from the adversarial security review; not a bypass): a
  * transient backed by the options table is a best-effort duplicate-click
  * guard, not an atomic distributed lock -- two requests landing in the exact
  * same instant could both observe "not locked". Worst case is a duplicate
