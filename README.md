@@ -8,11 +8,11 @@ restricted to WordPress administrators (`manage_options` capability).
 
 ## Documentation
 
-The canonical documentation for this integration is the WordPress hub on
-docs.cinatra.ai: **https://docs.cinatra.ai/integrations/wordpress/**. It is the
-six-part hub (Overview, Quick start, Use it, Settings & permissions,
-Troubleshooting, Advanced & reference) and is published from this repository's
-[`docs/`](docs/) folder at each release.
+The full documentation for this integration is the WordPress hub on
+docs.cinatra.ai: **https://docs.cinatra.ai/integrations/wordpress/** — Overview,
+Quick start, Use it, Settings & permissions, Troubleshooting, and Advanced &
+reference. The same six chapters are available in this repository's
+[`docs/`](docs/) folder.
 
 ## Works with
 
