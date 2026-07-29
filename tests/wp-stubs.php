@@ -58,6 +58,16 @@ function cinatra_test_do_action($hook, ...$args) {
         call_user_func_array($cb, $args);
     }
 }
+// Real do_action() -- WP core's own hook-firing function. Previously
+// unneeded because no plugin code called it directly (hooks were fired by
+// simulating the WP event that would trigger them, e.g. update_option()
+// below calls cinatra_test_do_action() itself); the installer's audit-log
+// action (cinatra_installer_attempt) is the first plugin code path to call
+// do_action() directly, so it needs a real, callback-firing stub rather than
+// a no-op.
+function do_action($hook, ...$args) {
+    cinatra_test_do_action($hook, ...$args);
+}
 function add_filter($hook, $cb, $priority = 10, $args = 1) {
     // Track filters by hook so tests can assert request-scoped add/remove, AND
     // keep the live callbacks so the HTTP stub can replay WordPress's real
@@ -136,10 +146,18 @@ function is_plugin_active($plugin) {
 }
 // Ensure-panel detection stubs (cinatra-ai/cinatra#2021 S6 / epsilon):
 // get_plugins() is the header-read primitive that tells "not installed" apart
-// from "installed, not active" (unlike is_plugin_active() alone). Driven by
-// $GLOBALS['cinatra_test']['installed_plugins'].
+// from "installed, not active" (unlike is_plugin_active() alone).
+// MERGE NOTE (epsilon x zeta): this declaration loads before the
+// function_exists-guarded copy in installer-test-stubs.php, so it is the ONE
+// live get_plugins() for every suite — it therefore honors BOTH fixture keys:
+// the ensure-panel tests drive the top-level 'installed_plugins'; the
+// installer tests drive ['installer']['installed_plugins'] (that key wins on
+// overlap, matching the guarded copy's pre-merge behavior).
 function get_plugins() {
-    return (array) ($GLOBALS['cinatra_test']['installed_plugins'] ?? []);
+    return array_merge(
+        (array) ($GLOBALS['cinatra_test']['installed_plugins'] ?? []),
+        (array) ($GLOBALS['cinatra_test']['installer']['installed_plugins'] ?? [])
+    );
 }
 // get_bloginfo('version') is the only $show value the plugin reads.
 function get_bloginfo($show = '') {
@@ -361,8 +379,10 @@ function wp_remote_retrieve_body($resp) { return $resp['body'] ?? ''; }
 // Minimal classes
 // ---------------------------------------------------------------------------
 class WP_Error {
+    private $code;
     private $message;
-    public function __construct($code = '', $message = '') { $this->message = $message; }
+    public function __construct($code = '', $message = '') { $this->code = $code; $this->message = $message; }
+    public function get_error_code() { return $this->code; }
     public function get_error_message() { return $this->message; }
 }
 
