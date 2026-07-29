@@ -569,8 +569,8 @@ function cinatra_ensure_content_server_ability_count(): ?int {
 	if ( ! cinatra_mcp_adapter_active() ) {
 		return null;
 	}
-	// Autoload=false (codex r0): this is a presence CHECK, not a load request --
-	// avoid triggering an unrelated autoloader as a side effect of detection.
+	// Autoload=false: this is a presence CHECK, not a load request -- avoid
+	// triggering an unrelated autoloader as a side effect of detection.
 	if ( ! class_exists( '\WP\MCP\Core\McpAdapter', false ) ) {
 		return null;
 	}
@@ -675,7 +675,7 @@ function cinatra_render_plugin_checklist_row( array $state, string $name, string
 		cinatra_render_checklist_row(
 			true,
 			sprintf(
-				/* translators: 1: plugin name, 2: version suffix such as " (v1.2.3)" (may be empty) */
+				/* translators: 1: plugin name, 2: parenthesized version suffix shown when the installed version is known (may be empty) */
 				esc_html__( '%1$s%2$s is active.', 'cinatra' ),
 				esc_html( $name ),
 				$version_suffix
@@ -693,7 +693,7 @@ function cinatra_render_plugin_checklist_row( array $state, string $name, string
 		cinatra_render_checklist_row(
 			false,
 			sprintf(
-				/* translators: 1: plugin name, 2: version suffix such as " (v1.2.3)" (may be empty), 3: "Activate it..." link HTML */
+				/* translators: 1: plugin name, 2: parenthesized version suffix shown when the installed version is known (may be empty), 3: "Activate it..." link HTML */
 				esc_html__( '%1$s%2$s is installed but not active. %3$s', 'cinatra' ),
 				esc_html( $name ),
 				$version_suffix,
