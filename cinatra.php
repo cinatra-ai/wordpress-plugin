@@ -453,11 +453,288 @@ function cinatra_render_settings_page() {
 	<?php
 }
 
+// ---------------------------------------------------------------------------
+// Ensure-panel detection (cinatra-ai/cinatra#2021 S6 / epsilon). Everything in
+// this section is READ-ONLY: it reports the site's WP/PHP/HTTPS floor state,
+// the install state (absent / installed-but-inactive / active) + version of
+// both AI-tools companion plugins, the live enrolled-ability count on
+// Cinatra's own MCP content server, and the browsing user's role as a
+// courtesy. No file is written and no plugin is installed or activated from
+// this section — that is a separate, human-gated PR (wordpress-plugin S6 /
+// zeta), additionally structurally gated by this repo's CODEOWNERS review
+// requirement on this file (#99).
+// ---------------------------------------------------------------------------
+
+// The Abilities API ships in WordPress 6.9; both AI-tools companion plugins
+// assume it. PHP 8.0 mirrors the floor the companion plugins themselves
+// declare.
+define( 'CINATRA_ENSURE_MIN_WP_VERSION', '6.9' );
+define( 'CINATRA_ENSURE_MIN_PHP_VERSION', '8.0' );
+
+// The wordpress.org catalog plugin ("Enable Abilities for MCP") complements
+// the GitHub-distributed MCP Adapter: it registers a broad set of core
+// content abilities and lets the site admin toggle each on/off. Plugin file
+// verified against the plugin's own wordpress.org SVN trunk listing.
+define( 'CINATRA_CATALOG_PLUGIN_FILE', 'enable-abilities-for-mcp/enable-abilities-for-mcp.php' );
+define( 'CINATRA_CATALOG_PLUGIN_URL', 'https://wordpress.org/plugins/enable-abilities-for-mcp/' );
+
 /**
- * Render a "Setup checklist" card on the settings page. Surfaces the key
- * optional dependency — the WordPress MCP Adapter — with a clear status
- * indicator and a direct link to its GitHub release. The checklist makes the
- * dependency first-class on the settings UI without burying it in prose.
+ * WordPress-core-version floor check for the ensure panel.
+ *
+ * @return bool True when the running WordPress version meets the floor.
+ */
+function cinatra_ensure_wp_version_ok(): bool {
+	return version_compare( get_bloginfo( 'version' ), CINATRA_ENSURE_MIN_WP_VERSION, '>=' );
+}
+
+/**
+ * PHP-version floor check for the ensure panel.
+ *
+ * @return bool True when the running PHP version meets the floor.
+ */
+function cinatra_ensure_php_version_ok(): bool {
+	return version_compare( PHP_VERSION, CINATRA_ENSURE_MIN_PHP_VERSION, '>=' );
+}
+
+/**
+ * HTTPS floor check for the ensure panel. wp-admin is always loaded over the
+ * site's actually-configured scheme, so is_ssl() at settings-page load time
+ * reflects the site's HTTPS posture, not merely "was this one visit HTTPS".
+ *
+ * @return bool True when the current (representative) request is HTTPS.
+ */
+function cinatra_ensure_https_ok(): bool {
+	return is_ssl();
+}
+
+/**
+ * Full install-state read for a plugin file: present-but-inactive vs. active
+ * vs. absent, plus the version string from the plugin header. Works WITHOUT
+ * requiring the plugin to be active — get_plugins() reads the file header
+ * directly — which is the detection primitive is_plugin_active() alone
+ * cannot provide: that function collapses "not installed" and "installed,
+ * not active" to the same false (cinatra-ai/cinatra#2021 D2).
+ *
+ * Fails safe: any environment where get_plugins()/is_plugin_active() cannot
+ * be loaded reports "absent" rather than fataling — absence is always a
+ * truthful, non-fatal answer here, never a crash.
+ *
+ * @param string $plugin_file Plugin file relative to the plugins directory,
+ *                             e.g. 'mcp-adapter/mcp-adapter.php'.
+ * @return array<string,mixed> { present: bool, active: bool, version: string }.
+ *               present=false implies active=false and version=''.
+ */
+function cinatra_ensure_plugin_state( string $plugin_file ): array {
+	$absent = array(
+		'present' => false,
+		'active'  => false,
+		'version' => '',
+	);
+	if ( ! function_exists( 'get_plugins' ) || ! function_exists( 'is_plugin_active' ) ) {
+		if ( ! defined( 'ABSPATH' ) || ! is_readable( ABSPATH . 'wp-admin/includes/plugin.php' ) ) {
+			return $absent;
+		}
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+	if ( ! function_exists( 'get_plugins' ) || ! function_exists( 'is_plugin_active' ) ) {
+		return $absent;
+	}
+	$all_plugins = get_plugins();
+	if ( ! is_array( $all_plugins ) || ! isset( $all_plugins[ $plugin_file ] ) ) {
+		return $absent;
+	}
+	return array(
+		'present' => true,
+		'active'  => (bool) is_plugin_active( $plugin_file ),
+		'version' => (string) ( $all_plugins[ $plugin_file ]['Version'] ?? '' ),
+	);
+}
+
+/**
+ * Enrolled-ability count for the Cinatra content MCP server, read from the
+ * live WordPress MCP Adapter registry ( \WP\MCP\Core\McpAdapter ) when the
+ * adapter is active. Confirms the tools registered by
+ * cinatra_register_mcp_content_server() actually made it onto the adapter at
+ * runtime, rather than merely asserting the registration call was made.
+ *
+ * Fails safe: returns null (never throws) whenever the adapter class/method
+ * surface this reads is absent or shaped unexpectedly — an inactive adapter,
+ * an adapter version that renamed something, or the Cinatra server withheld
+ * because not every content ability had registered yet (the guard already in
+ * cinatra_register_mcp_content_server()).
+ *
+ * @return int|null Ability count, or null when unavailable.
+ */
+function cinatra_ensure_content_server_ability_count(): ?int {
+	if ( ! cinatra_mcp_adapter_active() ) {
+		return null;
+	}
+	// Autoload=false (codex r0): this is a presence CHECK, not a load request --
+	// avoid triggering an unrelated autoloader as a side effect of detection.
+	if ( ! class_exists( '\WP\MCP\Core\McpAdapter', false ) ) {
+		return null;
+	}
+	try {
+		$adapter = \WP\MCP\Core\McpAdapter::instance();
+		if ( ! is_object( $adapter ) || ! method_exists( $adapter, 'get_servers' ) ) {
+			return null;
+		}
+		$servers = $adapter->get_servers();
+		if ( ! is_array( $servers ) ) {
+			return null;
+		}
+		$server = $servers[ CINATRA_MCP_CONTENT_SERVER ] ?? null;
+		if ( ! is_object( $server ) ) {
+			// Defensive fallback in case get_servers() is not keyed by server id.
+			foreach ( $servers as $candidate ) {
+				if ( is_object( $candidate )
+					&& method_exists( $candidate, 'get_server_id' )
+					&& CINATRA_MCP_CONTENT_SERVER === $candidate->get_server_id()
+				) {
+					$server = $candidate;
+					break;
+				}
+			}
+		}
+		if ( ! is_object( $server ) || ! method_exists( $server, 'get_tools' ) ) {
+			return null;
+		}
+		$tools = $server->get_tools();
+		return is_array( $tools ) ? count( $tools ) : null;
+	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- defensive catch-all; the null return is itself the fail-safe signal, nothing to log to without a logging dependency.
+		return null;
+	}
+}
+
+/**
+ * The signed-in user's own role, for the ensure panel's courtesy row. This is
+ * the BROWSING admin's role — it is NOT the audited "which role owns the
+ * site's stored Application-Password credential" signal. That durable signal
+ * is cinatra-ai/cinatra#2021's D6/D8 tri-state warning, computed server-side
+ * from the site-inventory handshake and rendered on the connector settings
+ * page; this row is a same-page convenience only.
+ *
+ * @return string The current user's primary role slug, or '' if none.
+ */
+function cinatra_ensure_current_user_role(): string {
+	$user = wp_get_current_user();
+	if ( ! ( $user instanceof WP_User ) || empty( $user->roles ) || ! is_array( $user->roles ) ) {
+		return '';
+	}
+	$role = reset( $user->roles );
+	return is_string( $role ) ? $role : '';
+}
+
+/**
+ * Render one ensure-panel <li> row with a pass/pending status icon, matching
+ * the pre-epsilon single-row markup byte-for-byte (no CSS/JS elsewhere needs
+ * to change).
+ *
+ * @param bool   $ok      True renders the check-mark/"ok" state, false the
+ *                        pending-dot state.
+ * @param string $message Fully-escaped message HTML for this row (callers
+ *                        build it via esc_html()/esc_html__()/sprintf() with
+ *                        esc_html()/esc_url()-wrapped dynamic parts, same
+ *                        convention as the rest of this file); rendered
+ *                        through wp_kses_post() so an allow-listed <a>/<br>
+ *                        fragment (e.g. an activation link) may pass through.
+ * @return void
+ */
+function cinatra_render_checklist_row( bool $ok, string $message ): void {
+	$icon  = $ok ? '&#10003;' : '&#9679;'; // Unicode U+2713 CHECK MARK / U+25CF BLACK CIRCLE.
+	$class = $ok ? 'cinatra-check-ok' : 'cinatra-check-pending';
+	?>
+	<li class="<?php echo esc_attr( $class ); ?>" style="margin-bottom:8px;">
+		<span aria-hidden="true" style="margin-right:6px;"><?php echo wp_kses_post( $icon ); ?></span>
+		<?php echo wp_kses_post( $message ); ?>
+	</li>
+	<?php
+}
+
+/**
+ * Render the ensure-panel checklist row for one AI-tools companion plugin:
+ * active (ok), installed-but-inactive (pending, links to the Installed
+ * Plugins screen so the admin can activate it), or absent (pending, links to
+ * the manual download/info source). No install action happens here — see the
+ * docblock on cinatra_render_setup_checklist().
+ *
+ * @param array<string,mixed> $state     From cinatra_ensure_plugin_state():
+ *                                        { present: bool, active: bool, version: string }.
+ * @param string              $name      Human-readable plugin name (already
+ *                                        translated by the caller).
+ * @param string              $link_url  Manual-install/info URL.
+ * @param string              $link_text Link text for the manual-install/info
+ *                                        URL (already translated by the caller).
+ * @return void
+ */
+function cinatra_render_plugin_checklist_row( array $state, string $name, string $link_url, string $link_text ): void {
+	// Version numbers are not translated; kept as plain, escaped text.
+	$version_suffix = '' !== $state['version'] ? ' (v' . esc_html( $state['version'] ) . ')' : '';
+
+	if ( $state['active'] ) {
+		cinatra_render_checklist_row(
+			true,
+			sprintf(
+				/* translators: 1: plugin name, 2: version suffix such as " (v1.2.3)" (may be empty) */
+				esc_html__( '%1$s%2$s is active.', 'cinatra' ),
+				esc_html( $name ),
+				$version_suffix
+			)
+		);
+		return;
+	}
+
+	if ( $state['present'] ) {
+		$activate_link = sprintf(
+			'<br /><a href="%1$s">%2$s</a>',
+			esc_url( admin_url( 'plugins.php' ) ),
+			esc_html__( 'Activate it on the Installed Plugins screen', 'cinatra' )
+		);
+		cinatra_render_checklist_row(
+			false,
+			sprintf(
+				/* translators: 1: plugin name, 2: version suffix such as " (v1.2.3)" (may be empty), 3: "Activate it..." link HTML */
+				esc_html__( '%1$s%2$s is installed but not active. %3$s', 'cinatra' ),
+				esc_html( $name ),
+				$version_suffix,
+				$activate_link
+			)
+		);
+		return;
+	}
+
+	$download_link = sprintf(
+		'<br /><a href="%1$s" target="_blank" rel="noopener noreferrer">%2$s</a>',
+		esc_url( $link_url ),
+		esc_html( $link_text )
+	);
+	cinatra_render_checklist_row(
+		false,
+		sprintf(
+			/* translators: 1: plugin name, 2: download/info link HTML */
+			esc_html__( '%1$s is not installed. %2$s', 'cinatra' ),
+			esc_html( $name ),
+			$download_link
+		)
+	);
+}
+
+/**
+ * Render the "Site AI stack" card on the settings page (formerly the "Setup
+ * checklist" / "AI tools setup" card — cinatra-ai/cinatra#2021 S6 upgrades
+ * this card in place rather than adding a new page). Surfaces:
+ *   - the WP/PHP/HTTPS floor the AI-tools companion plugins require;
+ *   - install state (absent / installed-but-inactive / active) + version for
+ *     both companion plugins (the WordPress MCP Adapter and the
+ *     wordpress.org catalog plugin "Enable Abilities for MCP");
+ *   - the live enrolled-ability count on Cinatra's own MCP content server;
+ *   - the signed-in user's role, as a courtesy (see
+ *     cinatra_ensure_current_user_role() for the durable/audited version of
+ *     this concern).
+ *
+ * Detection-only (cinatra-ai/cinatra#2021 S6 / epsilon): no plugin is
+ * installed, activated, or written to from this function. The one-click
+ * installer is a separate, human-gated PR (S6 / zeta) — see CODEOWNERS.
  *
  * The card is always rendered (even when everything is configured) so admins
  * can see at a glance which capabilities are enabled.
@@ -465,46 +742,94 @@ function cinatra_render_settings_page() {
  * @return void
  */
 function cinatra_render_setup_checklist(): void {
-	$mcp_active = cinatra_mcp_adapter_active();
-	if ( $mcp_active ) {
-		$mcp_icon   = '&#10003;'; // Unicode U+2713 CHECK MARK.
-		$mcp_class  = 'cinatra-check-ok';
-		$mcp_status = __( 'WordPress MCP Adapter is active — AI tools enabled.', 'cinatra' );
-		$mcp_extra  = '';
-	} else {
-		$mcp_icon   = '&#9679;'; // Unicode U+25CF BLACK CIRCLE, used as a status dot.
-		$mcp_class  = 'cinatra-check-pending';
-		$mcp_status = __( 'WordPress MCP Adapter is not active — AI tools are not available.', 'cinatra' );
-		$mcp_extra  = sprintf(
-			'<br /><a href="%1$s" target="_blank" rel="noopener noreferrer">%2$s</a>',
-			esc_url( CINATRA_MCP_ADAPTER_RELEASE_URL ),
-			esc_html__( 'Download the WordPress MCP Adapter from GitHub', 'cinatra' )
-		);
-	}
+	$wp_ok    = cinatra_ensure_wp_version_ok();
+	$php_ok   = cinatra_ensure_php_version_ok();
+	$https_ok = cinatra_ensure_https_ok();
+
+	$mcp_state     = cinatra_ensure_plugin_state( CINATRA_MCP_ADAPTER_PLUGIN_FILE );
+	$catalog_state = cinatra_ensure_plugin_state( CINATRA_CATALOG_PLUGIN_FILE );
+
+	$ability_count = cinatra_ensure_content_server_ability_count();
+	$current_role  = cinatra_ensure_current_user_role();
 	?>
 	<div class="card" style="max-width:680px;margin-top:24px;">
-		<h2 style="margin-top:0;"><?php echo esc_html__( 'AI tools setup', 'cinatra' ); ?></h2>
+		<h2 style="margin-top:0;"><?php echo esc_html__( 'Site AI stack', 'cinatra' ); ?></h2>
 		<p class="description">
-			<?php echo esc_html__( 'The Cinatra assistant works without the adapter below, but installing it unlocks WordPress AI tools — letting the assistant read and edit your site content directly from the chat.', 'cinatra' ); ?>
+			<?php echo esc_html__( 'The Cinatra assistant works without the items below, but installing them unlocks WordPress AI tools — letting the assistant read and edit your site content directly from the chat.', 'cinatra' ); ?>
 		</p>
 		<ul style="list-style:none;margin:0;padding:0;">
-			<li class="<?php echo esc_attr( $mcp_class ); ?>" style="margin-bottom:8px;">
-				<span aria-hidden="true" style="margin-right:6px;"><?php echo wp_kses_post( $mcp_icon ); ?></span>
-				<?php echo esc_html( $mcp_status ); ?>
-				<?php
-				echo wp_kses(
-					$mcp_extra,
-					array(
-						'a'  => array(
-							'href'   => array(),
-							'target' => array(),
-							'rel'    => array(),
-						),
-						'br' => array(),
+			<?php
+			cinatra_render_checklist_row(
+				$wp_ok,
+				$wp_ok
+					? esc_html__( 'WordPress version meets the requirement for AI tools.', 'cinatra' )
+					: sprintf(
+						/* translators: 1: minimum required WordPress version, 2: the WordPress version this site is currently running */
+						esc_html__( 'WordPress %1$s or newer is required for AI tools (this site is running %2$s).', 'cinatra' ),
+						esc_html( CINATRA_ENSURE_MIN_WP_VERSION ),
+						esc_html( get_bloginfo( 'version' ) )
+					)
+			);
+			cinatra_render_checklist_row(
+				$php_ok,
+				$php_ok
+					? esc_html__( 'PHP version meets the requirement for AI tools.', 'cinatra' )
+					: sprintf(
+						/* translators: 1: minimum required PHP version, 2: the PHP version this server is currently running */
+						esc_html__( 'PHP %1$s or newer is required for AI tools (this server is running %2$s).', 'cinatra' ),
+						esc_html( CINATRA_ENSURE_MIN_PHP_VERSION ),
+						esc_html( PHP_VERSION )
+					)
+			);
+			cinatra_render_checklist_row(
+				$https_ok,
+				$https_ok
+					? esc_html__( 'Site is served over HTTPS.', 'cinatra' )
+					: esc_html__( 'Site is not served over HTTPS — HTTPS is required for AI tools.', 'cinatra' )
+			);
+			cinatra_render_plugin_checklist_row(
+				$mcp_state,
+				__( 'WordPress MCP Adapter', 'cinatra' ),
+				CINATRA_MCP_ADAPTER_RELEASE_URL,
+				__( 'Download the WordPress MCP Adapter from GitHub', 'cinatra' )
+			);
+			cinatra_render_plugin_checklist_row(
+				$catalog_state,
+				__( 'Enable Abilities for MCP', 'cinatra' ),
+				CINATRA_CATALOG_PLUGIN_URL,
+				__( 'Get Enable Abilities for MCP from wordpress.org', 'cinatra' )
+			);
+			if ( null !== $ability_count ) {
+				cinatra_render_checklist_row(
+					true,
+					sprintf(
+						/* translators: %d: number of Cinatra AI abilities currently enrolled on the MCP content server */
+						esc_html__( 'Cinatra AI tools: %d enrolled and reachable by the assistant.', 'cinatra' ),
+						(int) $ability_count
 					)
 				);
-				?>
-			</li>
+			} elseif ( $mcp_state['active'] ) {
+				cinatra_render_checklist_row(
+					false,
+					esc_html__( 'Cinatra AI tools: not confirmed as enrolled yet — reload this page after the site finishes initializing.', 'cinatra' )
+				);
+			} else {
+				cinatra_render_checklist_row(
+					false,
+					esc_html__( 'Cinatra AI tools: not available yet — activate the WordPress MCP Adapter above to enroll them.', 'cinatra' )
+				);
+			}
+			if ( '' !== $current_role ) {
+				printf(
+					'<li style="margin-bottom:8px;"><span class="description">%1$s</span></li>',
+					sprintf(
+						/* translators: %s: the signed-in user's WordPress role slug (e.g. "administrator") */
+						esc_html__( 'Signed in as: %s.', 'cinatra' ),
+						esc_html( $current_role )
+					)
+				);
+			}
+			?>
 		</ul>
 		<p class="description" style="margin-top:12px;">
 			<?php

@@ -29,6 +29,10 @@ $GLOBALS['cinatra_test'] = [
     'filters'              => [],   // hook => count of currently-registered callbacks
     'filter_cbs'           => [],   // hook => [live callbacks] (for safe-request replay)
     'active_plugins'       => [],   // active plugin files for is_plugin_active() stub
+    'installed_plugins'    => [],   // plugin_file => ['Version' => '...'] for get_plugins() stub
+    'wp_version'           => '6.9', // get_bloginfo('version') stub
+    'is_ssl'               => true,  // is_ssl() stub
+    'current_user_roles'   => [],   // WP_User::$roles for wp_get_current_user() stub
 ];
 
 // ---------------------------------------------------------------------------
@@ -129,6 +133,29 @@ function post_type_exists($pt) { return in_array($pt, ['post', 'page'], true); }
 // loads wp-admin/includes/plugin.php; stub it here so tests do not need a real WP install.
 function is_plugin_active($plugin) {
     return in_array($plugin, (array) ($GLOBALS['cinatra_test']['active_plugins'] ?? []), true);
+}
+// Ensure-panel detection stubs (cinatra-ai/cinatra#2021 S6 / epsilon):
+// get_plugins() is the header-read primitive that tells "not installed" apart
+// from "installed, not active" (unlike is_plugin_active() alone). Driven by
+// $GLOBALS['cinatra_test']['installed_plugins'].
+function get_plugins() {
+    return (array) ($GLOBALS['cinatra_test']['installed_plugins'] ?? []);
+}
+// get_bloginfo('version') is the only $show value the plugin reads.
+function get_bloginfo($show = '') {
+    return 'version' === $show ? (string) ($GLOBALS['cinatra_test']['wp_version'] ?? '') : '';
+}
+function is_ssl() {
+    return (bool) ($GLOBALS['cinatra_test']['is_ssl'] ?? true);
+}
+class WP_User {
+    public $roles;
+    public function __construct(array $roles = []) {
+        $this->roles = $roles;
+    }
+}
+function wp_get_current_user() {
+    return new WP_User((array) ($GLOBALS['cinatra_test']['current_user_roles'] ?? []));
 }
 // HTML sanitisation stubs (pass-through for tests; the tag/attribute filter is irrelevant
 // in the test harness since no real HTML output is asserted in these tests).
