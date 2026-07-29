@@ -7,3 +7,10 @@
 # Security-relevant paths — request the owner + the org review account.
 /.github/ @groganz @megajustice
 /LICENSE @groganz @megajustice
+
+# Installer / site-write risk surface (cinatra-ai/cinatra#2021 S6). cinatra.php
+# is this plugin's single source file — the forthcoming one-click plugin
+# installer (side-loads and installs code onto the customer's own WordPress
+# site) lands here, so the whole file is covered ahead of that PR to make
+# review structurally required, not just requested by convention.
+/cinatra.php @groganz @megajustice
