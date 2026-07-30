@@ -54,6 +54,8 @@ jobs:
         run: php tests/test-installer-invariants.php
       - name: Run one-click installer pin-provenance conformance gate (cinatra#2021 S6 design D4)
         run: php tests/test-installer-pin-provenance.php
+      - name: Run handshake enrichment sender behavior tests (cinatra#2021 S6/eta, no WP install required)
+        run: php tests/test-site-inventory-sender.php
 
   js-tests:
     runs-on: ubuntu-latest
