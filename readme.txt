@@ -3,7 +3,7 @@ Contributors: ordnas
 Tags: ai, chat, assistant
 Requires at least: 5.9
 Tested up to: 7.0
-Stable tag: 0.1.6
+Stable tag: 0.1.7
 Requires PHP: 7.4
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -59,6 +59,10 @@ WordPress supports plugin-to-plugin dependencies via the `Requires Plugins:` hea
 3. Connect the plugin to your Cinatra instance from the Cinatra settings page: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
 
 == Changelog ==
+= 0.1.7 =
+* Removed the plugin's own built-in content-editing tools (create/read/update/delete posts, list posts and pages, upload media) and its dedicated MCP server. These were an early, plugin-specific way for the assistant to edit your content; the assistant now reaches your WordPress content exclusively through the WordPress MCP Adapter and Enable Abilities for MCP companion plugins described above, with no loss of capability. If you already have those companion plugins installed and active, there is nothing to do.
+* The settings page no longer shows a "Cinatra AI tools: N enrolled" count, since it described the now-removed built-in tools.
+
 = 0.1.6 =
 * The plugin now emits Standard-Webhooks events to the connected Cinatra instance's generic host URL, with a persisted binding id pairing the site to its Cinatra connection.
 * Security hardening: the session-token mint request now sends the site Origin so the Cinatra host can enforce fail-closed origin checks.
