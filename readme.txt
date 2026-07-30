@@ -60,7 +60,7 @@ WordPress supports plugin-to-plugin dependencies via the `Requires Plugins:` hea
 
 == Changelog ==
 = 0.1.7 =
-* Removed the plugin's own built-in content-editing tools (create/read/update/delete posts, list posts and pages, upload media) and its dedicated MCP server. These were an early, plugin-specific way for the assistant to edit your content; the assistant now reaches your WordPress content exclusively through the WordPress MCP Adapter and Enable Abilities for MCP companion plugins described above, with no loss of capability. If you already have those companion plugins installed and active, there is nothing to do.
+* Removed the plugin's own built-in content-editing tools (create/read/update/delete posts, list posts and pages, upload media) and its dedicated MCP server. These were an early, plugin-specific way for the assistant to edit your content; the assistant now reaches your WordPress content exclusively through two companion plugins — the WordPress MCP Adapter (https://wordpress.org/plugins/mcp-adapter/) and Enable Abilities for MCP (https://wordpress.org/plugins/enable-abilities-for-mcp/) — with no loss of capability. If you already have those companion plugins installed and active, there is nothing to do.
 * The settings page no longer shows a "Cinatra AI tools: N enrolled" count, since it described the now-removed built-in tools.
 
 = 0.1.6 =
