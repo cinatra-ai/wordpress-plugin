@@ -458,8 +458,7 @@ function cinatra_render_settings_page() {
 // Ensure-panel detection (cinatra-ai/cinatra#2021 S6 / epsilon). Everything in
 // this section is READ-ONLY: it reports the site's WP/PHP/HTTPS floor state,
 // the install state (absent / installed-but-inactive / active) + version of
-// both AI-tools companion plugins, the live enrolled-ability count on
-// Cinatra's own MCP content server, and the browsing user's role as a
+// both AI-tools companion plugins, and the browsing user's role as a
 // courtesy. No file is written and no plugin is installed or activated from
 // this section — that is a separate, human-gated PR (wordpress-plugin S6 /
 // zeta), additionally structurally gated by this repo's CODEOWNERS review
@@ -549,62 +548,6 @@ function cinatra_ensure_plugin_state( string $plugin_file ): array {
 		'active'  => (bool) is_plugin_active( $plugin_file ),
 		'version' => (string) ( $all_plugins[ $plugin_file ]['Version'] ?? '' ),
 	);
-}
-
-/**
- * Enrolled-ability count for the Cinatra content MCP server, read from the
- * live WordPress MCP Adapter registry ( \WP\MCP\Core\McpAdapter ) when the
- * adapter is active. Confirms the tools registered by
- * cinatra_register_mcp_content_server() actually made it onto the adapter at
- * runtime, rather than merely asserting the registration call was made.
- *
- * Fails safe: returns null (never throws) whenever the adapter class/method
- * surface this reads is absent or shaped unexpectedly — an inactive adapter,
- * an adapter version that renamed something, or the Cinatra server withheld
- * because not every content ability had registered yet (the guard already in
- * cinatra_register_mcp_content_server()).
- *
- * @return int|null Ability count, or null when unavailable.
- */
-function cinatra_ensure_content_server_ability_count(): ?int {
-	if ( ! cinatra_mcp_adapter_active() ) {
-		return null;
-	}
-	// Autoload=false: this is a presence CHECK, not a load request -- avoid
-	// triggering an unrelated autoloader as a side effect of detection.
-	if ( ! class_exists( '\WP\MCP\Core\McpAdapter', false ) ) {
-		return null;
-	}
-	try {
-		$adapter = \WP\MCP\Core\McpAdapter::instance();
-		if ( ! is_object( $adapter ) || ! method_exists( $adapter, 'get_servers' ) ) {
-			return null;
-		}
-		$servers = $adapter->get_servers();
-		if ( ! is_array( $servers ) ) {
-			return null;
-		}
-		$server = $servers[ CINATRA_MCP_CONTENT_SERVER ] ?? null;
-		if ( ! is_object( $server ) ) {
-			// Defensive fallback in case get_servers() is not keyed by server id.
-			foreach ( $servers as $candidate ) {
-				if ( is_object( $candidate )
-					&& method_exists( $candidate, 'get_server_id' )
-					&& CINATRA_MCP_CONTENT_SERVER === $candidate->get_server_id()
-				) {
-					$server = $candidate;
-					break;
-				}
-			}
-		}
-		if ( ! is_object( $server ) || ! method_exists( $server, 'get_tools' ) ) {
-			return null;
-		}
-		$tools = $server->get_tools();
-		return is_array( $tools ) ? count( $tools ) : null;
-	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- defensive catch-all; the null return is itself the fail-safe signal, nothing to log to without a logging dependency.
-		return null;
-	}
 }
 
 /**
@@ -728,7 +671,6 @@ function cinatra_render_plugin_checklist_row( array $state, string $name, string
  *   - install state (absent / installed-but-inactive / active) + version for
  *     both companion plugins (the WordPress MCP Adapter and the
  *     wordpress.org catalog plugin "Enable Abilities for MCP");
- *   - the live enrolled-ability count on Cinatra's own MCP content server;
  *   - the signed-in user's role, as a courtesy (see
  *     cinatra_ensure_current_user_role() for the durable/audited version of
  *     this concern).
@@ -750,8 +692,7 @@ function cinatra_render_setup_checklist(): void {
 	$mcp_state     = cinatra_ensure_plugin_state( CINATRA_MCP_ADAPTER_PLUGIN_FILE );
 	$catalog_state = cinatra_ensure_plugin_state( CINATRA_CATALOG_PLUGIN_FILE );
 
-	$ability_count = cinatra_ensure_content_server_ability_count();
-	$current_role  = cinatra_ensure_current_user_role();
+	$current_role = cinatra_ensure_current_user_role();
 	?>
 	<div class="card" style="max-width:680px;margin-top:24px;">
 		<h2 style="margin-top:0;"><?php echo esc_html__( 'Site AI stack', 'cinatra' ); ?></h2>
@@ -800,26 +741,6 @@ function cinatra_render_setup_checklist(): void {
 				CINATRA_CATALOG_PLUGIN_URL,
 				__( 'Get Enable Abilities for MCP from wordpress.org', 'cinatra' )
 			);
-			if ( null !== $ability_count ) {
-				cinatra_render_checklist_row(
-					true,
-					sprintf(
-						/* translators: %d: number of Cinatra AI abilities currently enrolled on the MCP content server */
-						esc_html__( 'Cinatra AI tools: %d enrolled and reachable by the assistant.', 'cinatra' ),
-						(int) $ability_count
-					)
-				);
-			} elseif ( $mcp_state['active'] ) {
-				cinatra_render_checklist_row(
-					false,
-					esc_html__( 'Cinatra AI tools: not confirmed as enrolled yet — reload this page after the site finishes initializing.', 'cinatra' )
-				);
-			} else {
-				cinatra_render_checklist_row(
-					false,
-					esc_html__( 'Cinatra AI tools: not available yet — activate the WordPress MCP Adapter above to enroll them.', 'cinatra' )
-				);
-			}
 			if ( '' !== $current_role ) {
 				printf(
 					'<li style="margin-bottom:8px;"><span class="description">%1$s</span></li>',
