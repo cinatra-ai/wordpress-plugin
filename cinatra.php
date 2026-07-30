@@ -5221,7 +5221,7 @@ function cinatra_resolve_connected_user_role(): string {
  * the note below) to the wp-site-inventory-v1 server-entry shape.
  *
  * TRANSPORT/AUTH INTROSPECTION LIMIT (grounded against the adapter's own
- * source, WordPress/mcp-adapter v0.5.0: includes/Core/McpServer.php,
+ * source, WordPress/mcp-adapter version 0.5.0: includes/Core/McpServer.php,
  * includes/Core/McpTransportFactory.php): neither class exposes a public
  * getter for a server's registered transport class list after construction
  * -- the class names are consumed transiently by initialize_transports() to
