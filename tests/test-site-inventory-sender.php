@@ -228,6 +228,18 @@ $GLOBALS['cinatra_test']['users'][42] = ['roles' => ['administrator']];
 update_option('cinatra_connected_app_user_id', 42);
 check('the CAPTURED Application-Password user wins over the current browsing user', cinatra_resolve_connected_user_role() === 'administrator');
 
+echo "\nconnectedUserRole fallback is itself capability-gated (defense in depth, CodeRabbit r3679186099)\n";
+reset_inventory_fixture();
+$GLOBALS['cinatra_test']['current_user_roles'] = ['subscriber'];
+$GLOBALS['cinatra_test']['current_user_can'] = false; // Not a manage_options holder.
+check(
+    'a non-manage_options current user is NEVER reported, even with no captured AP user (reports "none" instead)',
+    cinatra_resolve_connected_user_role() === 'none'
+);
+
+$GLOBALS['cinatra_test']['current_user_can'] = true; // Restore: a manage_options holder still gets the documented fallback.
+check('a manage_options current user still gets the browsing-user fallback', cinatra_resolve_connected_user_role() === 'subscriber');
+
 echo "\ncinatra_capture_connected_app_user()\n";
 reset_inventory_fixture();
 cinatra_capture_connected_app_user(new WP_User(['editor'], 99), ['uuid' => 'abc']);
@@ -325,6 +337,20 @@ $_GET['page'] = 'some-other-plugin';
 cinatra_maybe_send_site_inventory_on_settings_load();
 check('no network call on a different admin page', count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
 check('no seq increment on a different admin page', (int) get_option('cinatra_inventory_seq', 0) === 0);
+
+echo "\npage-load gate: a low-privilege current user sends nothing (CodeRabbit r3679186099)\n";
+reset_inventory_fixture();
+$GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
+$_GET['page'] = 'cinatra';
+$GLOBALS['cinatra_test']['current_user_roles'] = ['subscriber'];
+$GLOBALS['cinatra_test']['current_user_can'] = false; // Mirrors cinatra_render_settings_page()'s own gate -- NOT a manage_options holder.
+$stale_attempt = time() - 10000; // Debounce window elapsed.
+update_option('cinatra_inventory_last_attempt', $stale_attempt);
+update_option('cinatra_inventory_last_hash', 'a-hash-that-can-never-match-the-real-payload'); // Payload would otherwise look "changed".
+cinatra_maybe_send_site_inventory_on_settings_load();
+check('no network call when the current user lacks manage_options', count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
+check('no seq increment when the current user lacks manage_options', (int) get_option('cinatra_inventory_seq', 0) === 0);
+check('last_attempt is untouched (the capability gate returns before any attempt bookkeeping)', (int) get_option('cinatra_inventory_last_attempt', 0) === $stale_attempt);
 
 echo "\npage-load gate: not connected is a no-op\n";
 reset_inventory_fixture();

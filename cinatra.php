@@ -5183,6 +5183,22 @@ add_action( 'application_password_did_authenticate', 'cinatra_capture_connected_
  * returned -- not a real WordPress role slug, so it can never be mistaken for
  * a verified non-administrator state.
  *
+ * The CURRENT-user fallback is itself gated to manage_options (CodeRabbit
+ * r3679186099, defense in depth): every caller of cinatra_send_site_inventory()
+ * that can run with an authenticated request context is already capability-
+ * gated to manage_options before it gets here -- trigger (a) is the Connect
+ * callback, trigger (b) is cinatra_maybe_send_site_inventory_on_settings_load()
+ * -- so this check should never actually flip the outcome for either of them.
+ * It exists so this function never trusts "whoever the current user happens
+ * to be" as a general-purpose signal: trigger (c), the daily WP-Cron run,
+ * normally executes via an unauthenticated loopback request (no current user
+ * at all), but a site running in WordPress's ALTERNATE_WP_CRON mode executes
+ * scheduled hooks INLINE on an arbitrary front-end visitor's own request --
+ * so without this gate, a logged-in low-privilege visitor's page load could
+ * still leak their role into a report they never triggered on purpose. With
+ * no manage_options holder as the current user, this reports "none", exactly
+ * like the true no-signal case below.
+ *
  * KNOWN LIMIT (unverified telemetry, disclosed): on a site where MORE THAN
  * ONE Application-Password client is active (a backup service, a mobile app,
  * another integration), the most-recently-observed user may belong to the
@@ -5211,8 +5227,10 @@ function cinatra_resolve_connected_user_role(): string {
 	// cinatra_ensure_current_user_role() (ensure-panel, epsilon) already reads
 	// the BROWSING user's primary role via wp_get_current_user() -- reused here
 	// as the documented fallback rather than a second implementation of the
-	// same read.
-	$current_role = cinatra_ensure_current_user_role();
+	// same read. Gated to manage_options -- see the docblock above -- so a
+	// current user who could not plausibly be the connected admin is never
+	// reported in their place.
+	$current_role = current_user_can( 'manage_options' ) ? cinatra_ensure_current_user_role() : '';
 	return '' !== $current_role ? cinatra_inventory_clip( $current_role, 64 ) : 'none';
 }
 
@@ -5623,11 +5641,22 @@ function cinatra_send_site_inventory(): void {
 }
 
 /**
- * D5 trigger (b): Settings -> Cinatra page-load gate. Sends ONLY when
- * connected AND the local debounce window has elapsed AND the freshly-built
- * payload differs from the last accepted one -- a normal admin browsing the
- * settings page repeatedly should almost never even reach the server-side
- * 60s debounce.
+ * D5 trigger (b): Settings -> Cinatra page-load gate. Sends ONLY when the
+ * current user could actually load that settings page AND connected AND the
+ * local debounce window has elapsed AND the freshly-built payload differs
+ * from the last accepted one -- a normal admin browsing the settings page
+ * repeatedly should almost never even reach the server-side 60s debounce.
+ *
+ * Capability-gated to manage_options (CodeRabbit r3679186099), matching
+ * cinatra_render_settings_page()'s own gate and add_options_page()'s
+ * registration: admin_init fires for EVERY authenticated admin-area request,
+ * BEFORE this settings page's own capability check runs later in the request
+ * lifecycle. Without this gate here, any logged-in low-privilege user
+ * hitting admin.php?page=cinatra would (a) trigger an outbound inventory
+ * POST they have no business triggering, and (b) -- via
+ * cinatra_resolve_connected_user_role()'s browsing-user fallback -- have
+ * their OWN role reported as the site's connectedUserRole, the opposite of
+ * this feature's fail-closed intent.
  *
  * @return void
  */
@@ -5637,6 +5666,10 @@ function cinatra_maybe_send_site_inventory_on_settings_load(): void {
 	// phpcs:enable WordPress.Security.NonceVerification.Recommended
 	if ( 'cinatra' !== $page ) {
 		return;
+	}
+
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return; // Same gate as the settings page itself (add_options_page() / cinatra_render_settings_page()).
 	}
 
 	$url     = (string) get_option( 'cinatra_url', '' );
