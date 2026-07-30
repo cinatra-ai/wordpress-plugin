@@ -48,11 +48,10 @@ this site meets the requirements for AI content-editing tools: the WordPress
 and PHP version floor, whether the site is served over HTTPS, and the
 install/activation status (with version) of the two optional companion
 plugins — the [WordPress MCP Adapter](https://github.com/WordPress/mcp-adapter)
-and [Enable Abilities for MCP](https://wordpress.org/plugins/enable-abilities-for-mcp/)
-— plus how many Cinatra AI abilities are currently enrolled and reachable by
-the assistant. Links to each plugin's install source are shown until it is
-active. Neither plugin is required for the base chat widget; both are
-required only for AI content-editing tools.
+and [Enable Abilities for MCP](https://wordpress.org/plugins/enable-abilities-for-mcp/).
+Links to each plugin's install source are shown until it is active. Neither
+plugin is required for the base chat widget; both are required only for AI
+content-editing tools.
 
 ## Permissions
 
