@@ -1597,6 +1597,14 @@ function cinatra_connect_apply_result( array $result ): void {
 	// instance keeps its working pair; a changed instance was already cleared
 	// by the option hooks).
 	cinatra_set_connect_result( 'success', __( 'Connected to Cinatra. The integration credential is stored on this server.', 'cinatra' ) );
+
+	// cinatra-ai/cinatra#2021 S6/eta — D5 trigger (a): an unconditional force
+	// send immediately after a successful handshake (a fresh connect should
+	// always report right away), plus (re)arm the daily cron fallback so an
+	// admin-quiet site still gets covered even if this was a reconnect that
+	// found the schedule already lost.
+	cinatra_ensure_site_inventory_cron_scheduled();
+	cinatra_send_site_inventory();
 }
 
 // ---------------------------------------------------------------------------
@@ -5036,3 +5044,660 @@ add_action(
 	}
 );
 
+// ---------------------------------------------------------------------------
+// Handshake enrichment sender (cinatra-ai/cinatra#2021 S6 / eta). Reports this
+// site's MCP server inventory to the cinatra core intake route
+// (POST {cinatra_url}/api/connect/site-inventory, cinatra-ai/cinatra#2206 /
+// S6-beta) so multi-server enrollment (cinatra-ai/cinatra#2018 S3) can enroll
+// or retire discovered servers without any manual configuration core-side.
+// Payload shape is pinned field-for-field to the cinatra repo's
+// docs/internals/contracts/wp-site-inventory-contract.md; see
+// cinatra_build_site_inventory_payload() below for the exact mapping.
+//
+// ONE shared builder/sender, THREE triggers (all call the same function --
+// no duplicated payload-building logic):
+// (a) an unconditional FORCE SEND immediately after a successful Connect
+// handshake (cinatra_connect_apply_result()'s success branch) -- a
+// fresh connect should always report immediately;
+// (b) Settings -> Cinatra page load, gated by BOTH a locally-persisted
+// last-attempt timestamp (>=60s + jitter -- matching, not racing, the
+// server's own 60s per-site debounce) AND a locally-computed payload
+// hash differing from the last ACCEPTED send -- an unchanged page
+// reload makes no network call and does not advance inventorySeq;
+// (c) a daily WP-Cron fallback (scheduled on plugin activation and on every
+// successful connect) for admin-quiet sites -- always sends, no gate,
+// since drift coverage (e.g. a third-party plugin silently adding an
+// MCP server) is the entire point of this trigger.
+//
+// inventorySeq increments ONCE PER ACTUAL SEND ATTEMPT (contract-required
+// monotonicity), never for a page load the local gate skipped before ever
+// calling the sender. A best-effort transient lock (same pattern as the
+// installer's double-click lock) serializes overlapping triggers so two
+// concurrent sends don't allocate the same seq; the residual race is
+// fail-closed either way (core's atomic anti-replay gate rejects a
+// duplicate as stale and the next tick self-heals). A 429/4xx/5xx/transport
+// failure is handled by simply NOT retrying inline -- the next cadence tick
+// naturally resends with a fresh, higher inventorySeq, which the contract's
+// monotonic-accept design always tolerates.
+//
+// Read-only from this site's perspective: this section only enumerates
+// existing state (get_servers(), plugin headers, WP/PHP versions) and sends
+// it outbound -- nothing here writes to the site, installs anything, or
+// touches the installer/CODEOWNERS-gated regions above. Every failure mode is
+// a SILENT no-op (no admin notice, no thrown exception, no retry loop); the
+// worst case is a stale or missing inventory row core-side, which S3's own
+// design already treats as fail-closed (fewer enrolled servers, never a
+// crash).
+// ---------------------------------------------------------------------------
+
+const CINATRA_SITE_INVENTORY_CONTRACT_VERSION   = 'v1';
+const CINATRA_SITE_INVENTORY_ENDPOINT_PATH      = '/api/connect/site-inventory';
+const CINATRA_SITE_INVENTORY_MAX_SERVERS        = 100; // Mirrors core's SITE_INVENTORY_MAX_SERVERS cap (defense in depth; core enforces this too).
+const CINATRA_SITE_INVENTORY_DEBOUNCE_SECONDS   = 60;  // Mirrors the core per-site debounce window (contract "Channel").
+const CINATRA_SITE_INVENTORY_JITTER_MAX_SECONDS = 15;  // The local page-load gate waits slightly LONGER than the server window (matching, not racing -- D5).
+const CINATRA_SITE_INVENTORY_CRON_HOOK          = 'cinatra_site_inventory_cron_send';
+const CINATRA_SITE_INVENTORY_SEND_LOCK_TTL      = 30;  // Seconds -- covers the 10s HTTP timeout + build time with headroom.
+// Client-side cap on the ENCODED payload, kept safely below the intake
+// route's hard 256 KB body cap: an over-cap send would be rejected whole
+// (and would still burn the debounce window), so the builder trims optional
+// content (descriptions first, then trailing entries) to fit BEFORE sending.
+const CINATRA_SITE_INVENTORY_MAX_BODY_BYTES = 245760; // 240 KB (route cap 256 KB minus headroom).
+// Mirrors core's DEFAULT_ADAPTER_SERVER_REST_PATH (connector-instance-site-inventory-contract.ts).
+const CINATRA_MCP_ADAPTER_DEFAULT_SERVER_REST_PATH = '/mcp/mcp-adapter-default-server';
+// Mirror the contract's own server-entry identity patterns (ADAPTER_SERVER_ID_PATTERN /
+// SERVER_NAMESPACE_PATTERN / SERVER_ROUTE_PATTERN) so a malformed third-party MCP
+// server is skipped client-side rather than 400-ing the WHOLE payload core-side
+// (the contract validates strictly -- one bad entry would otherwise block every
+// other valid server this site is reporting).
+const CINATRA_SITE_INVENTORY_SERVER_ID_PATTERN = '/^[a-z0-9][a-z0-9_.\-]{0,127}$/i';
+const CINATRA_SITE_INVENTORY_NAMESPACE_PATTERN = '/^[a-z0-9][a-z0-9_\-]{0,63}$/i';
+const CINATRA_SITE_INVENTORY_ROUTE_PATTERN     = '/^[a-z0-9][a-z0-9\/_\-]{0,127}$/i';
+
+/**
+ * Clip a value to a contract max length, as a string. Every bounded field in
+ * the payload goes through this: the intake contract's schema is STRICT with
+ * per-field max lengths, so ONE overlong value (a long plugin version header,
+ * a long custom role slug, a long server description) would otherwise reject
+ * the ENTIRE payload server-side. WordPress core polyfills mb_substr()
+ * (wp-includes/compat.php) so it always exists on a live site; the
+ * function_exists fallback keeps the standalone test harness (no WP loaded)
+ * honest too.
+ *
+ * @param mixed $value Value to stringify and clip.
+ * @param int   $max   Contract max length for the field.
+ * @return string The clipped string (may be '').
+ */
+function cinatra_inventory_clip( $value, int $max ): string {
+	$str = is_scalar( $value ) ? (string) $value : '';
+	if ( function_exists( 'mb_substr' ) ) {
+		return mb_substr( $str, 0, $max );
+	}
+	return substr( $str, 0, $max );
+}
+
+/**
+ * Capture which WordPress user's Application Password most recently
+ * authenticated a request against this site (D5). WordPress core fires this
+ * action on EVERY successful Application-Password-authenticated request
+ * (REST or XML-RPC), regardless of route.
+ *
+ * This plugin has no other way to identify "the connected Application-
+ * Password's owning user" that connectedUserRole must report: the plugin's
+ * own Connect handshake provisions the unrelated cnx_ credential and never
+ * creates or reads a WordPress Application Password. In practice cinatra's
+ * own MCP connection is normally the sole/primary consumer of this site's
+ * Application-Password-authenticated REST surface, so the MOST RECENTLY
+ * OBSERVED authentication is the best available proxy -- an honest,
+ * best-effort signal (surfacing only, per the contract's own note: "never an
+ * authorization input"), not a cryptographically verified binding to one
+ * specific integration.
+ *
+ * @param mixed $user The authenticated user (a WP_User on success).
+ * @param mixed $item Unused; the application-password record (uuid, name, ...).
+ * @return void
+ */
+function cinatra_capture_connected_app_user( $user, $item ): void { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- $item is part of the core hook signature; only the authenticated user id is needed here.
+	if ( ! ( $user instanceof WP_User ) || (int) $user->ID <= 0 ) {
+		return;
+	}
+	update_option( 'cinatra_connected_app_user_id', (int) $user->ID );
+}
+add_action( 'application_password_did_authenticate', 'cinatra_capture_connected_app_user', 10, 2 );
+
+/**
+ * Resolve the role to report as site.connectedUserRole (D5/D6): the primary
+ * role of the WordPress user whose Application Password most recently
+ * authenticated a request (see cinatra_capture_connected_app_user() above) --
+ * NOT simply whichever admin happens to be browsing wp-admin when the
+ * enrichment payload is built.
+ *
+ * Falls back to the CURRENT request's user only when no Application-Password
+ * authentication has ever been observed yet (e.g. immediately after Connect,
+ * before cinatra core has made its first authenticated MCP call). This
+ * fallback deliberately favors the fail-CLOSED direction over a synthetic
+ * "safe-looking" placeholder: the Connect flow itself is gated on
+ * manage_options, so the acting admin is often an Administrator, and
+ * reporting their real role means the cinatra-side least-privilege warning
+ * (D6/D8) is more likely to surface, never less. When there is truly no user
+ * context at all (e.g. a WP-Cron run before any signal exists), "none" is
+ * returned -- not a real WordPress role slug, so it can never be mistaken for
+ * a verified non-administrator state.
+ *
+ * KNOWN LIMIT (unverified telemetry, disclosed): on a site where MORE THAN
+ * ONE Application-Password client is active (a backup service, a mobile app,
+ * another integration), the most-recently-observed user may belong to the
+ * OTHER client -- including understating privilege (cinatra's connection
+ * owned by an administrator while a lower-privilege client authenticated
+ * last). The consumer treats this field as an unverified hint, never a
+ * verified-safe signal: the contract marks it "surfacing only, never an
+ * authorization input", and the core-side least-privilege card renders an
+ * explicit unknown/hint state rather than trusting silence or a
+ * non-administrator name as proof of safety.
+ *
+ * @return string The role slug to report (never empty; clipped to the
+ *                contract's 64-char field bound).
+ */
+function cinatra_resolve_connected_user_role(): string {
+	$captured_id = (int) get_option( 'cinatra_connected_app_user_id', 0 );
+	if ( $captured_id > 0 ) {
+		$captured = get_userdata( $captured_id );
+		if ( $captured instanceof WP_User && ! empty( $captured->roles ) ) {
+			$role = reset( $captured->roles );
+			if ( is_string( $role ) && '' !== $role ) {
+				return cinatra_inventory_clip( $role, 64 );
+			}
+		}
+	}
+	// cinatra_ensure_current_user_role() (ensure-panel, epsilon) already reads
+	// the BROWSING user's primary role via wp_get_current_user() -- reused here
+	// as the documented fallback rather than a second implementation of the
+	// same read.
+	$current_role = cinatra_ensure_current_user_role();
+	return '' !== $current_role ? cinatra_inventory_clip( $current_role, 64 ) : 'none';
+}
+
+/**
+ * Map one live MCP Adapter server (\WP\MCP\Core\McpServer, duck-typed -- see
+ * the note below) to the wp-site-inventory-v1 server-entry shape.
+ *
+ * TRANSPORT/AUTH INTROSPECTION LIMIT (grounded against the adapter's own
+ * source, WordPress/mcp-adapter v0.5.0: includes/Core/McpServer.php,
+ * includes/Core/McpTransportFactory.php): neither class exposes a public
+ * getter for a server's registered transport class list after construction
+ * -- the class names are consumed transiently by initialize_transports() to
+ * instantiate transport objects and are never retained -- and the adapter
+ * exposes no site-authoritative "requires its own auth" flag either. Two
+ * honest, documented, conservative choices follow from that real API gap:
+ *   - transports: HttpTransport is the ONLY transport implementation the
+ *     adapter ships today (includes/Transport/ contains just the one class),
+ *     and it maps to this contract's "streamable-http" -- every discovered
+ *     server is reported that way. A future adapter release shipping
+ *     additional transport classes would need this revisited once a public
+ *     introspection point exists.
+ *   - requiresDedicatedAuth: a server registered with a NON-default
+ *     transport permission callback (get_transport_permission_callback() !==
+ *     null) has opted out of the adapter's own default is_user_logged_in()
+ *     gate -- the closest observable proxy for "this server's auth model may
+ *     not be the one cinatra's connection uses." Reporting present-not-
+ *     enrolled in that case (rather than guessing auto-enrollable) is the
+ *     safe direction: it never silently claims an auth model this plugin
+ *     cannot verify.
+ *
+ * A malformed identity (adapterServerId/namespace/route outside the
+ * contract's own grammar) is skipped -- returns null -- rather than sent: the
+ * contract validates the WHOLE payload strictly, so one bad entry from an
+ * oddly-configured third-party MCP server must never block every OTHER valid
+ * server this site is reporting.
+ *
+ * $server is intentionally untyped (duck-typed via method_exists(), mirroring
+ * cinatra_register_mcp_content_server()'s existing $adapter handling) so
+ * tests can exercise this against a fixture object without the real
+ * WordPress/mcp-adapter plugin installed.
+ *
+ * @param mixed $server An MCP Adapter server object from get_servers().
+ * @return array<string,mixed>|null The mapped server entry, or null to skip it.
+ */
+function cinatra_map_adapter_server_to_inventory_entry( $server ): ?array {
+	if ( ! is_object( $server )
+		|| ! method_exists( $server, 'get_server_id' )
+		|| ! method_exists( $server, 'get_server_route_namespace' )
+		|| ! method_exists( $server, 'get_server_route' )
+		|| ! method_exists( $server, 'get_server_name' )
+	) {
+		return null;
+	}
+
+	$server_id = $server->get_server_id();
+	$namespace = $server->get_server_route_namespace();
+	$route     = $server->get_server_route();
+
+	// Identity fields are never clipped (clipping would corrupt identity) --
+	// a non-scalar or grammar-violating value skips the entry outright.
+	if ( ! is_scalar( $server_id ) || ! is_scalar( $namespace ) || ! is_scalar( $route ) ) {
+		return null;
+	}
+	$server_id = (string) $server_id;
+	$namespace = (string) $namespace;
+	$route     = (string) $route;
+
+	if ( ! preg_match( CINATRA_SITE_INVENTORY_SERVER_ID_PATTERN, $server_id )
+		|| ! preg_match( CINATRA_SITE_INVENTORY_NAMESPACE_PATTERN, $namespace )
+		|| ! preg_match( CINATRA_SITE_INVENTORY_ROUTE_PATTERN, $route )
+	) {
+		return null;
+	}
+
+	$rest_path = '/' . $namespace . '/' . $route;
+	$name      = cinatra_inventory_clip( $server->get_server_name(), 200 );
+	if ( '' === $name ) {
+		$name = $server_id;
+	}
+
+	// Fail toward LESS trust on the unknown: a duck-typed object that does not
+	// even expose the permission-callback getter cannot prove it uses the
+	// adapter's default auth model, so it is reported as requiring dedicated
+	// auth (core surfaces it present-not-enrolled instead of auto-enrolling).
+	$requires_dedicated_auth = method_exists( $server, 'get_transport_permission_callback' )
+		? ( null !== $server->get_transport_permission_callback() )
+		: true;
+
+	$tool_count = 0;
+	if ( method_exists( $server, 'get_tools' ) ) {
+		$tools      = $server->get_tools();
+		$tool_count = is_array( $tools ) ? count( $tools ) : 0;
+	}
+
+	$entry = array(
+		'adapterServerId'       => $server_id,
+		'namespace'             => $namespace,
+		'route'                 => $route,
+		'restPath'              => $rest_path,
+		'name'                  => $name,
+		'transports'            => array( 'streamable-http' ),
+		'requiresDedicatedAuth' => $requires_dedicated_auth,
+		'isDefault'             => ( CINATRA_MCP_ADAPTER_DEFAULT_SERVER_REST_PATH === $rest_path ),
+		'toolCount'             => $tool_count,
+	);
+
+	if ( method_exists( $server, 'get_server_description' ) ) {
+		$description = cinatra_inventory_clip( $server->get_server_description(), 2000 );
+		if ( '' !== $description ) {
+			$entry['description'] = $description;
+		}
+	}
+	if ( method_exists( $server, 'get_server_version' ) ) {
+		$version = cinatra_inventory_clip( $server->get_server_version(), 64 );
+		if ( '' !== $version ) {
+			$entry['version'] = $version;
+		}
+	}
+
+	return $entry;
+}
+
+/**
+ * Enumerate every MCP server the live WordPress MCP Adapter registry reports
+ * and map each to the wp-site-inventory-v1 server-entry shape (D5). Mirrors
+ * cinatra_ensure_content_server_ability_count()'s defensive-read style
+ * (autoload=false class check, method_exists guards, catch-all \Throwable) --
+ * this reads a live third-party registry the plugin does not control, so it
+ * must degrade to an empty list, never fatal, on any unexpected shape.
+ *
+ * @return array<int,array<string,mixed>> Mapped server entries (possibly empty).
+ */
+function cinatra_collect_adapter_server_inventory(): array {
+	// Autoload=false: a presence CHECK, not a load request (same reasoning as
+	// cinatra_ensure_content_server_ability_count()).
+	if ( ! class_exists( '\WP\MCP\Core\McpAdapter', false ) ) {
+		return array();
+	}
+	try {
+		$adapter = \WP\MCP\Core\McpAdapter::instance();
+		if ( ! is_object( $adapter ) || ! method_exists( $adapter, 'get_servers' ) ) {
+			return array();
+		}
+		$registry = $adapter->get_servers();
+		if ( ! is_array( $registry ) ) {
+			return array();
+		}
+	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- defensive catch-all; an empty list is itself the fail-safe signal, nothing to log to without a logging dependency.
+		return array();
+	}
+
+	$entries  = array();
+	$seen_ids = array();
+	foreach ( $registry as $server ) {
+		// Per-entry containment: any single server object whose getter throws
+		// (or returns an uncastable value) skips ONLY that entry -- one broken
+		// third-party MCP server must never crash the admin page load / cron /
+		// handshake this send piggybacks on ("silent no-op" is a hard claim).
+		try {
+			$entry = cinatra_map_adapter_server_to_inventory_entry( $server );
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- defensive catch-all; skipping the one broken entry IS the handling.
+			continue;
+		}
+		if ( null === $entry ) {
+			continue;
+		}
+		// The contract rejects duplicate adapterServerId values payload-wide --
+		// dedupe here (first entry wins) so one misbehaving registry can never
+		// poison every OTHER server's enrollment. The real adapter registry is
+		// keyed by server id (duplicates structurally impossible there); this
+		// guards the duck-typed/defensive path.
+		if ( isset( $seen_ids[ $entry['adapterServerId'] ] ) ) {
+			continue;
+		}
+		$seen_ids[ $entry['adapterServerId'] ] = true;
+
+		$entries[] = $entry;
+		if ( count( $entries ) >= CINATRA_SITE_INVENTORY_MAX_SERVERS ) {
+			break;
+		}
+	}
+	return $entries;
+}
+
+/**
+ * Build the v1 wp-site-inventory payload (D5, single shared builder for all
+ * three triggers). Mirrors docs/internals/contracts/wp-site-inventory-
+ * contract.md (cinatra repo) field-for-field; the STRICT schema
+ * (wpSiteInventoryV1Schema) rejects unknown keys, so every key added here is
+ * intentional and no extra key is ever included.
+ *
+ * The inventorySeq field is READ, never incremented, here --
+ * cinatra_send_site_inventory() increments it once per actual SEND ATTEMPT
+ * (contract-required monotonicity), immediately before calling this function
+ * for a send that is actually going out.
+ *
+ * @return array<string,mixed> The v1 payload (unsigned; the caller adds auth headers).
+ */
+function cinatra_build_site_inventory_payload(): array {
+	$adapter_state = cinatra_ensure_plugin_state( CINATRA_MCP_ADAPTER_PLUGIN_FILE );
+	$catalog_state = cinatra_ensure_plugin_state( CINATRA_CATALOG_PLUGIN_FILE );
+
+	$adapter_version = null;
+	$servers         = array();
+	if ( $adapter_state['active'] ) {
+		// site.adapterVersion=null is the contract's "adapter absent" signal
+		// (servers[] MUST then be empty) -- gate on ACTIVE, not merely
+		// installed, since get_servers() can only ever be called when active.
+		$adapter_version = ( '' !== $adapter_state['version'] ) ? cinatra_inventory_clip( $adapter_state['version'], 64 ) : 'unknown';
+		$servers         = cinatra_collect_adapter_server_inventory();
+	}
+
+	$abilities_version = ( '' !== $catalog_state['version'] ) ? cinatra_inventory_clip( $catalog_state['version'], 64 ) : null;
+
+	// Every bounded string field is clipped to the contract's own max (the
+	// schema is STRICT: one overlong plugin-header/version/role value would
+	// reject the ENTIRE payload). wpVersion also guards min(1) -- a broken
+	// get_bloginfo() must not produce an empty required field.
+	$wp_version = cinatra_inventory_clip( get_bloginfo( 'version' ), 32 );
+	if ( '' === $wp_version ) {
+		$wp_version = 'unknown';
+	}
+
+	$payload = array(
+		'contractVersion' => CINATRA_SITE_INVENTORY_CONTRACT_VERSION,
+		'client'          => CINATRA_CONNECT_CLIENT,
+		'inventorySeq'    => (int) get_option( 'cinatra_inventory_seq', 0 ),
+		'collectedAt'     => gmdate( 'Y-m-d\TH:i:s\Z' ),
+		'site'            => array(
+			'wpVersion'              => $wp_version,
+			'phpVersion'             => cinatra_inventory_clip( PHP_VERSION, 32 ),
+			'adapterVersion'         => $adapter_version,
+			'abilitiesPluginVersion' => $abilities_version,
+			'connectedUserRole'      => cinatra_resolve_connected_user_role(),
+			'permalinkStructure'     => ( '' !== (string) get_option( 'permalink_structure', '' ) ) ? 'pretty' : 'plain',
+		),
+		'servers'         => $servers,
+	);
+
+	// claimedInstanceId is optional (disambiguation only, per the contract) --
+	// include it when this site already knows its host-issued instance id, so
+	// the intake route need not rely solely on the Origin match.
+	$instance_id = (string) get_option( 'cinatra_instance_id', '' );
+	if ( '' !== $instance_id ) {
+		$payload['claimedInstanceId'] = cinatra_inventory_clip( $instance_id, 128 );
+	}
+
+	return cinatra_fit_site_inventory_payload( $payload );
+}
+
+/**
+ * Fit a built payload under the intake route's body cap (client-side half of
+ * the contract's 256 KB limit). An over-cap send would be rejected WHOLE --
+ * and at worst case (100 servers x a 2000-char description each) the encoded
+ * payload genuinely can exceed the cap, so optional content is shed in
+ * priority order until it fits: first every server's optional description
+ * (the bulkiest optional field), then trailing server entries. Identity and
+ * required fields are never touched -- a trimmed payload is still a valid,
+ * honest (if less descriptive) inventory, which beats a rejected one.
+ *
+ * @param array<string,mixed> $payload A built payload.
+ * @return array<string,mixed> The payload, trimmed if needed to fit the cap.
+ */
+function cinatra_fit_site_inventory_payload( array $payload ): array {
+	$encoded = wp_json_encode( $payload );
+	if ( is_string( $encoded ) && strlen( $encoded ) <= CINATRA_SITE_INVENTORY_MAX_BODY_BYTES ) {
+		return $payload;
+	}
+
+	// Shed pass 1: drop every optional description.
+	foreach ( $payload['servers'] as $i => $entry ) {
+		unset( $payload['servers'][ $i ]['description'] );
+	}
+	$payload['servers'] = array_values( $payload['servers'] );
+	$encoded            = wp_json_encode( $payload );
+	if ( is_string( $encoded ) && strlen( $encoded ) <= CINATRA_SITE_INVENTORY_MAX_BODY_BYTES ) {
+		return $payload;
+	}
+
+	// Shed pass 2: drop trailing server entries until the payload fits (the
+	// loop always terminates -- an empty servers list plus the bounded site
+	// block is far below the cap).
+	while ( ! empty( $payload['servers'] ) ) {
+		array_pop( $payload['servers'] );
+		$encoded = wp_json_encode( $payload );
+		if ( is_string( $encoded ) && strlen( $encoded ) <= CINATRA_SITE_INVENTORY_MAX_BODY_BYTES ) {
+			break;
+		}
+	}
+	return $payload;
+}
+
+/**
+ * Stable hash of a built payload for the local "did anything change since the
+ * last accepted send" gate (D5, trigger (b) only -- never consulted by the
+ * unconditional handshake force-send or the always-send daily cron).
+ * inventorySeq/collectedAt are excluded: both change on every build by
+ * construction and would defeat the "nothing changed" comparison.
+ *
+ * @param array<string,mixed> $payload A built payload, as from cinatra_build_site_inventory_payload().
+ * @return string A sha256 hex digest of the content-relevant fields.
+ */
+function cinatra_hash_site_inventory_payload( array $payload ): string {
+	$stable = $payload;
+	unset( $stable['inventorySeq'], $stable['collectedAt'] );
+	return hash( 'sha256', (string) wp_json_encode( $stable ) );
+}
+
+/**
+ * Send the current site inventory to the cinatra core intake route (D5).
+ * Shared by all three triggers -- see the call sites (Connect-handshake
+ * success, the Settings-page-load gate, and the daily WP-Cron fallback) for
+ * WHEN this actually fires; callers gate BEFORE calling this, never after.
+ *
+ * The inventorySeq field is incremented ONCE per call to this function (one
+ * increment per actual SEND ATTEMPT, contract-required monotonicity) --
+ * never call this speculatively.
+ *
+ * Every failure mode (not connected, transport error, non-2xx including 429)
+ * is a silent no-op: this never throws, never surfaces an admin notice, and
+ * NEVER retries inline -- the next cadence tick (cron / page load / a future
+ * handshake) naturally retries with a fresh, higher inventorySeq, which the
+ * contract's monotonic-accept design always tolerates.
+ *
+ * @return void
+ */
+function cinatra_send_site_inventory(): void {
+	$url     = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
+	$api_key = (string) get_option( 'cinatra_api_key', '' );
+	if ( '' === $url || '' === $api_key ) {
+		return; // Not connected -- nothing to report.
+	}
+
+	// Best-effort concurrency guard (same transient-lock pattern as the
+	// installer's double-click lock): two overlapping triggers -- e.g. the
+	// Connect force-send racing an admin_init page load -- would otherwise
+	// read-modify-write the seq/timestamp options concurrently and could
+	// allocate the SAME inventorySeq twice (a classic lost update). A
+	// contended caller simply skips: another send is in flight with fresher
+	// state, and the next cadence tick covers anything it missed. DISCLOSED
+	// RESIDUAL: get_transient+set_transient is check-then-set, not atomic
+	// (WordPress has no portable atomic increment without direct SQL), so a
+	// microsecond-window race remains -- it is FAIL-CLOSED end to end: the
+	// intake route's atomic anti-replay gate rejects a duplicate seq as
+	// stale (applying nothing), and the next tick resends with a fresh
+	// higher seq. Same accepted tradeoff as the installer lock.
+	if ( false !== get_transient( 'cinatra_inventory_send_lock' ) ) {
+		return;
+	}
+	set_transient( 'cinatra_inventory_send_lock', 1, CINATRA_SITE_INVENTORY_SEND_LOCK_TTL );
+
+	try {
+		// One increment per ATTEMPT, before the network call, so a failed/timed-out
+		// attempt still advances the counter AND opens the local debounce window --
+		// this is what makes "don't retry inline" actually hold at the page-load
+		// trigger, since cinatra_inventory_last_attempt is what that gate reads.
+		update_option( 'cinatra_inventory_seq', (int) get_option( 'cinatra_inventory_seq', 0 ) + 1 );
+		update_option( 'cinatra_inventory_last_attempt', time() );
+
+		$payload = cinatra_build_site_inventory_payload();
+
+		// Assert THIS site's own origin, exactly like the widget-auth relays and
+		// the token broker (cinatra_rest_mint_token(), cinatra_rest_widget_auth_relay())
+		// -- the instance's cnx_ arm requires a paired Origin === the credential's
+		// bound connect-site origin and fails closed on a missing/mismatched one.
+		$origin = cinatra_site_origin( admin_url() );
+		if ( '' === $origin ) {
+			return;
+		}
+
+		$server_base = cinatra_server_base_url( $url );
+		$response    = cinatra_server_post(
+			$server_base . CINATRA_SITE_INVENTORY_ENDPOINT_PATH,
+			array(
+				'timeout' => 10,
+				'headers' => array(
+					'Authorization' => 'Bearer ' . $api_key,
+					'Content-Type'  => 'application/json',
+					'Accept'        => 'application/json',
+					'Origin'        => $origin,
+				),
+				'body'    => wp_json_encode( $payload ),
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			error_log( '[cinatra] site-inventory send failed (transport): ' . cinatra_scrub_secret( $response->get_error_message(), $api_key ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional fixed-scope server-side warning; the long-lived key is scrubbed and no payload/instance detail is logged.
+			return;
+		}
+
+		$status = (int) wp_remote_retrieve_response_code( $response );
+		if ( $status < 200 || $status >= 300 ) {
+			// Includes 429 (server-side debounce) and any 4xx/5xx -- logged for
+			// diagnosis, NEVER retried inline; the next trigger naturally resends
+			// with a fresh, higher inventorySeq. Never reflects the upstream body.
+			error_log( '[cinatra] site-inventory send rejected: HTTP ' . $status ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional fixed-text + status-only server-side warning; never logs the payload or any upstream response body.
+			return;
+		}
+
+		// Accepted -- persist the hash so the page-load gate (trigger b) can skip
+		// an unchanged resend until something actually changes.
+		update_option( 'cinatra_inventory_last_hash', cinatra_hash_site_inventory_payload( $payload ) );
+	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- defensive catch-all: the sender piggybacks on admin page loads / cron / the connect handshake and must NEVER fatal them; skipping the send IS the handling (next tick retries).
+		return;
+	} finally {
+		delete_transient( 'cinatra_inventory_send_lock' );
+	}
+}
+
+/**
+ * D5 trigger (b): Settings -> Cinatra page-load gate. Sends ONLY when
+ * connected AND the local debounce window has elapsed AND the freshly-built
+ * payload differs from the last accepted one -- a normal admin browsing the
+ * settings page repeatedly should almost never even reach the server-side
+ * 60s debounce.
+ *
+ * @return void
+ */
+function cinatra_maybe_send_site_inventory_on_settings_load(): void {
+	// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Read-only screen identification (which admin page loaded); no form processing, no state change.
+	$page = isset( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : '';
+	// phpcs:enable WordPress.Security.NonceVerification.Recommended
+	if ( 'cinatra' !== $page ) {
+		return;
+	}
+
+	$url     = (string) get_option( 'cinatra_url', '' );
+	$api_key = (string) get_option( 'cinatra_api_key', '' );
+	if ( '' === $url || '' === $api_key ) {
+		return; // Not connected.
+	}
+
+	$last_attempt = (int) get_option( 'cinatra_inventory_last_attempt', 0 );
+	$jitter       = wp_rand( 0, CINATRA_SITE_INVENTORY_JITTER_MAX_SECONDS );
+	if ( time() - $last_attempt < ( CINATRA_SITE_INVENTORY_DEBOUNCE_SECONDS + $jitter ) ) {
+		return; // The local debounce window (matching, not racing, the server's) hasn't elapsed.
+	}
+
+	// Build a throwaway payload ONLY to compare its hash -- no seq increment,
+	// no network call, for a comparison that finds nothing changed. Same
+	// silent-containment posture as the sender itself: this runs on an admin
+	// page load and must NEVER fatal it -- on any runtime error, skip the
+	// hash shortcut and let the (self-contained) sender decide.
+	try {
+		$candidate = cinatra_build_site_inventory_payload();
+		if ( cinatra_hash_site_inventory_payload( $candidate ) === (string) get_option( 'cinatra_inventory_last_hash', '' ) ) {
+			return; // Nothing changed since the last accepted send.
+		}
+	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- defensive catch-all: an unhashable candidate just skips the local shortcut; the sender below contains its own failures.
+		// Fall through to the sender, which is itself fully contained.
+		unset( $e );
+	}
+
+	cinatra_send_site_inventory();
+}
+add_action( 'admin_init', 'cinatra_maybe_send_site_inventory_on_settings_load' );
+
+/**
+ * Ensure the daily site-inventory WP-Cron fallback (D5 trigger (c)) is
+ * scheduled. Idempotent -- safe to call from both plugin activation and every
+ * successful Connect (covers a site that connected before this cron existed,
+ * or whose schedule was somehow lost).
+ *
+ * @return void
+ */
+function cinatra_ensure_site_inventory_cron_scheduled(): void {
+	if ( ! wp_next_scheduled( CINATRA_SITE_INVENTORY_CRON_HOOK ) ) {
+		wp_schedule_event( time(), 'daily', CINATRA_SITE_INVENTORY_CRON_HOOK );
+	}
+}
+register_activation_hook( __FILE__, 'cinatra_ensure_site_inventory_cron_scheduled' );
+
+/**
+ * Unschedule the site-inventory cron on deactivation -- a deactivated plugin
+ * must not keep firing background sends.
+ *
+ * @return void
+ */
+function cinatra_unschedule_site_inventory_cron(): void {
+	wp_clear_scheduled_hook( CINATRA_SITE_INVENTORY_CRON_HOOK );
+}
+register_deactivation_hook( __FILE__, 'cinatra_unschedule_site_inventory_cron' );
+
+// D5 trigger (c): daily fallback, unconditional (cinatra_send_site_inventory()
+// itself is the single "not connected -> no-op" guard, matching every other
+// trigger; drift coverage is the entire point of this trigger, so it carries
+// no debounce/hash gate of its own).
+add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );

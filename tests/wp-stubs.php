@@ -33,6 +33,8 @@ $GLOBALS['cinatra_test'] = [
     'wp_version'           => '6.9', // get_bloginfo('version') stub
     'is_ssl'               => true,  // is_ssl() stub
     'current_user_roles'   => [],   // WP_User::$roles for wp_get_current_user() stub
+    'users'                => [],   // user_id => ['roles' => [...]] for get_userdata() stub
+    'cron_scheduled'       => [],   // hook => timestamp for wp_next_scheduled()/wp_schedule_event() stubs
 ];
 
 // ---------------------------------------------------------------------------
@@ -168,12 +170,57 @@ function is_ssl() {
 }
 class WP_User {
     public $roles;
-    public function __construct(array $roles = []) {
+    // ID defaults to 0 (no back-compat break: every EXISTING `new WP_User($roles)`
+    // call site keeps working unchanged) — added for cinatra-ai/cinatra#2021
+    // S6/eta, which needs the id of a user OTHER than the current one
+    // (get_userdata() below), not just their roles.
+    public $ID;
+    public function __construct(array $roles = [], $id = 0) {
         $this->roles = $roles;
+        $this->ID = (int) $id;
     }
 }
 function wp_get_current_user() {
-    return new WP_User((array) ($GLOBALS['cinatra_test']['current_user_roles'] ?? []));
+    return new WP_User((array) ($GLOBALS['cinatra_test']['current_user_roles'] ?? []), (int) ($GLOBALS['cinatra_test']['current_user_id'] ?? 0));
+}
+// get_userdata(): fixture-driven via $GLOBALS['cinatra_test']['users'][$id] =
+// ['roles' => [...]] (cinatra-ai/cinatra#2021 S6/eta — resolving the role of a
+// specific captured user id, not the current one). Returns false for an
+// unknown id, matching real WordPress.
+function get_userdata($user_id) {
+    $row = $GLOBALS['cinatra_test']['users'][(int) $user_id] ?? null;
+    if (!is_array($row)) {
+        return false;
+    }
+    return new WP_User((array) ($row['roles'] ?? []), (int) $user_id);
+}
+// wp_rand(): WordPress's own seeded rand() wrapper — a plain mt_rand() stand-in
+// is sufficient for tests, which pin the surrounding window wide enough that
+// the exact jitter value never changes the pass/fail outcome.
+function wp_rand($min = 0, $max = 0) {
+    return mt_rand((int) $min, (int) $max);
+}
+// Activation/deactivation hook + WP-Cron stubs (cinatra-ai/cinatra#2021 S6/eta
+// — the site-inventory daily fallback). register_activation_hook()/
+// register_deactivation_hook() are called UNCONDITIONALLY at cinatra.php's
+// top level, so every test that requires cinatra.php needs these defined,
+// even tests unrelated to the sender — capture-only, mirroring add_action().
+function register_activation_hook($file, $callback) {
+    $GLOBALS['cinatra_test_activation_cbs'][] = $callback;
+}
+function register_deactivation_hook($file, $callback) {
+    $GLOBALS['cinatra_test_deactivation_cbs'][] = $callback;
+}
+function wp_next_scheduled($hook) {
+    return $GLOBALS['cinatra_test']['cron_scheduled'][$hook] ?? false;
+}
+function wp_schedule_event($timestamp, $recurrence, $hook) {
+    $GLOBALS['cinatra_test']['cron_scheduled'][$hook] = $timestamp;
+    return true;
+}
+function wp_clear_scheduled_hook($hook) {
+    unset($GLOBALS['cinatra_test']['cron_scheduled'][$hook]);
+    return true;
 }
 // HTML sanitisation stubs (pass-through for tests; the tag/attribute filter is irrelevant
 // in the test harness since no real HTML output is asserted in these tests).

@@ -27,6 +27,14 @@ function cinatra_uninstall_option_keys(): array {
 		'cinatra_webhook_secret',
 		'cinatra_webhook_binding_id',
 		'cinatra_webhook_subscriptions',
+		// Site-inventory enrichment sender bookkeeping (cinatra-ai/cinatra#2021
+		// S6/eta) — mirrors CINATRA_SITE_INVENTORY_CRON_HOOK's option names in
+		// cinatra.php (uninstall.php intentionally does not load the main
+		// plugin file).
+		'cinatra_inventory_seq',
+		'cinatra_inventory_last_attempt',
+		'cinatra_inventory_last_hash',
+		'cinatra_connected_app_user_id',
 		// Legacy keys from the pre-rename plugin (cinatra-widget.php).
 		'cinatra_widget_url',
 		'cinatra_widget_api_key',
@@ -42,6 +50,12 @@ function cinatra_uninstall_cleanup_current_site(): void {
 	foreach ( cinatra_uninstall_option_keys() as $key ) {
 		delete_option( $key );
 	}
+
+	// Clear the daily site-inventory cron (cinatra-ai/cinatra#2021 S6/eta) —
+	// mirrors CINATRA_SITE_INVENTORY_CRON_HOOK in cinatra.php. WP-Cron events
+	// are per-site, so this must run inside the per-blog switch on multisite,
+	// same as the option cleanup above.
+	wp_clear_scheduled_hook( 'cinatra_site_inventory_cron_send' );
 
 	// Per-user connect result + per-state connect transients. WordPress has no
 	// wildcard transient delete, so sweep the options table for our prefixes.
