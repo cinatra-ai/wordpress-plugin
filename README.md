@@ -89,7 +89,7 @@ token-exchange contract schemas live in the cinatra repository under
 > (`POST /api/assistants/chat` + `GET /api/assistants/chat/capabilities`), and
 > one-click connect (`/connect/authorize` + `/api/connect/token`) endpoints. The
 > legacy `/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
-> relay were retired (cinatra#1991); a pre-cutover instance is no longer supported.
+> relay were retired; a pre-cutover instance is no longer supported.
 
 ## Development
 

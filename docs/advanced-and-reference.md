@@ -42,7 +42,7 @@ version; it mounts unconditionally (login-gated) and mints the short-lived `cit_
 site token through the same-origin PHP broker. Server-side token exchange is
 always required — the browser never holds a long-lived key. The legacy
 `/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
-relay were retired (cinatra#1991); a pre-cutover instance is no longer supported.
+relay were retired; a pre-cutover instance is no longer supported.
 
 ## REST surface (high level)
 
