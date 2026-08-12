@@ -603,7 +603,7 @@ async function main() {
           const [key, raw] = [...store._map.entries()][0];
           const entry = JSON.parse(raw);
           return key.indexOf("cinatra.widget.thread.v1|") === 0 &&
-            key.indexOf("|7") === key.length - 2 &&           // keyed by the CMS user
+            key.slice(-2) === "|7" &&                        // keyed by the CMS user
             Object.keys(entry).sort().join(",") === "at,id" &&
             entry.id === firstMsg.session.threadId &&
             !/cwu_|cit_|cnx_/i.test(raw);
