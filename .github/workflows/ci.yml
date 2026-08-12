@@ -82,6 +82,23 @@ jobs:
         # reintroduction of the dead /api/{wordpress,drupal}/bundle.js route in
         # shipped/admin/schema strings. See cinatra docs/widget-source-of-truth.md.
         run: node tools/widget-parity-check.mjs
+      - name: Lexer probes for the parity gate's comment/regex stripper (cinatra#411)
+        # Direct unit probes of stripComments() against the counterexamples that
+        # motivated replacing the old per-line comment heuristic with a real
+        # scanner: a banned token hidden behind a regex literal, a comment inside
+        # a template expression, and regex-vs-division disambiguation after
+        # `return` / a control-condition `)` / a keyword-named member. Reads the
+        # function straight out of tools/widget-parity-check.mjs, so a change to
+        # the real stripper is probed as written, not as remembered. Byte-
+        # identical to the sibling repo's copy (cross-repo lockstep).
+        run: node tools/lexer-probe.mjs
+      - name: Mutation coverage of the parity gate's invariants (cinatra#411)
+        # Negative controls: 37 mutations, each removing exactly one protection
+        # from the canonical vendored widget, must turn the gate above RED. An
+        # assertion that stays green under its own mutation is hollow — this is
+        # what keeps the gate itself honest as the widget evolves. Byte-identical
+        # to the sibling repo's copy (cross-repo lockstep).
+        run: node tools/mutate-check.mjs
 
   readme-validate:
     runs-on: ubuntu-latest
