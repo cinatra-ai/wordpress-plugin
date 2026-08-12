@@ -1013,10 +1013,110 @@ assert(
     /window\.location\s*&&\s*window\.location\.origin/.test(code),
   "no same-origin refusal — protocol 2's credential guarantee does not exist when the frame shares the page's origin, and the widget must not pretend otherwise",
 );
+// 7g — WEB STORAGE: A BAN THAT BECAME A CHANNEL (cinatra#2683).
+//
+// This used to be "no web storage at all", and that was the right invariant while
+// the widget's conversation could not outlive a page load anyway: storage is the
+// one place a credential could come to REST rather than merely pass through, and a
+// shell with nothing to remember should be forbidden to remember.
+//
+// S8f gave it exactly one thing to remember. `threadId: correlationId` ended the
+// person's conversation at every reload — the frame asked to resume a thread that
+// had never existed — so the widget now persists the THREAD ID, keyed by (site,
+// user). A thread id is public context: it names which conversation to resume, and
+// the instance authorizes it against the frame's own signed-in reader before
+// serving a message.
+//
+// So the ban is narrowed rather than dropped, and the narrowing is what is
+// asserted: `sessionStorage` stays forbidden outright; `localStorage` may be
+// touched in exactly ONE accessor; and the write path is a CHOKE POINT that
+// accepts a thread id by shape and runs it through the SAME credential guard every
+// outbound message passes. A credential still cannot be persisted — now by
+// construction rather than by absence.
 assert(
-  "no web storage in the widget (localStorage/sessionStorage) — nothing can be persisted",
-  !/\b(?:local|session)Storage\b/.test(code),
-  "the widget references localStorage/sessionStorage — the iframe owns persistence",
+  "7g — sessionStorage is still forbidden outright",
+  !/\bsessionStorage\b/.test(code),
+  "the widget references sessionStorage — only the (site,user)-keyed thread id may be persisted, and it lives in localStorage",
+);
+const localStorageHits = (code.match(/\blocalStorage\b/g) || []).length;
+assert(
+  "7g — localStorage is reached through EXACTLY ONE accessor (threadStore)",
+  localStorageHits === 1 &&
+    /function\s+threadStore\s*\(\s*\)\s*\{[\s\S]{0,400}?window\.localStorage/.test(code),
+  `the widget touches localStorage in ${localStorageHits} place(s) — persistence must stay behind the single threadStore() accessor, so there is one place to be right about what may be written`,
+);
+assert(
+  "7g — the storage WRITE is shape-checked and credential-guarded",
+  /function\s+writeStoredThreadId\s*\([\s\S]{0,700}?ID_PATTERN\.test\(\s*id\s*\)[\s\S]{0,300}?containsCredentialShapedValue\s*\(\s*id\s*\)[\s\S]{0,400}?setItem/.test(
+    code,
+  ),
+  "writeStoredThreadId() does not bound the value by ID_PATTERN and run it through containsCredentialShapedValue before setItem — storage is where a credential would come to REST, so the one write must be a choke point",
+);
+assert(
+  "7g — the storage READ bounds what it returns by ID_PATTERN",
+  /function\s+readStoredThreadId\s*\([\s\S]{0,900}?ID_PATTERN\.test\(\s*entry\.id\s*\)/.test(code),
+  "readStoredThreadId() returns a stored value without bounding it by ID_PATTERN — a hand-edited entry would be posted into the frame's strict schema and take the session down",
+);
+assert(
+  "7g — the persisted thread id is keyed by the CMS USER, and no user means no persistence",
+  /function\s+threadStoreKey\s*\(\s*\)\s*\{[\s\S]{0,300}?cmsUserKey\(\)[\s\S]{0,120}?if\s*\(\s*!user\s*\)\s*return\s+null;/.test(
+    code,
+  ),
+  "threadStoreKey() does not require a CMS user — one browser profile can be two people, and resuming the first person's thread as the second leaves the second refused on every turn",
+);
+// The key's PARTITION, component by component. Each one separates conversations
+// that must not be shared: the instance (two Cinatra deployments behind one CMS),
+// the instance id (two instances of the same deployment), the assistant (the two
+// CMS personas), and the person. A key that lost any of them would silently merge
+// two people's or two deployments' conversations, so each is asserted by name
+// rather than by "the key looks composed".
+assert(
+  "7g — the storage key partitions by (instance origin, instance id, assistant, user)",
+  /THREAD_STORE_PREFIX\s*\+\s*'\|'\s*\+\s*cinatraOrigin\s*\+\s*'\|'\s*\+\s*instanceId\s*\+[\s\S]{0,80}?EMBED_ASSISTANT\s*\+\s*'\|'\s*\+\s*user/.test(
+    code,
+  ),
+  "the thread-storage key does not carry all four partition components — dropping one merges conversations that belong to different deployments, instances, personas or people",
+);
+assert(
+  "7g — anonymous (uid 0) is NOT a person, so it gets no persistence",
+  /function\s+cmsUserKey\s*\(\s*\)[\s\S]{0,900}?key\s*===\s*'0'\s*\)\s*return\s+'';/.test(code),
+  "cmsUserKey() accepts uid 0 — both CMSes spell 'anonymous' that way, so every signed-out visitor at a browser would share one bucket",
+);
+// THE WRITE IS THE ONLY WRITE. The single-accessor rule above keeps `localStorage`
+// itself in one place; this keeps the SETTER in one place, so "a credential cannot
+// be persisted" is a property of the code rather than of the current callers: a
+// second `setItem` anywhere would bypass the shape bound and the credential guard.
+const setItemHits = (code.match(/\.setItem\s*\(/g) || []).length;
+assert(
+  "7g — there is EXACTLY ONE storage write in the widget, inside writeStoredThreadId",
+  setItemHits === 1 &&
+    /function\s+writeStoredThreadId\s*\([\s\S]{0,900}?\.setItem\s*\(/.test(code),
+  `the widget calls setItem in ${setItemHits} place(s) — a second writer would bypass the shape bound and the credential guard that make persistence safe`,
+);
+assert(
+  "7g — the remembered thread EXPIRES from when it started (the age is bounded both ways)",
+  /THREAD_STORE_MAX_AGE_MS/.test(code) &&
+    /age\s*<\s*0\s*\|\|\s*age\s*>\s*THREAD_STORE_MAX_AGE_MS/.test(code),
+  "readStoredThreadId() does not bound the entry's age in both directions — an entry that cannot be used (a thread this reader does not own) must age out, and a future-dated one must not outlive every bound",
+);
+// …AND USE DOES NOT RESTART THAT CLOCK. Bounding the age is worth nothing if the
+// entry is rewritten every time it is read: the seven days would reset on each
+// page load and an unusable thread would follow the machine forever. The
+// structural form of "use does not write" is that the stored branch RETURNS
+// before the write — asserted as that ordering, so a rewrite-on-read cannot be
+// added without the gate seeing it.
+assert(
+  "7g — resolving a REMEMBERED thread returns it WITHOUT writing (use does not restart the clock)",
+  /function\s+resolveThreadId\s*\(\s*\)\s*\{[\s\S]{0,400}?if\s*\(\s*stored\s*\)\s*return\s+stored\.id;[\s\S]{0,300}?writeStoredThreadId\(/.test(
+    code,
+  ),
+  "resolveThreadId() writes on the remembered path — refreshing the entry on every use resets its expiry, so an entry that cannot be used would never age out",
+);
+assert(
+  "7g — the bridge correlationId is still minted per document, never the persisted id",
+  /correlationId\s*=\s*mintCorrelationId\(\)/.test(code) &&
+    !/correlationId\s*=\s*(?:resolveThreadId|readStoredThreadId)\(/.test(code),
+  "the correlationId is a per-document security nonce every uplink must echo — persisting it would make a replay across documents possible",
 );
 // EVERY console.* ARGUMENT IS A FIXED STRING LITERAL. The older form of this check
 // listed credential identifiers and banned those; that only ever caught the names

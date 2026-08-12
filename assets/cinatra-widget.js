@@ -864,6 +864,158 @@
     return randB64url(18);
   }
 
+  // ---------------------------------------------------------------------------
+  // THREAD CONTINUITY (cinatra#2683, epic #2564 S8f).
+  //
+  // The CONTEXT message used to say `threadId: correlationId` — "one thread per
+  // framed session". That made the widget's conversation END at every page load:
+  // a reload mints a new correlationId, so the frame asked to resume a thread that
+  // had never existed, the instance answered 404, and the person's history was
+  // gone. The instance's restore path was correct the whole time; the widget could
+  // never exercise it, because it never asked twice for the same thread.
+  //
+  // TWO IDS THAT WERE ONE, AND SHOULD NOT HAVE BEEN. The correlationId is a
+  // SECURITY binding — a per-document CSPRNG nonce that every uplink must echo —
+  // and it stays exactly that, minted fresh for every document and every epoch.
+  // The thread id is PUBLIC CONTEXT: a selector naming which conversation to
+  // resume, which the instance authorizes against the frame's own signed-in reader
+  // before it serves a single message. Only the second one is remembered here.
+  //
+  // KEYED BY (SITE, USER), AND IT REFUSES TO GUESS THE USER. `localStorage` is
+  // already scoped to the CMS site's origin; the key adds the instance and the
+  // assistant, and the CMS USER — because one browser profile can be two people on
+  // a shared workstation, and resuming the first person's thread as the second is
+  // a broken widget (the instance refuses every turn on a thread the reader does
+  // not own). When the host cannot say who is looking, NOTHING is stored and the
+  // per-bootstrap behaviour above is what happens — the safe direction, and a
+  // silent one only because it is the behaviour that shipped.
+  //
+  // NOTHING NEW GOES ON THE WIRE. The CONTEXT message carries the same one
+  // `session.threadId` field it always did; this only changes WHICH id that is.
+  // The stored value is a thread id and nothing else — never a credential, which
+  // this shell does not have — and it is bound-checked against the same
+  // ID_PATTERN the frame's schema applies, so a corrupt or hand-edited entry mints
+  // a fresh thread instead of taking the session down.
+  // ---------------------------------------------------------------------------
+  var THREAD_STORE_PREFIX = 'cinatra.widget.thread.v1';
+  // A remembered conversation lives a WEEK FROM WHEN IT STARTED, and the clock is
+  // NOT restarted by use. Refreshing on every read would let one entry live
+  // forever, and this bound is doing real work: the instance refuses a thread the
+  // reader does not own, so an entry that becomes unusable — the same person at
+  // this CMS signing into Cinatra as somebody else — is refused until it expires.
+  // Ending that within a week is the difference between a bad day and a widget
+  // that is permanently broken on that machine.
+  //
+  // THE HONEST LIMIT. Recovering FASTER than the expiry needs the frame to tell
+  // the parent "that thread is not mine", and there is no such uplink in protocol
+  // 2. Adding one is a protocol change, so it is not smuggled in here; it is
+  // written down as the remedy if that case is ever seen.
+  var THREAD_STORE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+  /**
+   * WHO is looking, as the CMS already tells this page — `userSettings.uid` in
+   * wp-admin, `drupalSettings.user.uid` in Drupal. Best effort by design: this is
+   * a STORAGE KEY component, never an authority and never sent anywhere, and a
+   * host that publishes neither gets no persistence at all rather than a shared
+   * bucket. Returns '' when there is no answer.
+   */
+  function cmsUserKey() {
+    var uid;
+    try {
+      if (CMS === 'wordpress') {
+        var us = window.userSettings;
+        uid = us && us.uid;
+      } else {
+        var ds = window.drupalSettings;
+        uid = ds && ds.user && ds.user.uid;
+      }
+    } catch (_) {
+      return '';
+    }
+    if (uid === undefined || uid === null) return '';
+    var key = String(uid).trim();
+    // ZERO IS NOT A PERSON. Both CMSes spell "anonymous" as user 0, and treating
+    // it as an identity would make one shared bucket for every signed-out visitor
+    // at that browser — the exact thing keying by user exists to prevent.
+    if (!key || key === '0') return '';
+    return key;
+  }
+
+  /** The (site, user) key, or null when there is no user to key on. */
+  function threadStoreKey() {
+    var user = cmsUserKey();
+    if (!user) return null;
+    var instanceId = asSelector(config.instanceId);
+    if (!instanceId) return null;
+    return THREAD_STORE_PREFIX + '|' + cinatraOrigin + '|' + instanceId +
+      '|' + EMBED_ASSISTANT + '|' + user;
+  }
+
+  /** `localStorage`, or null. Access ITSELF can throw (disabled storage, a
+   *  private window), so this is the only place that touches it. */
+  function threadStore() {
+    try {
+      var s = window.localStorage;
+      return (s && typeof s.getItem === 'function' && typeof s.setItem === 'function') ? s : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function readStoredThreadId(key) {
+    var store = threadStore();
+    if (!store) return null;
+    var raw;
+    try { raw = store.getItem(key); } catch (_) { return null; }
+    if (typeof raw !== 'string' || !raw) return null;
+    var entry;
+    try { entry = JSON.parse(raw); } catch (_) { return null; }
+    if (!entry || typeof entry !== 'object') return null;
+    if (typeof entry.id !== 'string' || !ID_PATTERN.test(entry.id)) return null;
+    if (typeof entry.at !== 'number' || !isFinite(entry.at)) return null;
+    var age = Date.now() - entry.at;
+    // A FUTURE-DATED entry (a hand-edit, or a clock that moved) is refused rather
+    // than trusted — otherwise it would outlive every bound this function has.
+    if (age < 0 || age > THREAD_STORE_MAX_AGE_MS) return null;
+    return { id: entry.id, at: entry.at };
+  }
+
+  function writeStoredThreadId(key, id) {
+    // THE SAME CHOKE POINT THE BRIDGE USES, ON THE WAY INTO STORAGE. Storage is
+    // the one place a credential could come to REST rather than merely pass
+    // through, which is why the gate forbade it outright before this slice. The
+    // ban is now a channel: exactly one value may be written, it must be a
+    // thread id by shape, and it is run through the SAME credential guard every
+    // outbound message is. A value that is neither is not written at all.
+    if (typeof id !== 'string' || !ID_PATTERN.test(id)) return;
+    if (containsCredentialShapedValue(id)) return;
+    var store = threadStore();
+    if (!store) return;
+    // A full or refusing quota must never take the widget down: the conversation
+    // still works, it just stops being remembered.
+    // `at` is WHEN THE CONVERSATION STARTED. There is exactly one write — the
+    // mint — so use never restarts the clock; see THREAD_STORE_MAX_AGE_MS for why
+    // that matters more than "the thread I use daily never expires".
+    try { store.setItem(key, JSON.stringify({ id: id, at: Date.now() })); } catch (_) {}
+  }
+
+  /**
+   * The thread this document should continue, minting one the first time.
+   *
+   * Every path returns an ID_PATTERN-valid id, so the CONTEXT message is
+   * composable whatever storage does — including the no-storage and no-user
+   * paths, which return a freshly minted id exactly as before this change.
+   */
+  function resolveThreadId() {
+    var key = threadStoreKey();
+    if (!key) return mintCorrelationId();
+    var stored = readStoredThreadId(key);
+    if (stored) return stored.id;
+    var id = mintCorrelationId();
+    writeStoredThreadId(key, id);
+    return id;
+  }
+
   // §6c per-direction monotonic gate: a seq must be a nonnegative integer and, on
   // any direction after the first accepted value, strictly increase.
   function acceptInboundSeq(seq) {
@@ -999,6 +1151,9 @@
     // that cannot be accepted.
     var instanceId = boundedSelector(ctx.instanceId, SELECTOR_MAX.instanceId);
     if (!instanceId) { return null; }
+    // Resolved AFTER the refusal above, so a message that will not be sent does
+    // not start (or touch) a remembered conversation.
+    var threadId = resolveThreadId();
     var cms = { instanceId: instanceId };
     var resourceId = boundedSelector(ctx.resourceId, SELECTOR_MAX.resourceId);
     var resourceType = boundedSelector(ctx.resourceType, SELECTOR_MAX.resourceType);
@@ -1013,7 +1168,10 @@
       nonceEcho: frameNonce,
       seq: nextOutboundSeq(),              // parent->iframe counter starts at 0
       session: {
-        threadId: correlationId,           // one thread per framed session
+        // The conversation this document CONTINUES (cinatra#2683) — remembered
+        // per (site, user), not minted per bootstrap. A public selector: the
+        // instance authorizes it against the frame's own signed-in reader.
+        threadId: threadId,
         assistant: EMBED_ASSISTANT,        // == ?assistant (a selector, not authority)
       },
       cms: cms,
