@@ -62,6 +62,7 @@ function check(label, cond) {
 // ---------------------------------------------------------------------------
 function makeEnv(fetchImpl, sharedRoot, captured, configOverrides, windowOverrides) {
   let attachShadowCount = 0;
+  let randCalls = 0;
   const messageListeners = []; // window 'message' listeners (the bridge only)
   const openedWindows = [];    // MUST stay empty: the frame owns the sign-in popup
 
@@ -167,7 +168,15 @@ function makeEnv(fetchImpl, sharedRoot, captured, configOverrides, windowOverrid
       // "no popup on the CMS origin" assertion has something to be false about.
       open(url) { const w = { url, closed: false, close() { this.closed = true; } }; openedWindows.push(w); return w; },
       crypto: {
-        getRandomValues(arr) { for (let i = 0; i < arr.length; i++) { arr[i] = (i * 7 + 3) & 0xff; } return arr; },
+        // Deterministic but VARYING across calls. A fixed byte pattern would make
+        // two successive correlationId mints IDENTICAL, and the assertion that a
+        // replacement document is given a FRESH correlationId could then never
+        // fail — it would pass on a widget that reused the retired epoch's id.
+        getRandomValues(arr) {
+          for (let i = 0; i < arr.length; i++) { arr[i] = (i * 7 + 3 + randCalls * 31) & 0xff; }
+          randCalls++;
+          return arr;
+        },
       },
     },
     document: documentStub,
@@ -446,10 +455,15 @@ async function main() {
 
     const correlationId = cmsg && cmsg.correlationId;
 
-    // (6) One context per frame: a SECOND READY does not re-send.
-    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg("secondNonce0123456789abc") });
+    // (6) A REPLAYED READY — the same nonce, the one already answered — is
+    //     IGNORED. This is the property the single-context latch was really
+    //     protecting, and the one an attacker could try. (Its counterpart, a
+    //     READY with a NEW nonce, is the frame's document having been REPLACED;
+    //     that is served a fresh context, and it is asserted at (12) below rather
+    //     than here so the drive keeps the correlationId it is binding uplinks to.)
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg(nonce) });
     await flush();
-    check("bridge: one context per frame (a second READY is ignored)", captured.windowPosts.length === 1);
+    check("bridge: a REPLAYED READY (same nonce) is ignored (no second context)", captured.windowPosts.length === 1);
 
     // (7) resize: an in-range height ABOVE the panel cap is CLAMPED (not trusted);
     //     a height OVER the schema max is REJECTED. maxPanelHeight() ==
@@ -495,6 +509,28 @@ async function main() {
 
     // (11) The whole drive stayed offline and popup-free.
     check("bridge: the whole drive issued NO network request and opened NO window", fetched.length === 0 && env.openedWindows.length === 0);
+
+    // (12) DOCUMENT REPLACEMENT. The frame reloads — at protocol 2 a reload runs
+    //      the sign-in ceremony again — and the replacement document announces
+    //      itself with a FRESH nonce. It must be served, with a FRESH
+    //      correlationId, or the widget would sit at "waiting for the host"
+    //      forever and the previous entangled port would leak. Re-serving is safe
+    //      in a way re-bootstrapping never was: the message carries no credential,
+    //      and the frame burns its own single-use nonce gate at the far end.
+    //      Deliberately LAST in this block: it retires the epoch the uplink
+    //      assertions above are bound to.
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg("reloadNonce0123456789abc") });
+    await flush(30);
+    const replacement = captured.windowPosts[1];
+    check(
+      "bridge: a READY with a NEW nonce (the frame's document was replaced) is served a FRESH context",
+      captured.windowPosts.length === 2 && !!replacement &&
+        replacement.msg.nonceEcho === "reloadNonce0123456789abc" &&
+        replacement.msg.seq === 0 &&
+        replacement.msg.correlationId !== correlationId &&
+        replacement.targetOrigin === INSTANCE_ORIGIN &&
+        !/cwu_|cit_|cnx_/i.test(JSON.stringify(replacement.msg)),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -704,11 +740,48 @@ async function main() {
     const afterWindowUplink = cwWidget && parseInt(String(cwWidget.style.height || "0"), 10);
     check("§12b: a WINDOW-delivered uplink in PORT mode is IGNORED (height unchanged)", afterWindowUplink === 680);
 
-    // (4) One context per frame holds on the port transport: a second READY (even
-    //     with a fresh port) does not re-send.
-    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg("portNonce2ndabcdefghij0"), ports: [makePortStub()] });
+    // (4) A REPLAYED READY (same nonce, even with a fresh port) is IGNORED on the
+    //     port transport too: the replay can neither draw a second context nor
+    //     MOVE the established channel to a port it supplied.
+    const replayPort = makePortStub();
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg(nonce), ports: [replayPort] });
     await flush();
-    check("§12b: one context per frame holds on the port transport (second READY ignored)", port.posts.length === 1 && captured.windowPosts.length === 0);
+    check(
+      "§12b: a REPLAYED READY-with-port is ignored (channel stays where it was)",
+      port.posts.length === 1 && replayPort.posts.length === 0 &&
+        port.closed === false && captured.windowPosts.length === 0,
+    );
+
+    // (5) A READY transferring MORE than one port is refused outright — the
+    //     protocol transfers exactly one, so this is not a frame speaking it and
+    //     reducing it to "the first port" would be a guess — and the refusal costs
+    //     the established session NOTHING (the epoch reset runs only after every
+    //     validation, so a rejected message is never a denial of service).
+    const extraA = makePortStub();
+    const extraB = makePortStub();
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg("multiPortNonce0123456789"), ports: [extraA, extraB] });
+    await flush();
+    check(
+      "§12b: a READY transferring MORE than one port is refused, and does NOT tear down the session",
+      extraA.posts.length === 0 && extraB.posts.length === 0 &&
+        port.closed === false && captured.windowPosts.length === 0,
+    );
+
+    // (6) DOCUMENT REPLACEMENT on the port transport: the replacement document's
+    //     READY (new nonce, its own fresh channel) is served on the NEW port, and
+    //     the previous entangled port is CLOSED rather than left dangling with a
+    //     live listener.
+    const replacementPort = makePortStub();
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: readyMsg("portReloadNonce012345678"), ports: [replacementPort] });
+    await flush(30);
+    check(
+      "§12b: a replacement document is served on its OWN port and the previous port is CLOSED",
+      replacementPort.posts.length === 1 &&
+        replacementPort.posts[0].nonceEcho === "portReloadNonce012345678" &&
+        replacementPort.posts[0].correlationId !== correlationId &&
+        port.closed === true && port.posts.length === 1 &&
+        captured.windowPosts.length === 0,
+    );
   }
 
   console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
