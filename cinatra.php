@@ -106,7 +106,10 @@ add_action(
 			'cinatra_instance_id',
 			array(
 				'type'              => 'string',
-				'sanitize_callback' => 'sanitize_text_field',
+				// cinatra#2674: the instance id is a PUBLIC SELECTOR handed to the
+				// browser, so a hand-typed one goes through the same gate as one
+				// issued by Connect — bounded, and never credential-shaped.
+				'sanitize_callback' => 'cinatra_sanitize_public_selector',
 				'default'           => '',
 			)
 		);
@@ -142,6 +145,173 @@ function cinatra_sanitize_url( $value ): string {
 	}
 	$clean = esc_url_raw( $value, array( 'http', 'https' ) );
 	return is_string( $clean ) ? $clean : '';
+}
+
+/**
+ * Is $value shaped like one of Cinatra's bearer credentials?
+ *
+ * Codex round 0 finding 3 on cinatra#2674. The widget refuses to put a
+ * credential-shaped value on the embed bridge — but that guard runs in the
+ * BROWSER, and by then the value has already been printed into the admin page by
+ * wp_localize_script(). The guarantee has to start here, on the server, at the
+ * moment a value is accepted or handed out.
+ *
+ * The prefixes are the real ones the platform mints: `cwu_` (per-user widget
+ * token), `cit_` (site transport token), `cnx_` (connect-site credential). They
+ * are matched at a TOKEN BOUNDARY anywhere in the string and case-insensitively,
+ * so `Error: cwu_…`, `https://x/?t=cit_…` and `CNX_…` are all caught, while a
+ * word that merely ends in those letters (a fictional `abccwu_`) is not. Exactly
+ * the matcher in the widget and in cinatra src/lib/embed/bridge-protocol.ts.
+ *
+ * This is CONTAINMENT, not secret detection: it cannot recognise a credential
+ * with no prefix, and it is not asked to. What it guarantees is that nothing
+ * shaped like one of our bearers is persisted as a public selector or printed
+ * into a page.
+ *
+ * @param string $value Value to test.
+ * @return bool True when the value carries a bearer prefix at a token boundary.
+ */
+function cinatra_is_credential_shaped( string $value ): bool {
+	return 1 === preg_match( '/(?:^|[^A-Za-z0-9])(?:cwu|cit|cnx)_/i', $value );
+}
+
+/**
+ * Length of $value in UTF-16 code units — the unit the protocol-2 schema counts.
+ *
+ * Codex round 1. The frame validates with zod `.max(n)`, and JavaScript's
+ * `String.length` counts UTF-16 code units. PHP's strlen() counts BYTES, which is
+ * a DIFFERENT number for any non-ASCII string: 101 `é` characters are 101 code
+ * units but 202 bytes, so a byte bound would blank a selector the frame would
+ * have accepted — and for the REQUIRED instance id, blanking it means the
+ * assistant never mounts on that site at all. So count what the contract counts.
+ *
+ * Code points come from a PCRE UTF-8 walk (no mbstring dependency); an astral
+ * code point (>= U+10000) is ONE code point but TWO UTF-16 code units, so those
+ * are counted again. Invalid UTF-8 returns -1: it cannot be measured, it would
+ * not survive wp_json_encode() into the page, and a value we cannot reason about
+ * is one to refuse.
+ *
+ * @param string $value Value to measure.
+ * @return int Length in UTF-16 code units, or -1 when the input is not valid UTF-8.
+ */
+function cinatra_utf16_length( string $value ): int {
+	$code_points = preg_match_all( '/./us', $value );
+	if ( false === $code_points ) {
+		return -1;
+	}
+	$astral = preg_match_all( '/[\x{10000}-\x{10FFFF}]/u', $value );
+	if ( false === $astral ) {
+		return -1;
+	}
+	return $code_points + $astral;
+}
+
+/**
+ * Normalize a value that will be handed to the BROWSER as a public selector.
+ *
+ * Returns the value UNCHANGED when it is a usable selector, or '' when it is
+ * not. Never a truncated, tag-stripped or otherwise rewritten string: a selector
+ * that has been altered NAMES SOMETHING ELSE. Refusing costs a disambiguator;
+ * mutating is a silent lie about which site or instance the page means.
+ *
+ * IT VALIDATES; IT DOES NOT NORMALIZE — and it deliberately does not borrow
+ * sanitize_text_field() for either job (codex rounds 1 and 2). That function is a
+ * NORMALIZER: it strips tags, deletes percent-encoded octets and collapses
+ * whitespace, so `tenant%2Fprod` comes back `tenantprod`. Using it as a transform
+ * renames the selector; using it as a mere TEST — refuse anything it would touch
+ * — is no better, because `tenant%2Fprod` is a perfectly legal selector under the
+ * contract (`z.string().min(1).max(200)`, no character class), and refusing a
+ * legal REQUIRED instance id means the assistant never mounts on that site. So
+ * the rule here is exactly the contract, plus what the contract cannot express.
+ *
+ * THIS FUNCTION MUTATES NOTHING — not even whitespace (codex round 3). It is a
+ * pure predicate that returns its input or ''. Trimming here would be a quiet
+ * disaster of its own: PHP's default trim charlist includes "\0" and "\x0B", so
+ * a trim placed before the control-character rule below would SILENTLY STRIP a
+ * NUL and let `"\0instance"` through as `"instance"` — the guard defeating
+ * itself. Whitespace normalization belongs at the ACCEPTANCE boundary and
+ * nowhere else; see cinatra_sanitize_public_selector().
+ *
+ * Four ways to be unusable:
+ *   1. it is empty;
+ *   2. it contains a CONTROL CHARACTER. Not a contract rule: a control character
+ *      cannot occur in a real handle, and a value carrying one is corrupt rather
+ *      than merely unusual. Refused, never stripped;
+ *   3. it is not valid UTF-8, or it exceeds the protocol-2 bound for its field.
+ *      The bound is measured in UTF-16 CODE UNITS so it matches the frame's zod
+ *      schema exactly — the frame's schema is strict, so an over-long selector
+ *      rejects the whole context message and strands the session (see the
+ *      widget's SELECTOR_MAX);
+ *   4. it is CREDENTIAL-SHAPED. A connect response, a manual settings edit or a
+ *      direct database write could put a bearer where a public handle belongs; it
+ *      fails closed here, before it is stored and before it is printed.
+ *
+ * Everything else travels byte-for-byte. That is safe at every sink this value
+ * reaches: the settings field prints it through esc_attr(), and
+ * wp_localize_script() JSON-encodes it (PHP escapes `/`, so a `</script>` inside
+ * a value cannot close the block).
+ *
+ * Nothing about a rejected value is logged. A rejected value may BE a
+ * credential, and a log line is a disclosure.
+ *
+ * @param mixed $value The candidate selector.
+ * @param int   $max   Maximum length in UTF-16 code units (the protocol-2 field bound).
+ * @return string The usable selector, unchanged, or '' when it is not usable.
+ */
+function cinatra_public_selector( $value, int $max = 200 ): string {
+	if ( ! is_string( $value ) || '' === $value ) {
+		return '';
+	}
+	// Control characters are corrupt input, not exotic input. Byte-level is safe:
+	// every UTF-8 continuation byte is >= 0x80, so this cannot fire mid-character.
+	if ( preg_match( '/[\x00-\x1F\x7F]/', $value ) ) {
+		return '';
+	}
+	// Cheap bail before the UTF-8 walk: a UTF-8 code point is at most 4 bytes, so
+	// anything longer than 4x the bound cannot possibly fit it.
+	if ( strlen( $value ) > $max * 4 ) {
+		return '';
+	}
+	$length = cinatra_utf16_length( $value );
+	if ( $length < 1 || $length > $max ) {
+		return '';
+	}
+	if ( cinatra_is_credential_shaped( $value ) ) {
+		return '';
+	}
+	return $value;
+}
+
+/**
+ * The ACCEPTANCE boundary for a public selector: the option-write gate.
+ *
+ * Two jobs, and the split matters. cinatra_public_selector() is a pure predicate
+ * that never alters a value; THIS is the one place a value is normalized, and it
+ * normalizes exactly one thing — surrounding ASCII SPACES.
+ *
+ * The charlist is given EXPLICITLY as ' ' rather than relying on PHP's default,
+ * which also strips "\0", "\x0B", "\t", "\r" and "\n" (codex round 3). Those are
+ * not stray formatting, they are corruption: a value carrying one must FAIL the
+ * control-character rule, not be quietly tidied into one that passes. Spaces are
+ * different — they are what a person leaves behind when pasting a handle into the
+ * settings field, they carry no meaning in an identifier, and removing them
+ * cannot turn one existing identifier into a different existing one.
+ *
+ * It is also deliberately a named ONE-PARAMETER function rather than
+ * cinatra_public_selector() itself: that one takes a second `$max`, and a filter
+ * that ever started forwarding the option NAME as a second argument would land a
+ * string in it. A typed `int` would fatal; an untyped one would cast to 0 and
+ * silently blank every selector on the site. A wrapper with exactly one parameter
+ * cannot be handed an argument it can misread.
+ *
+ * @param mixed $value Raw submitted or written value.
+ * @return string The usable selector, or '' when it is not usable.
+ */
+function cinatra_sanitize_public_selector( $value ): string {
+	if ( ! is_string( $value ) ) {
+		return '';
+	}
+	return cinatra_public_selector( trim( $value, ' ' ) );
 }
 
 /**
@@ -1484,6 +1654,12 @@ function cinatra_connect_exchange( string $instance_url, array $body ): array {
  * hooks below clear it the moment the stored identity changes, BEFORE the
  * pair write at the end of this function.
  *
+ * Connect-site handle (cinatra#2674): `siteId` is the PUBLIC id the instance
+ * issues alongside the credential, and it is written unconditionally from THIS
+ * response — after the identity options (so a cross-instance reconnect has
+ * already dropped the old handle) and before the pair. It is the only piece of
+ * this response the browser ever sees.
+ *
  * @param array $result Normalized exchange result from cinatra_connect_exchange().
  * @return void
  */
@@ -1501,7 +1677,14 @@ function cinatra_connect_apply_result( array $result ): void {
 	// Always overwrite the instance id from THIS connection — empty when the
 	// host returned none (codex: an only-when-present update could leave a
 	// stale identity from a previous instance and mask an identity change).
-	update_option( 'cinatra_instance_id', sanitize_text_field( (string) ( $r['cinatraInstanceId'] ?? '' ) ) );
+	update_option( 'cinatra_instance_id', cinatra_sanitize_public_selector( (string) ( $r['cinatraInstanceId'] ?? '' ) ) );
+	// The connect-site handle the instance issued with the credential
+	// (cinatra#2674). It is PUBLIC — the widget hands it to the Cinatra frame as
+	// the `site.siteId` selector — while its paired `cnx_` credential goes to
+	// cinatra_api_key and stays here. Overwritten unconditionally for the same
+	// reason as the instance id: a stale handle from a previous connection must
+	// never outlive the connection that issued it.
+	update_option( 'cinatra_site_id', cinatra_sanitize_public_selector( (string) ( $r['siteId'] ?? '' ) ) );
 
 	// PAIRED webhook persistence — LAST, so the identity-change hooks above
 	// have already cleared any stale pair before the new one lands.
@@ -2185,10 +2368,16 @@ function cinatra_sanitize_webhook_binding_id( string $value ): string {
 }
 
 // ---------------------------------------------------------------------------
-// Clear the webhook pair the moment the connected-instance IDENTITY changes
-// (cinatra#974, mirroring the drupal-module): a binding id minted by one
+// Clear the instance-bound, instance-ISSUED state the moment the connected-
+// instance IDENTITY changes (cinatra#974, mirroring the drupal-module; extended
+// to the connect-site handle by cinatra#2674): a binding id minted by one
 // instance must never be targeted at another — the emitter would send signed
-// webhook material for the OLD instance to the NEW origin. WordPress fires
+// webhook material for the OLD instance to the NEW origin — and a connect-site
+// handle issued by one instance must never be offered to another, where it names
+// a site that is not this one. Dropping the handle is the RIGHT failure: the
+// selector is optional, so the widget simply omits it and the instance names the
+// site from its own rows, whereas a stale handle would earn a flat refusal.
+// WordPress fires
 // update_option_{option} only on a REAL value change and add_option_{option}
 // when the option is (re)created, so together these cover the connect-flow
 // overwrite, a manual settings edit of the URL / instance id, and a
@@ -2200,7 +2389,17 @@ function cinatra_sanitize_webhook_binding_id( string $value ): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Clear the pair on a real identity change — the
+ * Drop everything the OLD instance issued.
+ *
+ * @return void
+ */
+function cinatra_clear_instance_issued_state(): void {
+	cinatra_clear_webhook_pair();
+	delete_option( 'cinatra_site_id' );
+}
+
+/**
+ * Clear instance-issued state on a real identity change — the
  * update_option_{cinatra_url|cinatra_instance_id} callback.
  *
  * @param mixed $old_value Previous option value.
@@ -2211,11 +2410,11 @@ function cinatra_on_instance_identity_changed( $old_value, $value ): void {
 	if ( (string) $old_value === (string) $value ) {
 		return; // update_option only fires on change; belt-and-braces.
 	}
-	cinatra_clear_webhook_pair();
+	cinatra_clear_instance_issued_state();
 }
 
 /**
- * Clear any stored pair when an identity option is (re)created — the
+ * Clear instance-issued state when an identity option is (re)created — the
  * add_option_{cinatra_url|cinatra_instance_id} callback (a re-added identity
  * is always a new identity).
  *
@@ -2224,8 +2423,19 @@ function cinatra_on_instance_identity_changed( $old_value, $value ): void {
  * @return void
  */
 function cinatra_on_instance_identity_added( $option, $value ): void { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- Required add_option_{option} callback signature.
-	cinatra_clear_webhook_pair();
+	cinatra_clear_instance_issued_state();
 }
+
+// EVERY WRITE OF A PUBLIC SELECTOR GOES THROUGH THE GATE, not only the ones this
+// plugin makes (codex round 1). update_option() runs sanitize_option(), which
+// fires these filters, so a value written by another plugin, a migration, or
+// WP-CLI is gated on the way IN as well as at the localization boundary. The
+// instance id already gets this via register_setting(), but only from admin_init
+// onward — these are unconditional, and applying the same idempotent gate twice
+// costs nothing. `cinatra_site_id` has no settings field at all (it is
+// instance-issued), so this is its only inbound gate.
+add_filter( 'sanitize_option_cinatra_site_id', 'cinatra_sanitize_public_selector' );
+add_filter( 'sanitize_option_cinatra_instance_id', 'cinatra_sanitize_public_selector' );
 
 add_action( 'update_option_cinatra_url', 'cinatra_on_instance_identity_changed', 10, 2 );
 add_action( 'update_option_cinatra_instance_id', 'cinatra_on_instance_identity_changed', 10, 2 );
@@ -2235,14 +2445,21 @@ add_action( 'add_option_cinatra_instance_id', 'cinatra_on_instance_identity_adde
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Enqueue the LOCAL widget asset and pass a secret-free config (contract v2).
+// Enqueue the LOCAL widget asset and pass a CREDENTIAL-FREE config.
 //
 // The widget JS is shipped inside this plugin (assets/cinatra-widget.js) — it is
 // never remote-loaded from the Cinatra instance, so wp-admin never executes
-// third-party code fetched over HTTP. The long-lived integration key
-// (cinatra_api_key) is NOT exposed to the browser: the widget exchanges it for a
-// short-lived, origin/audience/scope-bound stream token via the same-origin REST
-// broker route below (cinatra/v1/token). See wp#4 / cinatra#220.
+// third-party code fetched over HTTP.
+//
+// NOTHING THE BROWSER RECEIVES HERE IS A CREDENTIAL (cinatra#2674). The
+// long-lived `cnx_` integration key (cinatra_api_key) stays on this server, as it
+// always did — but so does everything else now. The browser used to be handed a
+// same-origin broker endpoint that minted a short-lived `cit_` site token and
+// relays that redeemed a `cwu_` per-user bearer; ALL THREE ARE GONE, because the
+// Cinatra frame acquires its own credential on its own origin. What is localized
+// below is a set of PUBLIC SELECTORS: which instance to frame, which connect-site
+// this is, and a feature flag. See wp#4 / cinatra#220 for the original broker and
+// cinatra#2674 for its retirement.
 // ---------------------------------------------------------------------------
 
 add_action( 'admin_enqueue_scripts', 'cinatra_enqueue_widget' );
@@ -2310,30 +2527,42 @@ function cinatra_enqueue_widget(): void {
 		CINATRA_PLUGIN_VERSION,
 		true
 	);
-	$instance_id = get_option( 'cinatra_instance_id', '' );
+	// EVERY SELECTOR IS RE-GATED HERE, AT THE MOMENT IT BECOMES A PAGE
+	// (cinatra#2674, codex round 0 finding 3). Both options are gated on the way
+	// IN too, but this is the boundary that matters: wp_localize_script() prints
+	// these values into the admin page as inline JavaScript, and a value that
+	// arrived by any other route — a direct database write, an older plugin
+	// version, another plugin's update_option() — has never passed that gate. A
+	// rejected selector becomes '' and the widget simply omits it (or, for the
+	// required instance id, declines to frame the assistant at all). Nothing about
+	// a rejection is logged: a rejected value may BE a credential.
+	$instance_id = cinatra_public_selector( get_option( 'cinatra_instance_id', '' ) );
 	wp_localize_script(
 		'cinatra',
 		'CinatraConfig',
 		array(
-			'contractVersion'   => CINATRA_CONTRACT_VERSION,
-			'cinatraUrl'        => rtrim( $url, '/' ),
-			// No apiKey. The browser obtains a short-lived token from this endpoint.
-			'tokenEndpoint'     => rest_url( 'cinatra/v1/token' ),
-			// Required-login (cinatra#410): same-origin broker relays for the
-			// per-user PKCE handshake. The long-lived cnx_ key stays server-side;
-			// these routes present it server-to-server to /api/widget-auth/*.
-			'authInitEndpoint'  => rest_url( 'cinatra/v1/widget-auth/init' ),
-			'authTokenEndpoint' => rest_url( 'cinatra/v1/widget-auth/token' ),
-			'nonce'             => wp_create_nonce( 'wp_rest' ),
-			'instanceId'        => $instance_id,
-			'wpAdminUrl'        => admin_url(),
+			'contractVersion'  => CINATRA_CONTRACT_VERSION,
+			'cinatraUrl'       => rtrim( $url, '/' ),
+			// No apiKey, no token endpoint, no sign-in relays: there is nothing
+			// here for the browser to authenticate WITH. The widget frames the
+			// instance and hands it selectors; the frame gets its own credential.
+			'instanceId'       => $instance_id,
+			// The connect-site handle issued by the instance at Connect. A PUBLIC
+			// id, and a SELECTOR only: the instance re-derives the authoritative
+			// site from its own rows and denies a mismatch, so naming another
+			// site's id yields a refusal rather than that site's data. Its paired
+			// `cnx_` credential stays in cinatra_api_key, server-side. Empty on a
+			// site connected before this key was persisted — the frame can name the
+			// site without it, which is why the protocol makes it optional.
+			'siteId'           => cinatra_public_selector( get_option( 'cinatra_site_id', '' ) ),
+			'wpAdminUrl'       => admin_url(),
 			// Feature-gate for the AI-tools path. True when the WordPress MCP
 			// Adapter (WordPress/mcp-adapter) is installed and active, giving the
 			// assistant access to WordPress content via MCP. False when the adapter
 			// is absent: the base chat widget still loads, but the widget should
 			// surface a clear "install the adapter to enable tools" state instead
 			// of a silent absence. Implements wordpress-plugin#62.
-			'mcpAdapterActive'  => cinatra_mcp_adapter_active(),
+			'mcpAdapterActive' => cinatra_mcp_adapter_active(),
 		)
 	);
 }
@@ -2383,52 +2612,25 @@ add_action(
 add_action(
 	'rest_api_init',
 	function () {
-		// Short-lived stream-token broker. The browser calls this same-origin route
-		// (with a wp_rest nonce); the PHP backend holds the long-lived integration
-		// key, performs a server-to-server token exchange with the Cinatra instance,
-		// and returns ONLY the short-lived token to the browser. The long-lived key
-		// never leaves the server. See wp#4 / cinatra#220.
-		register_rest_route(
-			'cinatra/v1',
-			'/token',
-			array(
-				'methods'             => 'POST',
-				'callback'            => 'cinatra_rest_mint_token',
-				'permission_callback' => function () {
-					return current_user_can( 'manage_options' );
-				},
-			)
-		);
-
-			// Required-login (cinatra#410): per-user PKCE handshake relays. The
-			// browser POSTs here (same-origin, wp_rest nonce, manage_options); the
-			// PHP backend presents the long-lived cnx_ key server-to-server to the
-			// instance widget-auth endpoints and returns ONLY the upstream envelope
-			// (no key, no internals). Mirrors /token above.
-			register_rest_route(
-				'cinatra/v1',
-				'/widget-auth/init',
-				array(
-					'methods'             => 'POST',
-					'callback'            => 'cinatra_rest_widget_auth_init',
-					'permission_callback' => function () {
-						return current_user_can( 'manage_options' );
-					},
-				)
-			);
-
-			register_rest_route(
-				'cinatra/v1',
-				'/widget-auth/token',
-				array(
-					'methods'             => 'POST',
-					'callback'            => 'cinatra_rest_widget_auth_token',
-					'permission_callback' => function () {
-						return current_user_can( 'manage_options' );
-					},
-				)
-			);
-
+		// RETIRED, NOT REGISTERED (cinatra#2674): `cinatra/v1/token` (the
+		// short-lived `cit_` stream-token broker, wp#4 / cinatra#220) and the
+		// `cinatra/v1/widget-auth/{init,token}` per-user PKCE relays (cinatra#410).
+		//
+		// The relays existed to present the `cnx_` key server-to-server to the
+		// instance's `/api/widget-auth/{init,token}`, which now answer 410 Gone to
+		// everyone; the broker existed to hand the browser a `cit_` for the widget
+		// to compose into a credential-bearing postMessage, which no longer exists.
+		// Both are DELETED rather than left forwarding, because a route whose only
+		// purpose is to fetch a bearer for the page is the possession this change
+		// ends — keeping it alive would keep the site-mediated ceremony half alive,
+		// and a plugin that forwarded to a 410 would only turn one dead end into
+		// two. There is nothing here to retry and nothing to migrate: the frame
+		// signs the person in on the Cinatra origin, and a browser still running a
+		// cached protocol-1 widget simply gets `rest_no_route` on one call, shows no
+		// conversation, and is fixed by the page reload that picks up this asset.
+		//
+		// The `cnx_` credential itself is UNCHANGED and still used server-to-server
+		// below (Connect, the site-inventory handshake, publish webhooks).
 		register_rest_route(
 			'cinatra/v1',
 			'/webhooks',
@@ -2509,19 +2711,11 @@ add_action(
 );
 
 /**
- * Agent slug for the WordPress content-editor assistant. The short-lived cit_
- * token is minted at /api/agents/{slug}/token on the instance (unchanged by the
- * S5 unified-broker cutover, cinatra#1221). The legacy /capabilities negotiation
- * and /stream relay under /api/agents/{slug}/ were deleted (cinatra#1991); the
- * conversation now runs against the unified broker (POST /api/assistants/chat)
- * inside the /embed/assistant iframe.
- */
-const CINATRA_AGENT_SLUG = 'wordpress-content-editor';
-
-/**
  * Normalize a URL down to its scheme://host[:port] origin, lowercased, no
  * trailing slash / path / query / fragment. Returns '' if the input has no
- * usable scheme+host. The instance binds the minted token to this exact origin.
+ * usable scheme+host. This site asserts this exact origin on every
+ * server-to-server call, and the instance pairs it with the `cnx_` credential's
+ * registered connect-site origin.
  *
  * @param string $url URL to reduce to its origin.
  * @return string The scheme://host[:port] origin, or '' if no usable scheme+host.
@@ -2539,144 +2733,14 @@ function cinatra_site_origin( string $url ): string {
 }
 
 /**
- * Mint a short-lived Cinatra stream token via server-to-server exchange.
- *
- * The browser sends the wp_rest nonce; this callback (gated to manage_options)
- * reads the long-lived integration key from wp_options and POSTs it to the
- * instance's token endpoint, returning only the short-lived token JSON to the
- * caller. The long-lived key is never sent to the browser.
- *
- * @param WP_REST_Request $request The incoming REST request (carries the wp_rest nonce + JSON params).
- * @return WP_REST_Response The short-lived token envelope, or an error response.
- */
-function cinatra_rest_mint_token( WP_REST_Request $request ): WP_REST_Response {
-	// CSRF: a valid wp_rest nonce must accompany the cookie-authenticated call.
-	$nonce = $request->get_header( 'X-WP-Nonce' );
-	if ( empty( $nonce ) || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
-		return new WP_REST_Response( array( 'error' => __( 'Invalid or missing nonce.', 'cinatra' ) ), 403 );
-	}
-
-	$url     = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
-	$api_key = (string) get_option( 'cinatra_api_key', '' );
-	if ( empty( $url ) || empty( $api_key ) ) {
-		return new WP_REST_Response(
-			array( 'error' => __( 'Cinatra URL or API key is not configured.', 'cinatra' ) ),
-			500
-		);
-	}
-
-	// Bind to the origin the BROWSER will present when it streams. The widget
-	// runs in wp-admin, so its Origin header is the admin origin (admin_url()),
-	// which can legitimately differ from the front-end home origin (WP_HOME vs
-	// WP_SITEURL, or admin-over-SSL setups). The instance re-checks this exact
-	// origin at stream-consume time, so it must match the admin origin.
-	$origin = cinatra_site_origin( admin_url() );
-	if ( empty( $origin ) ) {
-		return new WP_REST_Response(
-			array( 'error' => __( 'Could not derive this site origin.', 'cinatra' ) ),
-			500
-		);
-	}
-
-	$params           = $request->get_json_params();
-	$contract_version = CINATRA_CONTRACT_VERSION;
-	if ( is_array( $params ) && ! empty( $params['contractVersion'] ) ) {
-		$candidate = sanitize_text_field( (string) $params['contractVersion'] );
-		// Only accept the versions this plugin knows; otherwise pin to ours.
-		if ( in_array( $candidate, array( 'v1', 'v2' ), true ) ) {
-			$contract_version = $candidate;
-		}
-	}
-
-	// The token is minted server-to-server: route the TRANSPORT to the
-	// container-reachable base when CINATRA_BASE_URL is set (dev/container
-	// topology), else to the configured cinatra_url (production, unchanged). The
-	// origin bound into $body above stays the BROWSER origin (admin_url()) — the
-	// instance re-checks that at stream-consume time, so it must NOT be rewritten.
-	$server_base    = cinatra_server_base_url( $url );
-	$token_endpoint = $server_base . '/api/agents/' . CINATRA_AGENT_SLUG . '/token';
-	$body           = array(
-		'contractVersion' => $contract_version,
-		'origin'          => $origin,
-		'sub'             => 'wp-user-' . get_current_user_id(),
-		'scope'           => CINATRA_AGENT_SLUG . '.stream',
-	);
-
-	$response = cinatra_server_post(
-		$token_endpoint,
-		array(
-			'timeout' => 10,
-			'headers' => array(
-				'Authorization' => 'Bearer ' . $api_key,
-				'Content-Type'  => 'application/json',
-				'Accept'        => 'application/json',
-				// Assert THIS site's origin on the server-to-server mint. The
-				// instance's cnx_ arm on /api/agents/{slug}/token enforces a
-				// paired Origin === the credential's bound connect-site origin
-				// and FAILS CLOSED on a missing Origin — without this header
-				// every cnx_-paired site gets a 401 on the cit_ mint. Same
-				// identity assertion the widget-auth relays already send (the
-				// credential hash must also match the same connect-site row, so
-				// this grants no trust). $origin is validated non-empty above.
-				'Origin'        => $origin,
-			),
-			'body'    => wp_json_encode( $body ),
-		)
-	);
-
-	if ( is_wp_error( $response ) ) {
-		// Log the transport detail server-side; return a generic message so we
-		// never reflect low-level/internal error text to the browser.
-		error_log( '[cinatra] token endpoint unreachable: ' . $response->get_error_message() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; detail is never reflected to the browser.
-		return new WP_REST_Response(
-			array( 'error' => __( 'Could not reach the Cinatra instance. Check the connector URL, or contact your administrator.', 'cinatra' ) ),
-			502
-		);
-	}
-
-	$status = (int) wp_remote_retrieve_response_code( $response );
-	$raw    = (string) wp_remote_retrieve_body( $response );
-	$json   = json_decode( $raw, true );
-
-	if ( $status < 200 || $status >= 300 || ! is_array( $json ) || empty( $json['token'] ) ) {
-		// Do NOT reflect the upstream body to the browser — it could contain
-		// instance internals. Log the detail server-side for admins; return a
-		// generic, actionable message. Always 502: from the browser's
-		// perspective the upstream Cinatra instance failed the exchange
-		// (bad/rotated key, origin not configured, unreachable, malformed).
-		$detail = ( is_array( $json ) && ! empty( $json['error'] ) )
-			? (string) $json['error']
-			: substr( $raw, 0, 500 );
-		error_log( '[cinatra] token exchange failed (HTTP ' . $status . '): ' . $detail ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; detail is never reflected to the browser.
-		return new WP_REST_Response(
-			array( 'error' => __( 'Cinatra could not issue a session token. Check the connector settings, or contact your administrator.', 'cinatra' ) ),
-			502
-		);
-	}
-
-	// Return ONLY the short-lived token envelope to the browser.
-	return new WP_REST_Response(
-		array(
-			'token'           => (string) $json['token'],
-			'tokenType'       => isset( $json['tokenType'] ) ? (string) $json['tokenType'] : 'Bearer',
-			'expiresIn'       => isset( $json['expiresIn'] ) ? (int) $json['expiresIn'] : 300,
-			'expiresAt'       => isset( $json['expiresAt'] ) ? (string) $json['expiresAt'] : null,
-			'contractVersion' => isset( $json['contractVersion'] ) ? (string) $json['contractVersion'] : $contract_version,
-			'scope'           => isset( $json['scope'] ) ? (string) $json['scope'] : ( CINATRA_AGENT_SLUG . '.stream' ),
-		),
-		200
-	);
-}
-
-/**
  * Remove the long-lived integration key from a string before it is logged.
  *
- * The widget-auth relays carry the per-user code/codeVerifier outbound and the
- * long-lived key in the Authorization header; a buggy/proxy/debug upstream could
- * echo any of those into an error string. We cannot enumerate every transient
- * secret, but the durable, highest-value one — the long-lived key — is redacted
- * here so it can never land in a WordPress log. Mirrors the Drupal broker's
- * scrub(). A blank key returns the text unchanged.
+ * Every server-to-server call carries the long-lived key in the Authorization
+ * header, and a buggy/proxy/debug upstream could echo it back into an error
+ * string. We cannot enumerate every transient secret, but the durable,
+ * highest-value one — the long-lived key — is redacted here so it can never land
+ * in a WordPress log. Mirrors the Drupal broker's scrub(). A blank key returns
+ * the text unchanged.
  *
  * @param string $text    The text about to be logged.
  * @param string $api_key The long-lived integration key to redact.
@@ -2687,168 +2751,6 @@ function cinatra_scrub_secret( string $text, string $api_key ): string {
 		return $text;
 	}
 	return str_replace( $api_key, '[redacted]', $text );
-}
-
-/**
- * Shared server-to-server relay for the per-user widget-auth handshake
- * (cinatra#410). Validates the wp_rest nonce, presents the long-lived cnx_ key
- * server-to-server to the instance's /api/widget-auth/{init,token} endpoint with
- * the caller-whitelisted JSON, and returns ONLY the whitelisted upstream
- * envelope to the browser. The long-lived key never reaches JS, and upstream
- * error bodies are never reflected (generic message only). Mirrors the
- * cinatra_rest_mint_token transport.
- *
- * @param WP_REST_Request $request The incoming REST request (wp_rest nonce + JSON params).
- * @param string          $segment The upstream path segment ('init' or 'token').
- * @param array           $fields  Whitelisted request-field names to forward.
- * @param array           $passthrough Whitelisted response-field names to return.
- * @return WP_REST_Response The upstream envelope (whitelisted), or an error response.
- */
-function cinatra_rest_widget_auth_relay( WP_REST_Request $request, string $segment, array $fields, array $passthrough ): WP_REST_Response {
-	// CSRF: a valid wp_rest nonce must accompany the cookie-authenticated call.
-	$nonce = $request->get_header( 'X-WP-Nonce' );
-	if ( empty( $nonce ) || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
-		return new WP_REST_Response( array( 'error' => __( 'Invalid or missing nonce.', 'cinatra' ) ), 403 );
-	}
-
-	$url     = rtrim( (string) get_option( 'cinatra_url', '' ), '/' );
-	$api_key = (string) get_option( 'cinatra_api_key', '' );
-	if ( empty( $url ) || empty( $api_key ) ) {
-		return new WP_REST_Response(
-			array( 'error' => __( 'Cinatra URL or API key is not configured.', 'cinatra' ) ),
-			500
-		);
-	}
-
-	// Forward ONLY whitelisted JSON fields the widget is allowed to set. The
-	// instance derives the rest (txn binding, the agent's instances config key,
-	// the user identity from the authenticated login). We never forward arbitrary
-	// keys, and never echo the long-lived key.
-	$params  = $request->get_json_params();
-	$forward = array();
-	if ( is_array( $params ) ) {
-		foreach ( $fields as $field ) {
-			if ( array_key_exists( $field, $params ) && null !== $params[ $field ] ) {
-				$forward[ $field ] = $params[ $field ];
-			}
-		}
-	}
-
-	// Route the TRANSPORT to the container-reachable base when CINATRA_BASE_URL is
-	// set (dev/container topology), else the configured cinatra_url (production).
-	$server_base = cinatra_server_base_url( $url );
-	$endpoint    = $server_base . '/api/widget-auth/' . $segment;
-
-	// Assert THIS site's own origin on the server-to-server relay. The instance's
-	// /api/widget-auth/{init,token} enforces a paired Origin === the `cnx_`
-	// credential's bound connect-site origin (fail-closed: a missing Origin is
-	// rejected). We derive the origin from admin_url() — the SAME source the
-	// connect handshake used to register this site's `widget_origin` (see the
-	// connect-start payload) — so a split front-end/admin origin install still
-	// asserts the registered origin and matches. The relay cannot spoof another
-	// site because the credential_hash must ALSO match the same connect-site row,
-	// so this header is identity assertion, not a trust grant. The browser never
-	// reaches this endpoint (server-to-server only).
-	$site_origin   = cinatra_site_origin( admin_url() );
-	$relay_headers = array(
-		'Authorization' => 'Bearer ' . $api_key,
-		'Content-Type'  => 'application/json',
-		'Accept'        => 'application/json',
-	);
-	if ( '' !== $site_origin ) {
-		$relay_headers['Origin'] = $site_origin;
-	}
-
-	$response = cinatra_server_post(
-		$endpoint,
-		array(
-			'timeout' => 10,
-			'headers' => $relay_headers,
-			'body'    => wp_json_encode( $forward ),
-		)
-	);
-
-	if ( is_wp_error( $response ) ) {
-		// Log the transport detail server-side; return a generic message so we
-		// never reflect low-level/internal error text to the browser. SCRUB the
-		// long-lived key first: a buggy/proxy upstream error could echo the
-		// outgoing Authorization: Bearer cnx_... back into the message, and these
-		// widget-auth relays carry the per-user code/codeVerifier, so the key must
-		// never reach WP logs.
-		error_log( '[cinatra] widget-auth ' . $segment . ' endpoint unreachable: ' . cinatra_scrub_secret( $response->get_error_message(), $api_key ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; the long-lived key is scrubbed and the detail is never reflected to the browser.
-		return new WP_REST_Response(
-			array( 'error' => __( 'Could not reach the Cinatra instance. Check the connector URL, or contact your administrator.', 'cinatra' ) ),
-			502
-		);
-	}
-
-	$status = (int) wp_remote_retrieve_response_code( $response );
-	$raw    = (string) wp_remote_retrieve_body( $response );
-	$json   = json_decode( $raw, true );
-
-	if ( $status < 200 || $status >= 300 || ! is_array( $json ) ) {
-		// Never reflect the upstream body to the browser. Log server-side (with
-		// the long-lived key scrubbed); return a generic, actionable message.
-		// Always 502 from the browser's view.
-		$detail = ( is_array( $json ) && ! empty( $json['error'] ) ) ? (string) $json['error'] : substr( $raw, 0, 500 );
-		error_log( '[cinatra] widget-auth ' . $segment . ' failed (HTTP ' . $status . '): ' . cinatra_scrub_secret( $detail, $api_key ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional server-side error logging; the long-lived key is scrubbed and the detail is never reflected to the browser.
-		return new WP_REST_Response(
-			array( 'error' => __( 'Cinatra could not complete sign-in. Check the connector settings, or contact your administrator.', 'cinatra' ) ),
-			502
-		);
-	}
-
-	// Return ONLY the whitelisted upstream fields to the browser.
-	$out = array();
-	foreach ( $passthrough as $key ) {
-		if ( array_key_exists( $key, $json ) ) {
-			$out[ $key ] = $json[ $key ];
-		}
-	}
-	$resp = new WP_REST_Response( $out, 200 );
-	// The redeem response carries the opaque per-user token; never cache it.
-	$resp->header( 'Cache-Control', 'no-store, private' );
-	return $resp;
-}
-
-/**
- * REST: start the per-user widget-auth PKCE handshake (cinatra#410).
- *
- * Forwards the PKCE challenge + state to /api/widget-auth/init server-to-server
- * (presenting the long-lived cnx_ key) and returns the {txnId, authorizeUrl,
- * instanceId} envelope. The browser opens authorizeUrl as the hosted login
- * popup; raw credentials never touch this CMS DOM.
- *
- * @param WP_REST_Request $request The incoming REST request.
- * @return WP_REST_Response The init envelope, or an error response.
- */
-function cinatra_rest_widget_auth_init( WP_REST_Request $request ): WP_REST_Response {
-	return cinatra_rest_widget_auth_relay(
-		$request,
-		'init',
-		array( 'client', 'agentSlug', 'codeChallenge', 'codeChallengeMethod', 'state', 'instanceId' ),
-		array( 'txnId', 'authorizeUrl', 'instanceId' )
-	);
-}
-
-/**
- * REST: redeem the authorization code for the opaque per-user token (cinatra#410).
- *
- * Forwards {grantType, client, agentSlug, code, codeVerifier} to
- * /api/widget-auth/token server-to-server (presenting the long-lived cnx_ key)
- * and returns the {token: cwu_..., tokenType, expiresIn, scope} envelope. The
- * browser sends that token on the dual-token stream (cinatra#408).
- *
- * @param WP_REST_Request $request The incoming REST request.
- * @return WP_REST_Response The token envelope, or an error response.
- */
-function cinatra_rest_widget_auth_token( WP_REST_Request $request ): WP_REST_Response {
-	return cinatra_rest_widget_auth_relay(
-		$request,
-		'token',
-		array( 'grantType', 'client', 'agentSlug', 'code', 'codeVerifier' ),
-		array( 'token', 'tokenType', 'expiresIn', 'scope' )
-	);
 }
 
 /**
@@ -4211,10 +4113,9 @@ function cinatra_send_site_inventory(): void {
 
 		$payload = cinatra_build_site_inventory_payload();
 
-		// Assert THIS site's own origin, exactly like the widget-auth relays and
-		// the token broker (cinatra_rest_mint_token(), cinatra_rest_widget_auth_relay())
-		// -- the instance's cnx_ arm requires a paired Origin === the credential's
-		// bound connect-site origin and fails closed on a missing/mismatched one.
+		// Assert THIS site's own origin on every server-to-server call -- the
+		// instance's cnx_ arm requires a paired Origin === the credential's bound
+		// connect-site origin and fails closed on a missing/mismatched one.
 		$origin = cinatra_site_origin( admin_url() );
 		if ( '' === $origin ) {
 			return;

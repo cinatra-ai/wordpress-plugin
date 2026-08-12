@@ -22,13 +22,22 @@ resolve it, [contact support](https://docs.cinatra.ai/resources/support/).
 - **Symptom:** Connecting fails, or the assistant panel shows a fallback message
   instead of the chat.
 - **Cause:** The instance URL is wrong, the instance is unreachable, or the
-  instance cannot mint short-lived tokens / has no mutually-supported contract
-  version. The plugin requires server-side token exchange — there is no
-  long-lived-key fallback.
+  instance is older than the version-2 embed protocol this plugin speaks. There
+  is no fallback to an older protocol, on purpose: the older one required the
+  site to handle your sign-in credential.
 - **Fix:** Re-check the **Cinatra instance URL** on **Settings → Cinatra**,
-  confirm the instance is reachable from your site, and confirm the instance has
-  the matching token-exchange and capabilities endpoints deployed. Then run
-  **Connect with Cinatra** again.
+  confirm the instance is reachable from your site, and update the instance if it
+  predates the version-2 embed protocol. Then run **Connect with Cinatra** again.
+
+## The assistant asks me to sign in every time
+
+- **Symptom:** The assistant panel shows a sign-in prompt after a reload, or on
+  each new browser session.
+- **Cause:** This is expected. Your sign-in is held by the Cinatra assistant
+  window, not by the WordPress page, and it is short-lived on purpose. The site
+  cannot keep it for you, which is exactly why it cannot leak it either.
+- **Fix:** Sign in again in the window that opens. If you already have a Cinatra
+  session in that browser, you are returned straight away without typing.
 
 ## The assistant button does not appear
 

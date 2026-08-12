@@ -1,17 +1,40 @@
 <?php
 /**
- * Standalone behavior tests for the Cinatra plugin's token broker + secret-free
- * enqueue. Runs under plain `php tests/test-token-broker.php` — no PHPUnit, no
- * WordPress install. Exit code 0 = all pass, 1 = a failure.
+ * Standalone behavior tests for the Cinatra plugin's CREDENTIAL-FREE browser
+ * surface and its server-to-server transport. Runs under plain
+ * `php tests/test-token-broker.php` — no PHPUnit, no WordPress install. Exit code
+ * 0 = all pass, 1 = a failure.
  *
- * Covers (wp#4 / cinatra#220 spec §4.2):
- *   - cinatra_rest_mint_token denies users without manage_options.
- *   - it rejects a missing / invalid wp_rest nonce.
+ * THE BROKER THIS FILE IS NAMED AFTER IS RETIRED (cinatra#2674, epic #2564 S8e).
+ * It used to assert that `cinatra_rest_mint_token()` performed a server-to-server
+ * exchange and DELIVERED a short-lived `cit_` bearer to the browser, and that the
+ * `cinatra_rest_widget_auth_{init,token}` relays delivered a `cwu_` per-user
+ * bearer the widget composed into the iframe. Those assertions described exactly
+ * the possession this slice ends — the website holding a credential that belongs
+ * to the person and to Cinatra. The instance now answers the old
+ * `/api/widget-auth/{init,token}` pair 410 Gone, and the frame acquires its own
+ * credential on the Cinatra origin.
+ *
+ * So the bearer-DELIVERY tests are FLIPPED to bearer-ABSENCE tests. This suite
+ * now covers:
+ *   - the retired broker + relay callbacks DO NOT EXIST and their routes are NOT
+ *     registered (there is nothing left to call, so nothing to 410 against);
  *   - the enqueued widget script src is the LOCAL plugins_url(...), never a
- *     remote {cinatra_url}/api/... origin.
- *   - no `apiKey` appears anywhere in the localized CinatraConfig data.
- *   - happy path: server-to-server exchange returns ONLY the short-lived token
- *     envelope (no apiKey, no instance internals) and forwards the bound origin.
+ *     remote {cinatra_url}/api/... origin;
+ *   - the localized CinatraConfig carries NO apiKey, NO broker/relay endpoint,
+ *     and — checked recursively — no credential-shaped VALUE of any kind;
+ *   - the connect exchange persists the PUBLIC connect-site handle for the
+ *     widget's `site.siteId` selector while the `cnx_` credential stays server-
+ *     side, and an instance-identity change drops that handle;
+ *   - the server-to-server transport (cinatra_server_base_url +
+ *     cinatra_server_post) is unchanged, including the CINATRA_BASE_URL
+ *     container-override and its request-scoped SSRF relaxation. That path still
+ *     presents the `cnx_` key in an Authorization header, by design: it is the
+ *     setup/integration credential and it never enters the browser.
+ *
+ * The browser-side half of the no-credential guarantee (nothing credential-shaped
+ * can leave on the embed bridge, with a positive control) is pinned in
+ * tests/test-no-credential-egress.mjs.
  */
 
 require __DIR__ . '/wp-stubs.php';
@@ -71,13 +94,58 @@ function reset_fixture() {
     putenv('CINATRA_BASE_URL');
 }
 
-function make_request_with_nonce($nonce, $body = ['contractVersion' => 'v2']) {
-    $req = new WP_REST_Request();
-    if ($nonce !== null) {
-        $req->set_header('X-WP-Nonce', $nonce);
+/**
+ * Drive the server-to-server transport the way the plugin's REMAINING callers do
+ * (Connect, the site-inventory handshake, publish webhooks): resolve the base
+ * through cinatra_server_base_url() and POST through cinatra_server_post().
+ *
+ * The CINATRA_BASE_URL override tests below used to drive this through the token
+ * broker. The broker is gone; the transport it exercised is not, and it is what
+ * those tests were always really about.
+ */
+function drive_server_call(string $path = CINATRA_SITE_INVENTORY_ENDPOINT_PATH) {
+    $url    = rtrim((string) get_option('cinatra_url', ''), '/');
+    $base   = cinatra_server_base_url($url);
+    $origin = cinatra_site_origin(admin_url());
+    return cinatra_server_post(
+        $base . $path,
+        [
+            'timeout' => 10,
+            'headers' => [
+                'Authorization' => 'Bearer ' . (string) get_option('cinatra_api_key', ''),
+                'Content-Type'  => 'application/json',
+                'Origin'        => $origin,
+            ],
+            'body'    => wp_json_encode(['origin' => $origin]),
+        ]
+    );
+}
+
+/**
+ * Recursively true when any string in $value — a value OR a key, at any depth —
+ * carries one of Cinatra's bearer prefixes at a token boundary. The PHP twin of
+ * the widget's outbound guard and of the core `containsCredentialShapedValue`,
+ * used here to scan everything the plugin hands the BROWSER.
+ */
+function contains_credential_shaped_value($value, int $depth = 0): bool {
+    if ($depth > 8) {
+        return false;
     }
-    $req->set_json_params($body);
-    return $req;
+    if (is_string($value)) {
+        return (bool) preg_match('/(?:^|[^A-Za-z0-9])(?:cwu|cit|cnx)_/i', $value);
+    }
+    if (!is_array($value)) {
+        return false;
+    }
+    foreach ($value as $key => $item) {
+        if (is_string($key) && preg_match('/(?:^|[^A-Za-z0-9])(?:cwu|cit|cnx)_/i', $key)) {
+            return true;
+        }
+        if (contains_credential_shaped_value($item, $depth + 1)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,102 +158,66 @@ $GLOBALS['cinatra_test']['current_user_can'] = false;
 check('current_user_can(manage_options) is the gate', current_user_can('manage_options') === false);
 
 // ---------------------------------------------------------------------------
-echo "Test: mint rejects a missing nonce (403)\n";
+// THE RETIRED CREDENTIAL PATH IS GONE — not disabled, not forwarding, GONE.
+//
+// This is the flip. Every assertion below used to have a twin that proved the
+// plugin COULD fetch a bearer for the page: a happy-path mint returning a `cit_`,
+// a relay returning a `cwu_`, their nonce and origin discipline. The property
+// worth pinning now is the absence of the whole capability. A callback that does
+// not exist cannot be re-registered by accident, cannot be reached by a stale
+// cached script, and cannot be "temporarily" re-enabled behind a flag.
+//
+// Deleting rather than forwarding-to-410 is deliberate: a relay whose only job is
+// to present the `cnx_` key and hand the page back a bearer is the possession
+// this change ends. Keeping it alive to return an error would keep the ceremony
+// half-built and inviting.
+// ---------------------------------------------------------------------------
+echo "Test: the retired token broker and sign-in relay callbacks no longer exist\n";
 reset_fixture();
-$resp = cinatra_rest_mint_token(make_request_with_nonce(null));
-check('missing nonce -> 403', $resp->get_status() === 403);
-check('missing nonce -> no token in body', empty($resp->get_data()['token']));
+check('cinatra_rest_mint_token() is GONE (the cit_ broker)',
+    !function_exists('cinatra_rest_mint_token'));
+check('cinatra_rest_widget_auth_relay() is GONE (the shared cnx_ relay)',
+    !function_exists('cinatra_rest_widget_auth_relay'));
+check('cinatra_rest_widget_auth_init() is GONE (hosted-PKCE start)',
+    !function_exists('cinatra_rest_widget_auth_init'));
+check('cinatra_rest_widget_auth_token() is GONE (hosted-PKCE redemption)',
+    !function_exists('cinatra_rest_widget_auth_token'));
+check('CINATRA_AGENT_SLUG is GONE (the agent is derived host-side now)',
+    !defined('CINATRA_AGENT_SLUG'));
+
+echo "Test: no retired route is registered on rest_api_init\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['rest_routes'] = [];
+do_action('rest_api_init');
+$routes = array_map(
+    static function ($r) { return ($r['namespace'] ?? '') . $r['route']; },
+    $GLOBALS['cinatra_test']['rest_routes']
+);
+check('no cinatra/v1/token route is registered',
+    !in_array('cinatra/v1/token', $routes, true));
+check('no cinatra/v1/widget-auth/init route is registered',
+    !in_array('cinatra/v1/widget-auth/init', $routes, true));
+check('no cinatra/v1/widget-auth/token route is registered',
+    !in_array('cinatra/v1/widget-auth/token', $routes, true));
+// Positive control: the registrar DID run and DID register the routes that stay,
+// so "no retired route" is a real absence rather than an empty capture.
+check('positive control: the webhooks registry IS still registered (the capture works)',
+    in_array('cinatra/v1/webhooks', $routes, true));
+check('no registered route mentions widget-auth at all',
+    count(array_filter($routes, static function ($r) { return strpos($r, 'widget-auth') !== false; })) === 0);
 
 // ---------------------------------------------------------------------------
-echo "Test: mint rejects an invalid nonce (403)\n";
-reset_fixture();
-$resp = cinatra_rest_mint_token(make_request_with_nonce('bogus-nonce'));
-check('invalid nonce -> 403', $resp->get_status() === 403);
-
+// THE BROWSER RECEIVES SELECTORS, NOT CREDENTIALS.
+//
+// The old version of this block asserted that CinatraConfig POINTED THE BROWSER
+// AT THE TOKEN BROKER and carried a nonce to call it with. Both are now the
+// regression: the page has nothing to authenticate with and nothing to fetch a
+// credential from. What it gets is public — which instance to frame, which
+// connect-site this is, and a feature flag.
 // ---------------------------------------------------------------------------
-echo "Test: mint rejects when no nonce header AND no remote call made\n";
+echo "Test: enqueue serves the LOCAL asset and a CREDENTIAL-FREE config\n";
 reset_fixture();
-$resp = cinatra_rest_mint_token(make_request_with_nonce(null));
-check('no remote_post made on bad nonce', count($GLOBALS['cinatra_test']['remote_post_calls']) === 0);
-
-// ---------------------------------------------------------------------------
-echo "Test: happy-path exchange returns only the short-lived token\n";
-reset_fixture();
-$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) {
-    return [
-        'response' => ['code' => 200],
-        'body' => json_encode([
-            'token'           => 'cit_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789-_',
-            'tokenType'       => 'Bearer',
-            'expiresIn'       => 300,
-            'expiresAt'       => '2026-06-13T20:05:00.000Z',
-            'contractVersion' => 'v2',
-            'scope'           => 'wordpress-content-editor.stream',
-            // Instance internals that MUST NOT be forwarded:
-            'jti'             => 'should-not-leak',
-            'iss'             => 'https://app.cinatra.ai',
-        ]),
-    ];
-};
-$resp = cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
-$data = $resp->get_data();
-check('happy path -> 200', $resp->get_status() === 200);
-check('returns the cit_ token', ($data['token'] ?? '') === 'cit_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789-_');
-check('does not forward jti', !array_key_exists('jti', $data));
-check('does not forward iss', !array_key_exists('iss', $data));
-check('does not leak apiKey in response', strpos(json_encode($data), 'LONG-LIVED-SECRET-KEY') === false);
-
-// ---------------------------------------------------------------------------
-echo "Test: exchange sends the integration key server-to-server with bound origin\n";
-$call = $GLOBALS['cinatra_test']['remote_post_calls'][0] ?? null;
-check('called the instance token endpoint',
-    $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
-check('Authorization Bearer is the long-lived key',
-    $call && ($call['args']['headers']['Authorization'] ?? '') === 'Bearer LONG-LIVED-SECRET-KEY-uuid-uuid');
-// The instance's cnx_ arm fail-closes the mint on a missing Origin header
-// (paired-origin binding), so the broker MUST assert the site origin as a
-// header, exactly like the widget-auth relays (wordpress-plugin#78).
-check('asserts the site origin as the Origin header (host fail-closes without it)',
-    $call && ($call['args']['headers']['Origin'] ?? '') === 'https://blog.example');
-$sent_body = $call ? json_decode($call['args']['body'], true) : [];
-check('binds the request to the site origin (scheme://host, no path)',
-    ($sent_body['origin'] ?? '') === 'https://blog.example');
-check('sends an audit sub derived from the WP user',
-    ($sent_body['sub'] ?? '') === 'wp-user-7');
-check('sends the agent stream scope',
-    ($sent_body['scope'] ?? '') === 'wordpress-content-editor.stream');
-
-// ---------------------------------------------------------------------------
-echo "Test: instance failure is surfaced as 502 without leaking the key or upstream internals\n";
-reset_fixture();
-$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) {
-    return ['response' => ['code' => 401], 'body' => json_encode([
-        'error'    => 'Unauthorized',
-        'internal' => 'stack-trace-or-instance-detail',
-    ])];
-};
-$resp = cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
-check('instance 401 -> broker 502', $resp->get_status() === 502);
-check('error body does not leak the key',
-    strpos(json_encode($resp->get_data()), 'LONG-LIVED-SECRET-KEY') === false);
-check('upstream error string is NOT reflected verbatim to the browser',
-    strpos(json_encode($resp->get_data()), 'stack-trace-or-instance-detail') === false);
-
-// ---------------------------------------------------------------------------
-echo "Test: a transport failure (WP_Error) is a generic 502, not a verbatim leak\n";
-reset_fixture();
-$GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) {
-    return new WP_Error('http_request_failed', 'cURL error 7: connect to 10.0.0.5:443 refused');
-};
-$resp = cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
-check('transport failure -> 502', $resp->get_status() === 502);
-check('transport error detail is NOT reflected verbatim',
-    strpos(json_encode($resp->get_data()), 'cURL error 7') === false
-    && strpos(json_encode($resp->get_data()), '10.0.0.5') === false);
-
-// ---------------------------------------------------------------------------
-echo "Test: enqueue serves the LOCAL asset and a secret-free config\n";
-reset_fixture();
+$GLOBALS['cinatra_test']['options']['cinatra_site_id'] = 'site_123';
 // Drive the admin_enqueue_scripts logic directly via its named callback.
 cinatra_enqueue_widget();
 $script = $GLOBALS['cinatra_test']['enqueued_scripts']['cinatra'] ?? null;
@@ -200,9 +232,224 @@ check('CinatraConfig has NO apiKey', !array_key_exists('apiKey', $cfg));
 check('no value in CinatraConfig leaks the long-lived key',
     strpos(json_encode($cfg), 'LONG-LIVED-SECRET-KEY') === false);
 check('CinatraConfig advertises contractVersion v2', ($cfg['contractVersion'] ?? '') === 'v2');
-check('CinatraConfig points the browser at the same-origin token broker',
-    ($cfg['tokenEndpoint'] ?? '') === 'https://blog.example/wp-json/cinatra/v1/token');
-check('CinatraConfig carries a nonce for the broker call', !empty($cfg['nonce']));
+// FLIPPED (cinatra#2674): these keys used to be REQUIRED here.
+check('CinatraConfig carries NO token-broker endpoint', !array_key_exists('tokenEndpoint', $cfg));
+check('CinatraConfig carries NO hosted-PKCE relay endpoints',
+    !array_key_exists('authInitEndpoint', $cfg) && !array_key_exists('authTokenEndpoint', $cfg));
+check('CinatraConfig carries NO REST nonce (there is no same-origin credential call to make)',
+    !array_key_exists('nonce', $cfg));
+check('no CinatraConfig value mentions widget-auth or the token route',
+    strpos(json_encode($cfg), 'widget-auth') === false
+    && strpos(json_encode($cfg), 'cinatra/v1/token') === false);
+// The recursive scan — the PHP twin of the browser-side egress guarantee. It
+// catches a bearer smuggled under ANY key, at any depth, not just the two names
+// this file happens to know about.
+check('NOTHING in CinatraConfig is credential-shaped (recursive scan of values AND keys)',
+    contains_credential_shaped_value($cfg) === false);
+// Positive control: the scanner must be able to SEE a credential in this exact
+// shape, or the assertion above proves nothing.
+check('positive control: the scanner DOES fire on a credential planted in a config-shaped array',
+    contains_credential_shaped_value(array_merge($cfg, ['x' => ['y' => 'cwu_planted']])) === true
+    && contains_credential_shaped_value(array_merge($cfg, ['cnx_planted_key' => 1])) === true);
+
+// The PUBLIC selectors the widget needs, and nothing more.
+check('CinatraConfig carries the instance selector', ($cfg['instanceId'] ?? '') === 'wp-prod');
+check('CinatraConfig carries the PUBLIC connect-site handle for the site.siteId selector',
+    ($cfg['siteId'] ?? null) === 'site_123');
+
+// ---------------------------------------------------------------------------
+// THE SERVER-SIDE HALF OF THE GUARANTEE (codex round 0, finding 3).
+//
+// The widget refuses to put a credential-shaped value on the bridge — but that
+// refusal happens in the BROWSER, and by then wp_localize_script() has already
+// printed the value into the admin page as inline JavaScript. So the gate has to
+// run here, on the server, at BOTH boundaries: when a selector is accepted, and
+// again when it is handed out. The tests below poison each entry point in turn.
+// ---------------------------------------------------------------------------
+echo "Test: a credential-shaped selector never reaches the page, whatever route it arrived by\n";
+reset_fixture();
+// Route 1 — a direct database write / an older plugin version / another plugin.
+// The value is already in wp_options when the enqueue runs; only the outbound
+// gate can catch it.
+$GLOBALS['cinatra_test']['options']['cinatra_site_id']     = 'cnx_site_123_SECRET';
+$GLOBALS['cinatra_test']['options']['cinatra_instance_id'] = 'cwu_not_an_instance';
+cinatra_enqueue_widget();
+$cfg_poisoned = $GLOBALS['cinatra_test']['localized']['cinatra']['CinatraConfig'] ?? [];
+check('a stored credential-shaped site handle is BLANKED before localization',
+    ($cfg_poisoned['siteId'] ?? null) === '');
+check('a stored credential-shaped instance id is BLANKED before localization',
+    ($cfg_poisoned['instanceId'] ?? null) === '');
+check('the poisoned config carries no credential-shaped value anywhere',
+    contains_credential_shaped_value($cfg_poisoned) === false);
+
+echo "Test: an over-long selector is blanked too (the frame's schema is strict)\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['options']['cinatra_site_id']     = str_repeat('s', 201);
+$GLOBALS['cinatra_test']['options']['cinatra_instance_id'] = str_repeat('i', 201);
+cinatra_enqueue_widget();
+$cfg_long = $GLOBALS['cinatra_test']['localized']['cinatra']['CinatraConfig'] ?? [];
+check('an over-long site handle is blanked, never truncated',
+    ($cfg_long['siteId'] ?? null) === '');
+check('an over-long instance id is blanked, never truncated',
+    ($cfg_long['instanceId'] ?? null) === '');
+
+echo "Test: the selector gate accepts what it should and refuses what it should\n";
+check('a normal handle passes', cinatra_public_selector('site_123') === 'site_123');
+check('a normal instance id passes', cinatra_public_selector('wp-prod') === 'wp-prod');
+// Lookalikes MUST pass: a gate that blanks ordinary values breaks the product
+// and gets removed.
+check('a lookalike passes (`citation`)', cinatra_public_selector('citation') === 'citation');
+check('a lookalike passes (`abccwu_x`)', cinatra_public_selector('abccwu_x') === 'abccwu_x');
+check('exactly the bound passes', cinatra_public_selector(str_repeat('a', 200)) === str_repeat('a', 200));
+check('one over the bound is blanked', cinatra_public_selector(str_repeat('a', 201)) === '');
+check('a shorter bound is honoured (status is 64)', cinatra_public_selector(str_repeat('a', 65), 64) === '');
+
+// Codex round 1: the bound is measured in UTF-16 CODE UNITS, the unit the
+// frame's zod schema counts — not bytes. A byte bound would blank a perfectly
+// valid non-ASCII selector, and for the REQUIRED instance id that means the
+// assistant never mounts on that site.
+$accented = str_repeat('é', 200);              // 200 UTF-16 units, 400 bytes
+check('200 accented chars pass (measured in UTF-16 units, not the 400 bytes)',
+    cinatra_public_selector($accented) === $accented);
+check('201 accented chars are blanked (the bound is real, just measured right)',
+    cinatra_public_selector(str_repeat('é', 201)) === '');
+// An astral code point is ONE code point but TWO UTF-16 units, exactly as JS
+// counts it: 100 of them are 200 units and must pass; 101 are 202 and must not.
+$astral = str_repeat("\u{1F600}", 100);
+check('100 astral code points pass (200 UTF-16 units)',
+    cinatra_public_selector($astral) === $astral);
+check('101 astral code points are blanked (202 UTF-16 units)',
+    cinatra_public_selector(str_repeat("\u{1F600}", 101)) === '');
+check('cinatra_utf16_length counts UTF-16 units', cinatra_utf16_length('abc') === 3
+    && cinatra_utf16_length('éé') === 2 && cinatra_utf16_length("\u{1F600}") === 2);
+check('invalid UTF-8 is unmeasurable and therefore refused',
+    cinatra_utf16_length("\xC3\x28") === -1 && cinatra_public_selector("\xC3\x28") === '');
+
+// Codex rounds 1 and 2: the gate VALIDATES, it does not normalize — and it does
+// not borrow sanitize_text_field() for either job. That function deletes
+// percent-encoded octets, so using it as a transform renames `tenant%2Fprod` to
+// `tenantprod`, and using it as a mere test refuses a selector the contract
+// plainly allows. Refusing a legal REQUIRED instance id means the assistant never
+// mounts on that site, so both are wrong. Everything legal travels byte-for-byte.
+check('a percent-encoded selector survives EXACTLY (not renamed, not refused)',
+    cinatra_public_selector('tenant%2Fprod') === 'tenant%2Fprod');
+check('a selector with spaces inside survives exactly',
+    cinatra_public_selector('acme prod') === 'acme prod');
+check('angle brackets are not a selector rule (every sink escapes; nothing is stripped)',
+    cinatra_public_selector('wp<b>prod') === 'wp<b>prod');
+// Codex round 3: the PREDICATE mutates nothing at all — not even whitespace.
+check('the predicate does not trim (it returns the value or nothing)',
+    cinatra_public_selector('  wp-prod  ') === '  wp-prod  ');
+// Control characters are corrupt input, not exotic input: refused, never stripped.
+check('a control character is refused, not stripped',
+    cinatra_public_selector("wp\x01prod") === '' && cinatra_public_selector("wp\nprod") === '');
+// The exact trap codex named: PHP's DEFAULT trim charlist includes "\0", so a
+// trim placed before the control-character rule would strip the NUL and let the
+// value through. The predicate does not trim, and the acceptance boundary trims
+// SPACES ONLY — so a NUL is refused on both paths.
+check('a NUL is refused by the predicate',
+    cinatra_public_selector("\x00instance") === '');
+check('a NUL is refused at the acceptance boundary too (trim charlist is spaces only)',
+    cinatra_sanitize_public_selector("\x00instance") === '');
+check('a vertical tab is refused on both paths',
+    cinatra_public_selector("wp\x0Bprod") === '' && cinatra_sanitize_public_selector("wp\x0Bprod") === '');
+
+echo "Test: the acceptance boundary normalizes surrounding SPACES, and only those\n";
+check('the boundary trims surrounding spaces (what a paste leaves behind)',
+    cinatra_sanitize_public_selector('  wp-prod  ') === 'wp-prod');
+check('the boundary leaves inner spaces alone', cinatra_sanitize_public_selector('acme prod') === 'acme prod');
+// The over-length case codex named: 200 letters plus a trailing space is 201
+// units to the predicate (refused) and 200 after the boundary trims (accepted).
+$two_hundred = str_repeat('a', 200);
+check('200 chars + a trailing space is over-length to the predicate',
+    cinatra_public_selector($two_hundred . ' ') === '');
+check('...and is accepted at the boundary, because the space was never part of it',
+    cinatra_sanitize_public_selector($two_hundred . ' ') === $two_hundred);
+check('201 real chars are refused at the boundary too',
+    cinatra_sanitize_public_selector(str_repeat('a', 201)) === '');
+check('a percent-encoded selector survives the boundary exactly',
+    cinatra_sanitize_public_selector('tenant%2Fprod') === 'tenant%2Fprod');
+foreach (['cwu_abc', 'cit_abc', 'cnx_abc', 'Error: cwu_expired', 'https://x/?t=cit_a', 'CNX_ABC', 'x cwu_y'] as $bad) {
+    check("credential-shaped '$bad' is refused", cinatra_public_selector($bad) === '');
+}
+check('a non-string is refused', cinatra_public_selector(['a']) === '' && cinatra_public_selector(null) === '');
+
+echo "Test: a Connect response carrying a credential-shaped handle does not persist it\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['options'] = [];
+$GLOBALS['cinatra_test']['remote_post'] = function () {
+    return [
+        'response' => ['code' => 200],
+        'body'     => json_encode([
+            'url'               => 'https://app.cinatra.ai',
+            // A malformed or compromised host echoing a bearer where the public
+            // handle belongs. Route 2: the inbound gate must catch it.
+            'siteId'            => 'cnx_site_123_PROVISIONED-SECRET',
+            'cinatraInstanceId' => 'cit_not_an_instance',
+            'credential'        => 'cnx_site_123_PROVISIONED-SECRET',
+            'credentialVersion' => 1,
+        ]),
+    ];
+};
+$poisoned = cinatra_connect_exchange('https://app.cinatra.ai', [
+    'grant_type'    => 'authorization_code',
+    'code'          => 'abc',
+    'client'        => 'wordpress',
+    'redirect_uri'  => 'https://blog.example/wp-admin/admin-post.php?action=cinatra_connect_callback',
+    'code_verifier' => str_repeat('v', 64),
+]);
+cinatra_connect_apply_result($poisoned);
+check('a credential-shaped siteId from the host is NOT persisted',
+    get_option('cinatra_site_id', 'unset') === '');
+check('a credential-shaped instance id from the host is NOT persisted',
+    get_option('cinatra_instance_id', 'unset') === '');
+// The credential itself still lands where credentials belong — the gate applies
+// to PUBLIC SELECTORS, not to the site credential.
+check('the site credential itself IS still stored server-side',
+    get_option('cinatra_api_key', '') === 'cnx_site_123_PROVISIONED-SECRET');
+
+echo "Test: every selector WRITE is gated, not only the ones this plugin makes\n";
+// codex round 1: update_option() runs sanitize_option(), which fires these
+// filters — so a value written by another plugin, a migration or WP-CLI is gated
+// on the way IN, not only at the localization boundary.
+check('a sanitize_option filter is registered for the connect-site handle',
+    cinatra_test_has_filter('sanitize_option_cinatra_site_id'));
+check('a sanitize_option filter is registered for the instance id',
+    cinatra_test_has_filter('sanitize_option_cinatra_instance_id'));
+// Behaviour, not just registration: a write by ANY caller goes through the gate.
+reset_fixture();
+update_option('cinatra_site_id', 'cnx_written_by_someone_else');
+check('a foreign update_option() cannot persist a credential-shaped handle',
+    get_option('cinatra_site_id', 'unset') === '');
+update_option('cinatra_instance_id', 'cwu_written_by_someone_else');
+check('a foreign update_option() cannot persist a credential-shaped instance id',
+    get_option('cinatra_instance_id', 'unset') === '');
+// Positive control: an ordinary write still lands, so the gate is a gate and not
+// a wall.
+update_option('cinatra_site_id', 'site_456');
+check('positive control: an ordinary handle still persists', get_option('cinatra_site_id', '') === 'site_456');
+
+echo "Test: a hand-typed credential-shaped instance id is refused by the settings sanitizer\n";
+// The registered callback itself, not the helper behind it: it must take exactly
+// ONE parameter, so a settings filter that ever forwarded the option name as a
+// second argument cannot be misread as a length bound (which would blank every
+// selector on the site).
+$sanitizer = new ReflectionFunction('cinatra_sanitize_public_selector');
+check('the registered sanitize_callback takes exactly one parameter',
+    $sanitizer->getNumberOfParameters() === 1);
+check('the registered sanitizer blanks a pasted bearer',
+    cinatra_sanitize_public_selector('cnx_pasted_by_an_admin') === '');
+check('the registered sanitizer passes an ordinary instance id through',
+    cinatra_sanitize_public_selector('wp-prod') === 'wp-prod');
+
+echo "Test: an unset connect-site handle is an empty selector, never a missing key\n";
+reset_fixture();
+cinatra_enqueue_widget();
+$cfg_nosite = $GLOBALS['cinatra_test']['localized']['cinatra']['CinatraConfig'] ?? [];
+// Present-but-empty is what lets the WIDGET decide to omit the optional `site`
+// block; an absent key would make that a typeof check on undefined instead.
+check('siteId is present and empty when this site has no handle yet',
+    array_key_exists('siteId', $cfg_nosite) && $cfg_nosite['siteId'] === '');
 
 // ---------------------------------------------------------------------------
 // MCP Adapter detection (#62): mcpAdapterActive feature gate in CinatraConfig.
@@ -278,6 +525,22 @@ check('credential stored server-side in cinatra_api_key',
     get_option('cinatra_api_key', '') === 'cnx_site_123_PROVISIONED-SECRET');
 check('instance URL stored', get_option('cinatra_url', '') === 'https://app.cinatra.ai');
 check('instance id stored', get_option('cinatra_instance_id', '') === 'wp-prod');
+// cinatra#2674: the PUBLIC handle is persisted so the widget can offer it as the
+// `site.siteId` selector. The two travel together in the response and part ways
+// here — the handle becomes browser-visible, the credential never does.
+check('connect-site handle stored for the widget selector',
+    get_option('cinatra_site_id', '') === 'site_123');
+check('the stored handle is NOT the credential (they are different values)',
+    get_option('cinatra_site_id', '') !== get_option('cinatra_api_key', ''));
+
+echo "Test: an instance-identity change DROPS the connect-site handle\n";
+// A handle issued by one instance names a site that does not exist on another.
+// Dropping it is the right failure: the selector is optional, so the widget omits
+// it and the instance names the site from its own rows — whereas a stale handle
+// would earn a flat refusal on every message.
+update_option('cinatra_url', 'https://other.cinatra.ai');
+check('handle cleared when the instance URL changes',
+    get_option('cinatra_site_id', '') === '');
 
 echo "Test: connect exchange rejects an http (non-loopback) instance URL\n";
 reset_fixture();
@@ -317,23 +580,16 @@ check('subscriptions capped at the configured max',
 // request-scoped SSRF relaxation.
 // ---------------------------------------------------------------------------
 $ok_remote = function () {
-    return [
-        'response' => ['code' => 200],
-        'body' => json_encode([
-            'token'     => 'cit_envoverride0123456789',
-            'tokenType' => 'Bearer',
-            'expiresIn' => 300,
-        ]),
-    ];
+    return ['response' => ['code' => 200], 'body' => json_encode(['ok' => true])];
 };
 
-echo "Test: env unset -> mint posts to the configured cinatra_url (production unchanged)\n";
+echo "Test: env unset -> server-to-server posts to the configured cinatra_url (production unchanged)\n";
 reset_fixture();
 $GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
-$resp = cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
+drive_server_call();
 $call = $GLOBALS['cinatra_test']['remote_post_calls'][0] ?? null;
 check('env unset -> posts to configured cinatra_url host',
-    $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
+    $call && $call['url'] === 'https://app.cinatra.ai' . CINATRA_SITE_INVENTORY_ENDPOINT_PATH);
 check('env unset -> NO host-allowlist filter active during the call (full SSRF guard)',
     $call && $call['host_filter_active'] === 0);
 check('env unset -> NO safe-port filter active during the call (full SSRF guard)',
@@ -341,9 +597,9 @@ check('env unset -> NO safe-port filter active during the call (full SSRF guard)
 
 // MUST-FIX 1 (production parity): on the env-unset/production path the helper
 // must pass the caller's args UNCHANGED to wp_safe_remote_post — it must NOT
-// inject redirection => 0. The mint caller never sets redirection, so the
-// captured args carry NO redirection key, meaning WordPress applies its DEFAULT
-// (which permits redirects) — byte-identical to the pre-override call.
+// inject redirection => 0. No plugin caller sets redirection, so the captured
+// args carry NO redirection key, meaning WordPress applies its DEFAULT (which
+// permits redirects) — byte-identical to the pre-override call.
 echo "Test: env unset -> args are byte-identical to the pre-override call (no forced redirection => 0)\n";
 check('env unset -> helper does NOT inject a redirection arg (WP default redirect behavior preserved)',
     $call && !array_key_exists('redirection', (array) $call['args']));
@@ -358,14 +614,14 @@ check('env unset -> caller redirection arg is forwarded UNCHANGED (not forced to
 check('env unset -> no SSRF filters installed for a plain public-host call',
     $passthru && $passthru['host_filter_active'] === 0 && $passthru['port_filter_active'] === 0);
 
-echo "Test: CINATRA_BASE_URL override redirects the mint TRANSPORT to the container host\n";
+echo "Test: CINATRA_BASE_URL override redirects the server-to-server TRANSPORT to the container host\n";
 reset_fixture();
 putenv('CINATRA_BASE_URL=http://host.docker.internal:3000');
 $GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
-$resp = cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
+drive_server_call();
 $call = $GLOBALS['cinatra_test']['remote_post_calls'][0] ?? null;
 check('override -> posts to host.docker.internal transport base',
-    $call && $call['url'] === 'http://host.docker.internal:3000/api/agents/wordpress-content-editor/token');
+    $call && $call['url'] === 'http://host.docker.internal:3000' . CINATRA_SITE_INVENTORY_ENDPOINT_PATH);
 check('override -> request-scoped host-allowlist filter ACTIVE during the call',
     $call && $call['host_filter_active'] === 1);
 check('override -> request-scoped safe-port filter ACTIVE during the call',
@@ -375,6 +631,9 @@ check('override -> BOTH filters REMOVED after the call (no leaked relaxation)',
     && (int) ($GLOBALS['cinatra_test']['filters']['http_allowed_safe_ports'] ?? 0) === 0);
 check('override -> redirection disabled on the internal call',
     $call && (int) ($call['args']['redirection'] ?? -1) === 0);
+// The `cnx_` key IS still presented here, and that is correct: this is the
+// server-to-server arm, it never touches the browser, and cinatra#2674 retired
+// the BROWSER's credential path, not this one.
 check('override -> still sends the long-lived Bearer key server-to-server',
     $call && ($call['args']['headers']['Authorization'] ?? '') === 'Bearer LONG-LIVED-SECRET-KEY-uuid-uuid');
 $sent = $call ? json_decode($call['args']['body'], true) : [];
@@ -416,10 +675,10 @@ foreach ([
     cinatra_test_log_reset();
     putenv('CINATRA_BASE_URL=' . $bad_env);
     $GLOBALS['cinatra_test']['remote_post'] = $ok_remote;
-    cinatra_rest_mint_token(make_request_with_nonce('nonce-for-wp_rest'));
+    drive_server_call();
     $call = $GLOBALS['cinatra_test']['remote_post_calls'][0] ?? null;
     check("bad env '$bad_env' -> falls back to configured cinatra_url",
-        $call && $call['url'] === 'https://app.cinatra.ai/api/agents/wordpress-content-editor/token');
+        $call && $call['url'] === 'https://app.cinatra.ai' . CINATRA_SITE_INVENTORY_ENDPOINT_PATH);
     check("bad env '$bad_env' -> NO host-allowlist filter active (SSRF guard intact)",
         $call && $call['host_filter_active'] === 0);
     // The discard warning is fixed-text only: it must NOT echo the raw env value
@@ -510,7 +769,7 @@ $GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) use (&$captured
         'host' => ($GLOBALS['cinatra_test']['filter_cbs']['http_request_host_is_external'] ?? [])[0] ?? null,
         'port' => ($GLOBALS['cinatra_test']['filter_cbs']['http_allowed_safe_ports'] ?? [])[0] ?? null,
     ];
-    return ['response' => ['code' => 200], 'body' => json_encode(['token' => 'cit_x', 'expiresIn' => 300])];
+    return ['response' => ['code' => 200], 'body' => json_encode(['ok' => true])];
 };
 $res_win = cinatra_server_post('http://host.docker.internal:3000/api/x', []);
 check('override window: a host externality filter WAS installed', is_callable($captured_filters['host'] ?? null));
@@ -565,7 +824,7 @@ $GLOBALS['cinatra_test']['remote_post'] = function ($url, $args) use (&$nested) 
         $nested['third_party_private']    = wp_safe_remote_post('http://10.0.0.5/other', []);
         $nested['exact_override_again']   = wp_safe_remote_post('http://host.docker.internal:3000/again', []);
     }
-    return ['response' => ['code' => 200], 'body' => json_encode(['token' => 'cit_x', 'expiresIn' => 300])];
+    return ['response' => ['code' => 200], 'body' => json_encode(['ok' => true])];
 };
 cinatra_server_post('http://host.docker.internal:3000/api/x', []);
 check('window: SAME host on a WP-default-safe port (:8080) is STILL BLOCKED (not the exact origin)',

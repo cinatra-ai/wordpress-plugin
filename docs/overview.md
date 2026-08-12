@@ -20,9 +20,9 @@ content in a chat panel right where they already work — no copy-pasting betwee
 tabs, and no moving your content out of WordPress.
 
 The assistant talks to *your own* Cinatra instance: you choose which instance to
-connect, and the long-lived integration key stays on the server. The browser
-only ever receives a short-lived, scope-bound stream token, so the credential
-never reaches the page.
+connect, and the site's integration key stays on the server. Your own sign-in is
+separate from the site's: you sign in inside the Cinatra assistant window, and
+the WordPress page never receives or holds your credential.
 
 ## What you get
 
@@ -32,9 +32,10 @@ never reaches the page.
 - **A locally-served widget.** The assistant JavaScript ships with the plugin
   and is served from your site — no executable code is fetched from a remote
   server at runtime.
-- **Server-held credentials.** A server-side endpoint exchanges your integration
-  key for a short-lived stream token. The integration key never reaches the
-  browser.
+- **Credentials the page never touches.** The site's integration key stays on the
+  server and is used only for server-to-server calls. Your sign-in belongs to you
+  and Cinatra: it happens inside the assistant window, and the page is not a
+  party to it.
 - **Outbound publish webhooks.** When a post is published, the plugin can sign
   (Standard-Webhooks) and send a `post_published` notification to your connected
   Cinatra instance, using credentials the instance issues during Connect.

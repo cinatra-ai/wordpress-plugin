@@ -6,54 +6,74 @@
 // AUTHORED FIRST; the Drupal copy (cinatra-ai/drupal-module/js/cinatra-widget.js)
 // is hand-mirrored from it.
 //
-// ARCHITECTURE (S5 / cinatra#1221): the assistant conversation is NO LONGER
-// rendered by this file. The Cinatra instance serves the AG-UI surface at
-// `/embed/assistant` and THIS widget mounts it in a sandboxed <iframe> as the
-// SOLE session owner. This shell keeps only the host-side concerns that MUST live
-// on the CMS origin: the launcher/panel chrome, the required-login PKCE handshake
-// (cwu_ per-user token) + the short-lived cit_ site-token broker mint, and the
-// parent half of the §12/§12b parent↔iframe bridge — a document-bound MessagePort
-// transport with an origin-pinned legacy window fallback for the negotiated
-// transition.
+// ARCHITECTURE (S5 / cinatra#1221; PROTOCOL 2 by cinatra#2674): the assistant
+// conversation is NOT rendered by this file. The Cinatra instance serves the
+// AG-UI surface at `/embed/assistant` and THIS widget mounts it in a sandboxed
+// <iframe> as the SOLE session owner. This shell keeps only the host-side
+// concerns that MUST live on the CMS origin: the launcher/panel chrome and the
+// parent half of the §12/§12b parent↔iframe bridge.
 //
-// CAPABILITY/CONTRACT NEGOTIATION IS THE IFRAME'S JOB (S5 cutover, cinatra#2029).
-// The retired shell pre-flight against the bespoke `GET /api/agents/{slug}/
-// capabilities` (deleted by cinatra#1991 — no migration window) is GONE. The
-// unified assistant broker negotiates the AG-UI contract CLIENT-SIDE inside the
-// `/embed/assistant` iframe (against `GET /api/assistants/chat/capabilities` with
-// the cit_/cwu_ dual-token broker headers, per cinatra#1998 Lane A / #2004) and
-// the conversational wire is `POST /api/assistants/chat` (cinatra#1221). This
-// shell therefore MOUNTS UNCONDITIONALLY (login-gated) and no longer fetches any
-// capabilities endpoint or holds a client-negotiated contract version.
+// WHAT PROTOCOL 2 CHANGED, AND WHY IT IS THE WHOLE POINT (cinatra#2674).
+// At protocol 1 this file was a party to the person's sign-in: it ran the hosted
+// PKCE handshake through same-origin PHP relays, received the `cwu_` per-user
+// bearer back, minted a `cit_` site transport token, and composed BOTH into a
+// postMessage BOOTSTRAP. That made the website a HOLDER of a credential that
+// belongs to the person and to Cinatra.
 //
-// The vanilla AG-UI renderer (markdown/diff-card/history/SSE-stream loop) that
-// previously lived here is DELETED: the iframe owns the turn (textarea + submit +
-// streaming render are INSIDE the iframe). This shell never streams, never holds
-// an `Authorization: Bearer` fetch, and relays the cit_/cwu_ tokens ONLY into the
-// single BOOTSTRAP postMessage — never to storage, a URL, a log, or an uplink.
+// That is over. This shell now:
+//   * initiates NO sign-in and redeems NO code — the frame runs the whole
+//     ceremony on the Cinatra origin, in a top-level Cinatra popup it opens
+//     itself, and the credential never leaves the frame;
+//   * composes and receives NO bearer — `cwu_` and `cit_` do not appear in
+//     plugin code at all, and the retired token-broker relays are DELETED (the
+//     instance answers the old `/api/widget-auth/{init,token}` pair 410 Gone);
+//   * posts ONE inbound message, `cinatra.embed.context`, carrying PUBLIC,
+//     UNTRUSTED SELECTORS only (which site, which agent, which CMS resource is
+//     on screen) at protocol version literal 2.
+// The long-lived `cnx_` connect-site credential is UNCHANGED and stays exactly
+// what it was: a backend-only setup/integration credential, used server-to-server
+// from PHP, never in the browser and never on this bridge.
+//
+// NO CREDENTIAL FIELD, AND NO CREDENTIAL VALUE. Dropping `auth` removes the
+// credential FIELD. Every remaining field is still a string this file chooses, so
+// a `cwu_…` could in principle ride inside `cms.resourceId`. So every outbound
+// bridge payload is recursively scanned for a value carrying one of Cinatra's
+// bearer prefixes and the send is REFUSED when one is found — mirroring
+// `containsCredentialShapedValue` in cinatra src/lib/embed/bridge-protocol.ts. A
+// message that never leaves is strictly better than one the frame rejects on
+// arrival.
 //
 // TRUST BOUNDARY (§4/§6/§12/§12b):
-//   * The iframe is `sandbox="allow-scripts allow-same-origin"` (no top-nav, no
-//     forms, no popups, no downloads, no modals) framing `/embed/assistant`.
+//   * The iframe framing `/embed/assistant` is sandboxed with EXACTLY four
+//     tokens: `allow-scripts allow-same-origin allow-popups
+//     allow-popups-to-escape-sandbox`. The two popup grants are REQUIRED at
+//     protocol 2 and are not optional hardening to be tidied away later: the
+//     FRAME opens the hosted sign-in with `window.open`, which a sandbox without
+//     `allow-popups` blocks outright, and a popup that merely inherited this
+//     sandbox would have no forms and no top-level navigation, so the ceremony
+//     could not complete. The escape applies to the window the frame opens, NOT
+//     to the frame: no top-navigation, no forms, no modals, no downloads and no
+//     pointer-lock are granted here. THIS SHELL still opens no window itself.
+//   * The credential guard runs in BOTH directions: a payload carrying a
+//     bearer-shaped value is refused on the way out and dropped on the way in.
 //   * PORT-BOUND TRANSPORT (§12b): the iframe creates a MessageChannel and
-//     transfers ONE endpoint in the token-free, origin/source-gated READY. The
-//     parent RETAINS that transferred port and sends the token-bearing BOOTSTRAP
-//     (plus any later parent→iframe traffic) ONLY over it — never via a window
-//     postMessage. Because the READY transfer is addressed to the exact Cinatra
-//     origin, only the expected document receives the port; a same-origin
-//     replacement of the frame's browsing context is a FRESH realm that never
-//     inherits the entangled endpoint, so it can never receive the tokens. This
-//     closes the residual the WindowProxy source-binding narrows but cannot
-//     eliminate (event.source is a browsing CONTEXT, not a specific DOCUMENT).
-//   * The legacy WINDOW transport is kept ONLY for the negotiated transition with
-//     an as-yet-unmigrated iframe; when used it still posts to an EXPLICIT
-//     targetOrigin (the Cinatra instance origin), NEVER "*".
+//     transfers ONE endpoint in the origin/source-gated READY. The parent RETAINS
+//     that endpoint and sends the CONTEXT message (plus any later parent→iframe
+//     traffic) over it. At protocol 2 this is no longer a credential wall — there
+//     is no credential to misdeliver — but it is kept because the property still
+//     holds and costs nothing: a same-origin replacement of the frame is a fresh
+//     realm that never inherits the entangled endpoint, so it cannot silently
+//     take over an established session's channel.
+//   * The WINDOW transport remains for a frame that transfers no port; when used
+//     it still posts to an EXPLICIT targetOrigin (the Cinatra instance origin),
+//     NEVER "*".
 //   * Inbound frame messages are accepted ONLY when `event.origin === cinatraOrigin`
 //     AND `event.source === iframe.contentWindow` (origin + source-window binding).
 //     Steady-state uplinks in PORT mode ride the entangled port (their provenance
 //     is the origin-targeted transfer that delivered it — a NARROWING).
-//   * READY→BOOTSTRAP: the parent mints a CSPRNG correlationId (≥128-bit), echoes
-//     the frame nonce, sends seq=0, and one bootstrap per frame (re-auth = reload).
+//   * READY→CONTEXT: the parent mints a CSPRNG correlationId (≥128-bit), echoes
+//     the frame nonce, sends seq=0, and ONE context per frame (a new session is a
+//     reload). A refused send is NOT retried — there is no retry storm here.
 //   * Two INDEPENDENT monotonic seq counters (one per direction) per correlationId.
 //   * apply_intent carries an UNTRUSTED SELECTOR only: the parent re-checks the
 //     current user may edit, uses its OWN canonical resource, dedups against a
@@ -61,10 +81,11 @@
 //     (#1214: field-apply happens server-side via the CMS MCP integration).
 //   * resize height is CLAMPED to the panel cap (clamp, never trust the value).
 //
-// Security-critical invariants (no apiKey in the browser; tokenEndpoint broker;
-// sandbox iframe; explicit targetOrigin; source-window binding; token-in-bootstrap
-// only; no apply-time egress; no legacy /api/agents/{slug}/capabilities pre-flight)
-// are gated by tools/widget-parity-check.mjs in CI.
+// Security-critical invariants (no apiKey and no bearer of any shape in the
+// browser; no token-broker call; no sign-in ceremony on the CMS origin; sandbox
+// iframe; explicit targetOrigin; source-window binding; the credential-shaped
+// value guard on every send; no apply-time egress) are gated by
+// tools/widget-parity-check.mjs in CI.
 //
 // ---------------------------------------------------------------------------
 // NOTICE (Apache License 2.0)
@@ -91,13 +112,14 @@
 // ---------------------------------------------------------------------------
 (function () {
   // ---------------------------------------------------------------------------
-  // Bootstrap config guard.
-  // The browser holds NO long-lived key. It needs the instance URL and a
-  // same-origin broker endpoint that mints short-lived tokens.
+  // Config guard.
+  // The browser holds NO credential of any kind — no long-lived key, no broker
+  // endpoint, no bearer. All it needs is the instance URL to frame, plus the
+  // public selectors it will hand the frame.
   // ---------------------------------------------------------------------------
   var config = window.CinatraConfig || {};
-  if (!config.cinatraUrl || !config.tokenEndpoint) {
-    console.warn('[cinatra] Missing CinatraConfig (cinatraUrl / tokenEndpoint)');
+  if (!config.cinatraUrl) {
+    console.warn('[cinatra] Missing CinatraConfig (cinatraUrl)');
     return;
   }
   var rootEl = document.getElementById('cinatra-root');
@@ -108,27 +130,29 @@
   // unconditionally at boot; a throw mid-mount still leaves the fallback chrome
   // visible (the marker that hides it is set LAST).
 
-  var AGENT_SLUG = 'wordpress-content-editor';
-  // Required-login (cinatra#410): the per-user auth handshake (#407 hosted PKCE)
-  // names this site as the `client`. The CMS differentiator (vs the Drupal mirror)
-  // is this one constant + the CMS config accessor + the broker CSRF idiom.
-  var AUTH_CLIENT = 'wordpress';
-  // §4: the `?assistant` value; == the cit_-bound kind. MUST equal the embed
-  // page's `session.assistant` agreement check.
+  // §4: the `?assistant` value — the agent identifier this parent may name. It is
+  // a SELECTOR, never an assertion: the instance re-derives the authoritative
+  // agent from its own closed host-side table and denies on any mismatch, so
+  // naming another site's agent yields a refusal, not that agent. MUST equal the
+  // embed page's `session.assistant` agreement check.
   var EMBED_ASSISTANT = 'wordpress';
 
   // ---------------------------------------------------------------------------
   // §12/§12b bridge protocol constants (the byte-level contract both halves pin).
   // Mirror of cinatra-ai/cinatra src/lib/embed/bridge-protocol.ts — kept in sync
   // by review + the parity gate. There is NO arbitrary-tool channel: the message
-  // type set is CLOSED. The BOOTSTRAP body is byte-identical across the port and
-  // legacy transports (protocolVersion 1), so a migrated parent interoperates with
-  // the merged schema during the negotiated transition.
+  // type set is CLOSED.
+  //
+  // VERSION 2 (cinatra#2674) is deliberately BREAKING. A protocol-1 parent and a
+  // protocol-2 frame cannot negotiate at all, which is what makes "the parent can
+  // no longer deliver a credential" TRUE rather than merely intended: there is no
+  // silent fallback to the retired credential-bearing bootstrap, and the retired
+  // inbound type is not even named here, so it cannot be reached by name.
   // ---------------------------------------------------------------------------
-  var EMBED_PROTOCOL_VERSION = 1;
+  var EMBED_PROTOCOL_VERSION = 2;
   var MSG = {
-    ready: 'cinatra.embed.ready',       // iframe -> parent, pre-bootstrap (no correlationId)
-    bootstrap: 'cinatra.embed.bootstrap', // parent -> iframe, the ONLY credential carrier
+    ready: 'cinatra.embed.ready',       // iframe -> parent, pre-context (no correlationId)
+    context: 'cinatra.embed.context',   // parent -> iframe, PUBLIC SELECTORS ONLY
     resize: 'cinatra.embed.resize',     // iframe -> parent
     focus: 'cinatra.embed.focus',       // iframe -> parent
     a11y: 'cinatra.embed.a11y',         // iframe -> parent
@@ -141,8 +165,91 @@
   var APPLY_INTENT_VIEW_TYPES = ['content_change_proposal'];
   var APPLY_LRU_MAX = 64;                         // §6f bounded seen-id LRU
 
-  // The Cinatra instance origin — the ONLY origin the bridge posts BOOTSTRAP to
-  // and the ONLY origin/source it accepts uplinks from. Resolved ONCE, strictly.
+  // ---------------------------------------------------------------------------
+  // The protocol-2 SELECTOR BOUNDS, mirrored from the core context schema
+  // (cinatra#2674; codex round 0, finding 4).
+  //
+  // The frame's schema is `.strict()`, so ONE over-long display field rejects the
+  // WHOLE message and the session never starts — the frame just sits in its
+  // neutral "waiting for host" state forever, with nothing to tell the site owner
+  // why. An OPTIONAL selector that would exceed its bound is therefore OMITTED
+  // rather than sent: it is a disambiguator, and losing a disambiguator costs far
+  // less than losing the session. It is never TRUNCATED — a truncated id is a
+  // different id, and a selector that quietly names something else is worse than
+  // one that is absent.
+  // ---------------------------------------------------------------------------
+  var SELECTOR_MAX = {
+    siteId: 200,        // site.siteId
+    instanceId: 200,    // cms.instanceId (REQUIRED, min 1)
+    resourceId: 200,    // cms.resourceId
+    resourceType: 200,  // cms.resourceType
+    status: 64,         // cms.status
+  };
+  /** The value when it is a non-empty string within its bound, else null. */
+  function boundedSelector(value, max) {
+    if (typeof value !== 'string') return null;
+    if (value.length === 0 || value.length > max) return null;
+    return value;
+  }
+
+  // ---------------------------------------------------------------------------
+  // CREDENTIAL-SHAPED VALUE GUARD (cinatra#2674) — the second half of "no
+  // credential crosses this boundary", mirrored from the core
+  // `containsCredentialShapedValue`.
+  //
+  // The context schema has no `auth`, so there is no credential FIELD. Every
+  // remaining field is still a string THIS FILE chooses from CMS state, so a
+  // bearer could in principle be smuggled into `cms.resourceId` or a site id by a
+  // misconfiguration or a compromised option. Every outbound payload is therefore
+  // scanned before it is sent and the send is REFUSED on a hit.
+  //
+  // This is a CONTAINMENT control, not a secret detector: it cannot recognise a
+  // credential that carries no prefix, and it is not asked to. What it guarantees
+  // — and what tests/test-no-credential-egress.mjs pins with synthetic sentinels —
+  // is that nothing this plugin puts on the bridge can be shaped like one of our
+  // bearers, at any depth, in a value or a key.
+  // ---------------------------------------------------------------------------
+  var CREDENTIAL_VALUE_PREFIXES = ['cwu_', 'cit_', 'cnx_'];
+  // A bearer prefix ANYWHERE in the string, at a token boundary — a prefix-only
+  // test would let `'Error: cwu_…'` and `'https://x/?t=cit_…'` through, and an
+  // error string or a URL is exactly how one arrives there by accident. The
+  // boundary class keeps it from firing on a word that merely ENDS in the letters
+  // (a fictional 'abccwu_'). Case-insensitive: a value that differs from a
+  // credential only by case is a credential someone is trying to sneak past.
+  var CREDENTIAL_TOKEN_RE = new RegExp(
+    '(?:^|[^A-Za-z0-9])(?:' +
+      CREDENTIAL_VALUE_PREFIXES.map(function (p) { return p.slice(0, -1); }).join('|') +
+      ')_',
+    'i'
+  );
+  function isCredentialShapedValue(value) {
+    if (typeof value !== 'string') return false;
+    return CREDENTIAL_TOKEN_RE.test(value);
+  }
+  // Recursively true when ANY string anywhere is credential-shaped — object
+  // values, array members and object KEYS alike (a key is as visible to a logger
+  // as a value). Depth-bounded, like the core guard.
+  function containsCredentialShapedValue(value, depth) {
+    var d = depth || 0;
+    if (d > 8) return false;
+    if (isCredentialShapedValue(value)) return true;
+    if (value === null || typeof value !== 'object') return false;
+    if (Object.prototype.toString.call(value) === '[object Array]') {
+      for (var i = 0; i < value.length; i++) {
+        if (containsCredentialShapedValue(value[i], d + 1)) return true;
+      }
+      return false;
+    }
+    for (var key in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      if (isCredentialShapedValue(key)) return true;
+      if (containsCredentialShapedValue(value[key], d + 1)) return true;
+    }
+    return false;
+  }
+
+  // The Cinatra instance origin — the ONLY origin the bridge posts to and the
+  // ONLY origin/source it accepts uplinks from. Resolved ONCE, strictly.
   var cinatraOrigin = null;
   try { cinatraOrigin = new URL(config.cinatraUrl).origin; } catch (_) { cinatraOrigin = null; }
   if (!cinatraOrigin) {
@@ -151,12 +258,18 @@
   }
 
   // ---------------------------------------------------------------------------
-  // mountWidget() — builds the Shadow DOM + wires the launcher, login, and the
+  // mountWidget() — builds the Shadow DOM + wires the launcher and the
   // parent-side bridge. Called UNCONDITIONALLY at boot: the capability/contract
-  // handshake now runs CLIENT-SIDE inside the /embed/assistant iframe against the
+  // handshake runs CLIENT-SIDE inside the /embed/assistant iframe against the
   // unified broker surface (see the header), so there is no shell pre-flight to
-  // gate the mount. The login gate still holds — the iframe is not framed until a
-  // per-user cwu_ token is held, so the conversation never appears token-less.
+  // gate the mount.
+  //
+  // THERE IS NO LOGIN GATE HERE ANY MORE (cinatra#2674). Sign-in is not this
+  // shell's business: the frame decides whether the person is signed in and, if
+  // not, shows its own sign-in inside the frame and runs the whole ceremony on the
+  // Cinatra origin. So the panel has exactly one body — the frame — and the frame
+  // is mounted lazily on the first open (a user gesture), never on every admin
+  // page load.
   // ---------------------------------------------------------------------------
   function mountWidget() {
   // Idempotency guard: a second copy of this IIFE (a double script include) could
@@ -205,7 +318,7 @@
     '  z-index: 3;',
     '}',
 
-    /* Panel: fills the widget; header on top, body (login | iframe) below. */
+    /* Panel: fills the widget; header on top, the embed iframe below. */
     '.cw-panel {',
     '  position: absolute; top: 0; left: 0; right: 0; bottom: 0;',
     '  box-sizing: border-box;',
@@ -246,26 +359,10 @@
     '  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;',
     '}',
 
-    /* Required-login window (cinatra#410). Shown in place of the iframe until a
-       valid per-user token is held. NO email/password inputs and NO sign-up — the
-       only affordance is the button that opens the hosted /widget-auth popup. */
-    '.cw-login {',
-    '  flex: 1; min-height: 0; display: flex; flex-direction: column;',
-    '  align-items: center; justify-content: center;',
-    '  padding: 32px 28px; text-align: center; gap: 16px; box-sizing: border-box;',
-    '}',
-    '.cw-login-mark { display: flex; align-items: center; justify-content: center; }',
-    '.cw-login-title { font: 600 18px/1.3 system-ui, -apple-system, sans-serif; color: #15213a; letter-spacing: -0.01em; margin: 0; }',
-    '.cw-login-sub { font: 14px/1.55 system-ui, -apple-system, sans-serif; color: #5a6477; max-width: 280px; margin: 0; }',
-    '.cw-login-btn {',
-    '  width: 100%; max-width: 260px; padding: 10px 16px; margin-top: 4px;',
-    '  background: #15213a; color: #ffffff; border: none; border-radius: 10px;',
-    '  font: 600 14px system-ui, -apple-system, sans-serif; cursor: pointer;',
-    '  transition: background 0.15s;',
-    '}',
-    '.cw-login-btn:hover { background: #1d2c4d; }',
-    '.cw-login-btn:disabled { opacity: 0.55; cursor: default; }',
-    '.cw-login-err { font: 13px/1.5 system-ui, -apple-system, sans-serif; color: #b42318; min-height: 18px; max-width: 280px; }',
+    /* There is deliberately NO login chrome here (cinatra#2674). The sign-in
+       affordance — and every message about it — belongs to the Cinatra frame,
+       which owns the ceremony. This CMS page renders no auth UI, no auth error,
+       and no credential input of any kind. */
   ].join('\n');
   shadow.appendChild(style);
 
@@ -405,52 +502,12 @@
   a11yLive.setAttribute('aria-live', 'polite');
   panel.appendChild(a11yLive);
 
-  // ---------------------------------------------------------------------------
-  // Required-login window (cinatra#410). Shown in login mode; hidden in
-  // conversation mode (replaced by the iframe). NO credential inputs, NO sign-up
-  // — its only affordance opens the Cinatra-hosted /widget-auth login popup, so
-  // raw credentials never touch this CMS-origin DOM.
-  // ---------------------------------------------------------------------------
-  var loginEl = document.createElement('div');
-  loginEl.className = 'cw-login';
-
-  var loginMark = document.createElement('div');
-  loginMark.className = 'cw-login-mark';
-  var loginLogo = mkSvg(40, 25, LOGO_VIEWBOX);
-  loginLogo.setAttribute('fill', 'none');
-  loginLogo.appendChild(mkEl('path', { d: LOGO_BRIM, fill: LOGO_COLOR }));
-  loginLogo.appendChild(mkEl('path', { d: LOGO_CROWN, fill: LOGO_COLOR }));
-  loginMark.appendChild(loginLogo);
-  loginEl.appendChild(loginMark);
-
-  var loginTitle = document.createElement('p');
-  loginTitle.className = 'cw-login-title';
-  loginTitle.textContent = 'Sign in to continue';
-  loginEl.appendChild(loginTitle);
-
-  var loginSub = document.createElement('p');
-  loginSub.className = 'cw-login-sub';
-  loginSub.textContent = 'Sign in with your Cinatra account to use the assistant on this site.';
-  loginEl.appendChild(loginSub);
-
-  var loginBtn = document.createElement('button');
-  loginBtn.className = 'cw-login-btn';
-  loginBtn.type = 'button';
-  loginBtn.textContent = 'Sign in with Cinatra';
-  loginEl.appendChild(loginBtn);
-
-  var loginErr = document.createElement('div');
-  loginErr.className = 'cw-login-err';
-  loginErr.setAttribute('role', 'alert');
-  loginErr.setAttribute('aria-live', 'polite');
-  loginEl.appendChild(loginErr);
-
-  panel.appendChild(loginEl);
-
-  // Conversation body host — the sandboxed embed iframe is mounted here on login.
+  // Conversation body host — the sandboxed embed iframe is mounted here on the
+  // first open. It is the panel's ONLY body: whatever the person needs to see
+  // before they are signed in (including the sign-in itself) is drawn by the
+  // frame, on the Cinatra origin.
   var frameHost = document.createElement('div');
   frameHost.className = 'cw-frame-host';
-  frameHost.style.display = 'none';
   panel.appendChild(frameHost);
 
   // ---------------------------------------------------------------------------
@@ -458,19 +515,12 @@
   // ---------------------------------------------------------------------------
   var isOpen = false;
 
-  // Required-login state (cinatra#410). On a fresh mount there is never a valid
-  // per-user token, so the panel starts in 'login' mode. `userToken` is held in
-  // module scope (in-memory ONLY — never sessionStorage; a bearer in storage
-  // outlives the tab and is XSS-exfiltratable). `pkce` holds the in-flight
-  // handshake (verifier/state/popup) and is single-use.
-  var panelMode = 'login';   // 'login' | 'conversation'
-  var userToken = null;      // { token, expiresAtMs }
-  var pkce = null;           // { codeVerifier, state, popup } during a handshake
-  var popupTimer = null;     // setInterval handle while watching for popup close
-
   // ---------------------------------------------------------------------------
-  // Content editor context (repurposed for the `cms` BOOTSTRAP context and as the
-  // parent's OWN canonical resource for apply_intent — NOT a stream input).
+  // Content editor context — the PUBLIC selectors for the `cms` block of the
+  // CONTEXT message, and the parent's OWN canonical resource for apply_intent.
+  // Nothing here is authority and nothing here is secret: the instance re-derives
+  // the authoritative site, org, origin, agent and canonical instance from its own
+  // rows and denies on any mismatch.
   // ---------------------------------------------------------------------------
   function buildContentContext() {
     var postId =
@@ -498,63 +548,13 @@
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // Short-lived cit_ token exchange via the same-origin WordPress REST broker.
-  // The browser never holds the long-lived integration key; the broker (PHP)
-  // holds it and performs the server-to-server exchange. The minted cit_ token is
-  // relayed ONLY into the BOOTSTRAP message (§4) — never a Bearer header, never a
-  // URL, never storage. Cached in-memory and reused until ~10s before expiry.
-  // ---------------------------------------------------------------------------
-  var cachedToken = null;        // { token, expiresAtMs }
-  async function getStreamToken() {
-    var now = Date.now();
-    if (cachedToken && cachedToken.expiresAtMs - 10000 > now) {
-      return cachedToken.token;
-    }
-    var headers = { 'Content-Type': 'application/json' };
-    if (config.nonce) headers['X-WP-Nonce'] = config.nonce;
-    // The shell no longer negotiates a client-side contract version (the iframe
-    // owns the AG-UI handshake). The token-exchange contract version is supplied
-    // authoritatively by the same-origin PHP broker (CINATRA_CONTRACT_VERSION),
-    // so the browser posts no contractVersion here.
-    var resp = await fetch(config.tokenEndpoint, {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: headers,
-      body: JSON.stringify({}),
-    });
-    if (!resp.ok) {
-      var detail = 'HTTP ' + resp.status;
-      try {
-        var errRaw = await resp.text();
-        var errParsed = null;
-        try { errParsed = JSON.parse(errRaw); } catch (_) {}
-        if (errParsed && (errParsed.message || errParsed.error)) {
-          detail = errParsed.message || errParsed.error;
-        } else if (errRaw) {
-          detail += ': ' + errRaw.slice(0, 200);
-        }
-      } catch (_) {}
-      throw new Error('Could not obtain a Cinatra session token (' + detail + ').');
-    }
-    var body = await resp.json();
-    if (!body || typeof body.token !== 'string' || body.token.indexOf('cit_') !== 0) {
-      throw new Error('Cinatra session-token response was malformed.');
-    }
-    var ttlMs = (typeof body.expiresIn === 'number' ? body.expiresIn : 300) * 1000;
-    cachedToken = { token: body.token, expiresAtMs: now + ttlMs };
-    return body.token;
-  }
 
   // ---------------------------------------------------------------------------
-  // Required-login (cinatra#410): the per-user PKCE handshake against the hosted
-  // /widget-auth surface (#407) + the login-window mode toggle. The browser never
-  // holds the long-lived cnx_ key: both init and token redemptions go through the
-  // same-origin PHP broker, which presents cnx_ server-to-server. The opaque cwu_
-  // user token is short-lived (15-min TTL, no refresh) and held in memory only.
+  // CSPRNG id minting. base64url(no padding) of a random byte array — the ONLY
+  // cryptographic thing left in this file now that the sign-in ceremony belongs to
+  // the frame. It mints the bridge correlationId; it mints no PKCE verifier,
+  // because this shell starts no PKCE transaction.
   // ---------------------------------------------------------------------------
-
-  // base64url(no padding) of a byte array.
   function b64url(bytes) {
     var s = '';
     for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
@@ -565,204 +565,45 @@
     crypto.getRandomValues(a);
     return b64url(a);
   }
-  async function sha256b64url(str) {
-    var data = new TextEncoder().encode(str);
-    var dig = await crypto.subtle.digest('SHA-256', data);
-    return b64url(new Uint8Array(dig));
-  }
-
-  // CSRF/auth headers for the same-origin broker POSTs (WP REST convention: the
-  // wp_rest nonce in X-WP-Nonce; the broker permission_callback + nonce check are
-  // the cross-site-POST defense).
-  function brokerHeaders() {
-    var h = { 'Content-Type': 'application/json' };
-    if (config.nonce) { h['X-WP-Nonce'] = config.nonce; }
-    return h;
-  }
-
-  // A per-user token is valid when present and at least 5s from expiry (skew).
-  function userTokenValid() {
-    return !!(userToken && userToken.token && (userToken.expiresAtMs - 5000) > Date.now());
-  }
-
-  // Reflect panelMode into the DOM. The header stays in both modes; the iframe is
-  // display:none in login mode so the conversation is never shown without a token.
-  function applyPanelMode() {
-    var login = panelMode === 'login';
-    loginEl.style.display = login ? 'flex' : 'none';
-    frameHost.style.display = login ? 'none' : 'flex';
-  }
-
-  // Tear down any in-flight handshake state. Does NOT close the popup — the caller
-  // decides that (success closes it).
-  function clearHandshake() {
-    if (popupTimer) { try { clearInterval(popupTimer); } catch (_) {} popupTimer = null; }
-    pkce = null;
-  }
-
-  // Drop the user token and return to the login window, tearing down the iframe
-  // session (single bootstrap per frame; re-auth = a fresh frame). Used on expiry.
-  function forceReLogin(message) {
-    userToken = null;
-    clearHandshake();
-    teardownBridge();
-    panelMode = 'login';
-    applyPanelMode();
-    loginErr.textContent = message || 'Your session expired. Please sign in again.';
-    loginBtn.disabled = false;
-  }
-
-  // Poll for a manually-closed/blocked popup so we can re-enable the button and
-  // drop the dangling handshake (the postMessage may never arrive).
-  function watchPopupClosed() {
-    if (popupTimer) { try { clearInterval(popupTimer); } catch (_) {} popupTimer = null; }
-    var ticks = 0;
-    popupTimer = setInterval(function () {
-      ticks++;
-      var closed = false;
-      try { closed = !pkce || !pkce.popup || pkce.popup.closed; } catch (_) { closed = false; }
-      if (closed || ticks > 600) {
-        try { clearInterval(popupTimer); } catch (_) {}
-        popupTimer = null;
-        if (pkce) {
-          pkce = null;
-          loginBtn.disabled = false;
-        }
-      }
-    }, 500);
-  }
-
-  // Start the login handshake: generate PKCE, init via the broker, open the hosted
-  // login popup. The auth-popup message listener does the redeem when it posts back.
-  async function startLogin() {
-    if (pkce) { return; }                  // reject concurrent handshakes
-    loginErr.textContent = '';
-    loginBtn.disabled = true;
-    try {
-      if (typeof window.crypto === 'undefined' || !window.crypto || !crypto.subtle || typeof btoa === 'undefined') {
-        throw new Error('Secure sign-in is not available in this browser.');
-      }
-      var verifier = randB64url(48);
-      var challenge = await sha256b64url(verifier);
-      var state = randB64url(24);
-
-      var initResp = await fetch(config.authInitEndpoint, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: brokerHeaders(),
-        body: JSON.stringify({
-          client: AUTH_CLIENT,
-          agentSlug: AGENT_SLUG,
-          codeChallenge: challenge,
-          codeChallengeMethod: 'S256',
-          state: state,
-          instanceId: config.instanceId || undefined,
-        }),
-      });
-      if (!initResp.ok) { throw new Error('Could not start sign-in.'); }
-      var initBody = await initResp.json();
-      if (!initBody || !initBody.authorizeUrl) { throw new Error('Could not start sign-in.'); }
-
-      // SECURITY: the popup destination MUST be same-origin with the configured
-      // instance — defense against a compromised broker steering the login popup
-      // off-instance. Resolve and re-assert the origin here.
-      var authUrl = new URL(initBody.authorizeUrl, cinatraOrigin + '/');
-      if (authUrl.origin !== cinatraOrigin) { throw new Error('Refusing off-origin sign-in.'); }
-
-      pkce = { codeVerifier: verifier, state: state, popup: null };
-
-      var popup = window.open(authUrl.href, 'cinatra-login',
-        'width=460,height=640,menubar=no,toolbar=no,location=yes,status=no');
-      if (!popup) {
-        pkce = null;
-        throw new Error('Pop-up blocked. Allow pop-ups for this site and try again.');
-      }
-      pkce.popup = popup;
-      watchPopupClosed();
-    } catch (err) {
-      clearHandshake();
-      loginErr.textContent = (err && err.message) ? err.message : 'Sign-in failed.';
-      loginBtn.disabled = false;
-    }
-  }
-
-  // Redeem the authorization code for the opaque cwu_ user token via the broker,
-  // then swap to conversation mode (which mounts the iframe). Single-use: the
-  // in-flight pkce is consumed immediately.
-  async function redeemCode(code) {
-    var local = pkce;
-    clearHandshake();                      // consume handshake + stop popup watch
-    loginBtn.disabled = true;
-    try {
-      var resp = await fetch(config.authTokenEndpoint, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: brokerHeaders(),
-        body: JSON.stringify({
-          grantType: 'authorization_code',
-          client: AUTH_CLIENT,
-          agentSlug: AGENT_SLUG,
-          code: code,
-          codeVerifier: local.codeVerifier,
-        }),
-      });
-      if (!resp.ok) { throw new Error('Sign-in could not be completed.'); }
-      var body = await resp.json();
-      // Validate the token shape before trusting it: opaque Bearer cwu_ token + TTL.
-      if (!body || typeof body.token !== 'string' || body.token.indexOf('cwu_') !== 0) {
-        throw new Error('Sign-in could not be completed.');
-      }
-      if (body.tokenType && String(body.tokenType).toLowerCase() !== 'bearer') {
-        throw new Error('Sign-in could not be completed.');
-      }
-      var ttlSec = (typeof body.expiresIn === 'number' && body.expiresIn > 0) ? body.expiresIn : 900;
-      if (ttlSec > 900) { ttlSec = 900; }   // clamp to the backend max (15-min TTL)
-      userToken = { token: body.token, expiresAtMs: Date.now() + (ttlSec * 1000) };
-      try { if (local.popup && !local.popup.closed) { local.popup.close(); } } catch (_) {}
-      loginErr.textContent = '';
-      enterConversation();
-    } catch (err) {
-      try { if (local && local.popup && !local.popup.closed) { local.popup.close(); } } catch (_) {}
-      loginErr.textContent = (err && err.message) ? err.message : 'Sign-in failed.';
-    } finally {
-      loginBtn.disabled = false;
-    }
-  }
 
   // ---------------------------------------------------------------------------
   // §12/§12b PARENT-SIDE BRIDGE — the host half of the parent↔iframe embed
   // protocol.
   //
-  // The iframe (`/embed/assistant`) is the SOLE session owner. This shell mints
-  // the credentials, delivers them ONCE via BOOTSTRAP, and services the closed
-  // set of iframe→parent uplinks. Every trust-boundary control is enforced here:
-  // origin + source-window binding, schema/protocolVersion/nonce agreement, dual
-  // monotonic seq, single-bootstrap-per-frame, apply_intent untrusted-selector
-  // permission checks + bounded LRU dedup, and the resize clamp.
+  // The iframe (`/embed/assistant`) is the SOLE session owner AND the sole holder
+  // of the person's credential. This shell delivers ONE selector-only CONTEXT
+  // message and services the closed set of iframe→parent uplinks. Every
+  // trust-boundary control is enforced here: origin + source-window binding,
+  // schema/protocolVersion/nonce agreement, dual monotonic seq, one context per
+  // frame, the credential-shaped value refusal on every send, apply_intent
+  // untrusted-selector permission checks + bounded LRU dedup, and the resize clamp.
   //
   // TRANSPORT (§12b): the iframe transfers one MessageChannel endpoint in READY;
-  // the parent RETAINS it and sends the token-bearing BOOTSTRAP over that port,
-  // never via a window post. Steady-state uplinks then ride the same entangled
-  // port. A legacy WINDOW transport is kept ONLY for the negotiated transition
-  // with an as-yet-unmigrated iframe (BRIDGE_REQUIRE_PORT === false); flip that to
-  // true — and drop the legacy path — once every embed instance transfers a port.
+  // the parent RETAINS it and sends the CONTEXT message over that port. Steady-
+  // state uplinks then ride the same entangled port. The WINDOW transport remains
+  // for a frame that transfers no port (BRIDGE_REQUIRE_PORT === false) and is
+  // origin-pinned when used. At protocol 2 the port is DEFENCE IN DEPTH, not the
+  // credential wall — the credential wall is that no credential exists here at all.
   // ---------------------------------------------------------------------------
-  var iframeEl = null;          // the mounted embed iframe (null until conversation)
+  var iframeEl = null;          // the mounted embed iframe (null until first open)
   var frameWindow = null;       // iframeEl.contentWindow captured at load
-  var frameNonce = null;        // the READY nonce the frame minted (echoed in bootstrap)
+  var frameNonce = null;        // the READY nonce the frame minted (echoed in context)
   var correlationId = null;     // parent-minted CSPRNG id, echoed by every uplink
-  var bootstrapped = false;     // single bootstrap per frame
+  var contextSent = false;      // one CONTEXT per frame (a new session is a reload)
   var inboundSeqLast = null;    // iframe->parent monotonic gate (READY seeds it)
-  var outboundSeqLast = null;   // parent->iframe monotonic counter (bootstrap = 0)
+  var outboundSeqLast = null;   // parent->iframe monotonic counter (context = 0)
   var appliedLru = [];          // §6f bounded seen apply-id LRU for this correlationId
-  var bridgePort = null;        // §12b the MessagePort the iframe transferred in READY (null in legacy mode)
-  var activeTransport = null;   // 'port' | 'legacy' — set once at bootstrap release
+  var bridgePort = null;        // §12b the MessagePort the iframe transferred in READY (null in window mode)
+  var activeTransport = null;   // 'port' | 'window' — set once at context release
+  var frameRefused = false;     // one-shot: the frame cannot be framed (see mountBridgeIframe)
 
-  // §12b: refuse a portless (window-only) bootstrap. FALSE during the negotiated
-  // transition so this widget still interoperates with an as-yet-unmigrated iframe
-  // that has not been rebuilt to transfer a port; flip to true (and delete the
-  // legacy branch) once the port transport is universal. Mirrors the core
-  // `selectParentBootstrapTransport({ requirePort })` fail-closed switch.
+  // §12b: refuse a portless (window-only) send. FALSE, mirroring the core
+  // `selectParentContextTransport({ requirePort })` switch, because at protocol 2
+  // the port protects an uplink channel rather than a credential — a frame that
+  // transfers no port gets the origin-pinned window transport, and the worst a
+  // misdelivered CONTEXT can do is tell a replacement document which post is on
+  // screen. Flip to true (and delete the window branch) once every embed instance
+  // transfers a port.
   var BRIDGE_REQUIRE_PORT = false;
 
   // A CSPRNG base64url correlationId carrying >=128 bits (24 base64url chars ==
@@ -785,48 +626,58 @@
     return next;
   }
 
-  // LEGACY WINDOW transport (§12b transition): ALWAYS an explicit origin, NEVER
-  // "*" (§6a outbound). Posts to the frame window. Used only when the iframe did
-  // not transfer a port (an as-yet-unmigrated embed) and BRIDGE_REQUIRE_PORT is
-  // false. cinatraOrigin is resolved once and is a real origin (never "*"/empty —
-  // the mount aborts otherwise), so the "never '*'" invariant holds structurally.
+  // WINDOW transport (§12b): ALWAYS an explicit origin, NEVER "*" (§6a outbound).
+  // Posts to the frame window. Used only when the iframe transferred no port and
+  // BRIDGE_REQUIRE_PORT is false. cinatraOrigin is resolved once and is a real
+  // origin (never "*"/empty — the mount aborts otherwise), so the "never '*'"
+  // invariant holds structurally.
   function postToFrame(message) {
-    if (!frameWindow) return;
+    if (!frameWindow) return false;
     frameWindow.postMessage(message, cinatraOrigin);
+    return true;
   }
 
-  // §12b PARENT-side transport selection — mirrors selectParentBootstrapTransport
+  // §12b PARENT-side transport selection — mirrors selectParentContextTransport
   // in cinatra src/lib/embed/bridge-protocol.ts. Given the ports the iframe
   // transferred on the ALREADY-GATED READY (origin + source-window checked by
   // onBridgeMessage before this runs):
-  //   * a transferred port present  -> PORT mode (the tokens ride ONLY the
+  //   * a transferred port present  -> PORT mode (the message rides ONLY the
   //     entangled port; a same-origin replacement of the iframe cannot receive it);
   //   * no port AND requirePort     -> FAIL CLOSED ('none'): the caller sends
-  //     NOTHING — no cit_/cwu_ ever leaves via window.postMessage, and a downgrade
-  //     cannot be forced merely by stripping the transferred port;
-  //   * no port AND legacy allowed   -> LEGACY mode (the origin-pinned window
-  //     transport, for an unmigrated iframe during the negotiated transition).
-  function selectBootstrapTransport(ports) {
+  //     NOTHING, so the window transport cannot be selected merely by stripping
+  //     the transferred port;
+  //   * no port AND window allowed  -> WINDOW mode (the origin-pinned window
+  //     transport, for a frame that transferred no port).
+  function selectContextTransport(ports) {
     var port = (ports && ports.length) ? ports[0] : null;
     if (port) { return { mode: 'port', port: port }; }
     if (BRIDGE_REQUIRE_PORT) { return { mode: 'none' }; }
-    return { mode: 'legacy' };
+    return { mode: 'window' };
   }
 
-  // Send a parent->iframe message over the transport chosen at bootstrap. In PORT
-  // mode the token-bearing bootstrap rides ONLY the retained port — NEVER a window
-  // postMessage — so a same-origin replacement of the frame's browsing context (a
-  // fresh realm that never inherits the port) can never receive it. In LEGACY mode
-  // it posts to the origin-pinned frame window (never "*").
-  function sendBootstrap(message) {
+  // Send a parent->iframe message over the transport chosen at READY.
+  //
+  // THE OUTBOUND GUARD RUNS HERE, ON EVERY PATH (cinatra#2674). Whatever the
+  // caller composed, a payload carrying a credential-shaped value AT ANY DEPTH is
+  // REFUSED rather than transmitted: the parity gate proves the guard exists, and
+  // this function is the single choke point that proves it always runs. Returns
+  // whether the message was actually sent, so the caller can fail closed instead
+  // of assuming delivery.
+  function sendToFrame(message) {
+    if (containsCredentialShapedValue(message)) {
+      // Deliberately says nothing about WHAT matched: a refusal must not become a
+      // place where a credential is echoed into a console.
+      console.warn('[cinatra] refusing to post a credential-shaped value to the assistant frame');
+      return false;
+    }
     if (activeTransport === 'port' && bridgePort) {
       bridgePort.postMessage(message);
-      return;
+      return true;
     }
-    postToFrame(message);
+    return postToFrame(message);
   }
 
-  // §3a READY validator (pre-bootstrap; the ONLY message without a correlationId).
+  // §3a READY validator (pre-context; the ONLY message without a correlationId).
   function isValidReady(d) {
     return !!d && d.type === MSG.ready &&
       d.protocolVersion === EMBED_PROTOCOL_VERSION &&
@@ -834,7 +685,7 @@
       typeof d.seq === 'number';
   }
 
-  // §5 uplink common envelope validator (post-bootstrap): protocolVersion, the
+  // §5 uplink common envelope validator (post-context): protocolVersion, the
   // echoed correlationId, and a monotonic seq for the iframe->parent direction.
   function validUplinkEnvelope(d) {
     if (!d || d.protocolVersion !== EMBED_PROTOCOL_VERSION) return false;
@@ -843,48 +694,50 @@
     return true;
   }
 
-  // Synchronous read of the pre-minted cit_ site token from the in-memory cache
-  // (mirrors getStreamToken's freshness check). Returns null if it is absent or
-  // within ~10s of expiry. The cit_ token is pre-minted in enterConversation()
-  // BEFORE the frame mounts, so this read is warm when READY arrives.
-  function getCachedCitToken() {
-    var now = Date.now();
-    if (cachedToken && cachedToken.token && cachedToken.expiresAtMs - 10000 > now) {
-      return cachedToken.token;
-    }
-    return null;
-  }
-
-  // §4: build the ONE BOOTSTRAP (the only credential carrier) — mint the
-  // correlationId, echo the frame nonce, seq=0, relay cit_/cwu_. Pure builder: no
-  // await, no I/O, so the caller can release it SYNCHRONOUSLY in the same task as
-  // the READY message (see onBridgeMessage) — a same-origin navigation cannot
-  // interleave within one synchronous task, so credentials can never reach a
-  // document that navigated in mid-release.
-  function buildBootstrap(nonce, citToken) {
+  // §4: build the ONE inbound CONTEXT message — mint the correlationId, echo the
+  // frame nonce, seq=0, and carry PUBLIC SELECTORS ONLY. There is no `auth` block
+  // and there is nothing to await: this shell holds no credential, so the message
+  // is composed and released synchronously in the same task as the READY that
+  // triggered it.
+  //
+  // EVERY FIELD IS A SELECTOR, NOT AN ASSERTION. `site.siteId`, `cms.instanceId`
+  // and `session.assistant` name things the INSTANCE already knows about; it
+  // re-derives the authoritative site, org, origin, agent and canonical instance
+  // from its own rows and denies on any mismatch. `site.siteId` is the connect-site
+  // handle issued at Connect — a public id whose paired `cnx_` credential stays on
+  // this server and never enters the browser. Omitted when this site has none
+  // (it is a disambiguator, and one that is not needed must not be required).
+  //
+  // The page URL is deliberately NOT sent: the protocol allows an optional
+  // `cms.href` display selector, and the frame does not need one to name the post.
+  function buildEmbedContext(nonce) {
     frameNonce = nonce;
     correlationId = mintCorrelationId();
     var ctx = buildContentContext();
-    var cms = { instanceId: config.instanceId || '' };
-    if (ctx.postId) { cms.resourceId = ctx.postId; }
-    if (ctx.postType) { cms.resourceType = ctx.postType; }
-    if (ctx.postStatus) { cms.status = ctx.postStatus; }
-    return {
-      type: MSG.bootstrap,
+    // instanceId is bound-checked at mount (an out-of-bounds one means no frame
+    // at all), so it is in range by the time this runs.
+    var cms = { instanceId: config.instanceId };
+    var resourceId = boundedSelector(ctx.postId, SELECTOR_MAX.resourceId);
+    var resourceType = boundedSelector(ctx.postType, SELECTOR_MAX.resourceType);
+    var status = boundedSelector(ctx.postStatus, SELECTOR_MAX.status);
+    if (resourceId) { cms.resourceId = resourceId; }
+    if (resourceType) { cms.resourceType = resourceType; }
+    if (status) { cms.status = status; }
+    var message = {
+      type: MSG.context,
       protocolVersion: EMBED_PROTOCOL_VERSION,
       correlationId: correlationId,
       nonceEcho: frameNonce,
       seq: nextOutboundSeq(),              // parent->iframe counter starts at 0
-      auth: {
-        citToken: citToken,                // cit_ site transport token
-        cwuToken: userToken.token,         // cwu_ per-user token
-      },
       session: {
-        threadId: correlationId,           // one thread per bootstrapped frame
-        assistant: EMBED_ASSISTANT,        // == ?assistant, == cit_ bound kind
+        threadId: correlationId,           // one thread per framed session
+        assistant: EMBED_ASSISTANT,        // == ?assistant (a selector, not authority)
       },
       cms: cms,
     };
+    var siteId = boundedSelector(config.siteId, SELECTOR_MAX.siteId);
+    if (siteId) { message.site = { siteId: siteId }; }
+    return message;
   }
 
   // §5/§B9 resize: CLAMP the reported content height to the panel cap (clamp,
@@ -969,7 +822,7 @@
   // proposalId/changeSetId) + a fixed viewType. NO content, NO tool call. The
   // parent (1) re-checks edit permission, (2) uses its OWN canonical resource,
   // (3) the correlationId binding already proves the signal belongs to this
-  // bootstrapped thread/instance, (4) dedups against a bounded LRU, THEN does the
+  // established thread/instance, (4) dedups against a bounded LRU, THEN does the
   // in-place draft refresh. The selector id is used ONLY as the LRU key — never as
   // a fetch selector, never egressed (#1214).
   function handleApplyIntent(d) {
@@ -1000,18 +853,36 @@
     a11yLive.textContent = 'The assistant applied changes to this content.';
   }
 
-  // Post-bootstrap uplink dispatch (§5): require an established correlationId + a
+  // Post-context uplink dispatch (§5): require an established correlationId + a
   // monotonic seq for the iframe->parent direction, then route the closed set.
   // Shared by BOTH transports so a port-delivered and a window-delivered uplink
   // pass the identical envelope gate and dispatch.
   function dispatchUplink(d) {
-    if (!bootstrapped) return;
+    if (!contextSent) return;
     if (!validUplinkEnvelope(d)) return;
     if (d.type === MSG.resize) { handleResize(d.height); return; }
     if (d.type === MSG.focus) { handleFocus(d.focus); return; }
     if (d.type === MSG.a11y) { handleA11y(d.liveRegion, d.politeness); return; }
     if (d.type === MSG.applyIntent) { handleApplyIntent(d); return; }
     // Unknown type: dropped (the set is closed).
+  }
+
+  // THE GUARD RUNS INBOUND TOO (cinatra#2674; codex round 0, finding 2).
+  //
+  // "No credential crosses this boundary" is a claim about BOTH directions, and
+  // the inbound half is not hypothetical: the FRAME is the one party that holds a
+  // `cwu_`/`cit_`, and an uplink is a place a bug could put one — an
+  // `a11y.liveRegion` string, say, which this parent writes straight into the
+  // admin page's live region. That would leave a person's bearer sitting in the
+  // CMS DOM, which is the exact possession this slice exists to remove.
+  //
+  // So every inbound envelope is scanned before any field of it is read, on both
+  // transports, and a match is DROPPED SILENTLY. Silently on purpose: a warning
+  // that named or echoed the offending message would copy the credential into a
+  // console and from there into a support paste, turning a containment control
+  // into a disclosure.
+  function inboundIsClean(d) {
+    return !containsCredentialShapedValue(d);
   }
 
   // §12b PORT path — steady-state uplinks over the entangled port. NO origin/
@@ -1023,13 +894,13 @@
   function onPortMessage(event) {
     var d = event.data;
     if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
+    if (!inboundIsClean(d)) return;
     dispatchUplink(d);
   }
 
   // The single inbound WINDOW bridge listener — origin + source-window bound.
-  // Attached when the iframe mounts and detached on teardown. It carries the
-  // token-free READY (which transfers the port) and, in LEGACY mode only, the
-  // post-bootstrap uplinks.
+  // Attached when the iframe mounts. It carries the READY (which transfers the
+  // port) and, in WINDOW mode only, the post-context uplinks.
   function onBridgeMessage(event) {
     // (§6a) strict origin, BEFORE schema.
     if (event.origin !== cinatraOrigin) return;
@@ -1039,31 +910,25 @@
 
     var d = event.data;
     if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
+    // Inbound credential guard, before ANY field is read — including READY's, so
+    // a nonce carrying a bearer shape never reaches the echo that would put it
+    // back on the wire.
+    if (!inboundIsClean(d)) return;
 
     if (d.type === MSG.ready) {
-      // §4 READY → BOOTSTRAP, released SYNCHRONOUSLY in this same message task.
-      // A second READY on a mounted (bootstrapped) session is IGNORED (single
-      // bootstrap per frame; re-auth = reload the frame).
-      if (bootstrapped) return;
+      // §4 READY → CONTEXT, released synchronously in this same message task.
+      // A second READY on an established session is IGNORED (one context per
+      // frame; a new session is a reload).
+      if (contextSent) return;
       if (!isValidReady(d)) return;
-      if (!userTokenValid()) { forceReLogin(); return; }
-      // The cit_ token was PRE-MINTED in enterConversation() before this frame
-      // mounted, so it is read from cache SYNCHRONOUSLY here — there is NO await
-      // between receiving READY and posting the bootstrap. A same-origin
-      // navigation of the frame cannot interleave within one synchronous task, so
-      // credentials can never be released to a replacement document. If the cache
-      // is unexpectedly cold (the pre-mint failed/expired) we reload via re-login
-      // rather than mint-and-post across an await (which would reopen that gap).
-      var citToken = getCachedCitToken();
-      if (!citToken) { forceReLogin('Your session expired. Please sign in again.'); return; }
-      // Seed the iframe->parent monotonic gate with READY's seq (§6c); post-
-      // bootstrap uplinks must strictly increase from it.
+      // Seed the iframe->parent monotonic gate with READY's seq (§6c); post-context
+      // uplinks must strictly increase from it.
       if (!acceptInboundSeq(d.seq)) return;
       // §12b: choose the transport from the ports the iframe transferred on THIS
       // already-gated READY. A transferred port => bind uplinks to it and send the
-      // bootstrap ONLY over it. No port + requirePort => send NOTHING (fail
-      // closed). No port + legacy allowed => the origin-pinned window transport.
-      var transport = selectBootstrapTransport(event.ports);
+      // context over it. No port + requirePort => send NOTHING (fail closed). No
+      // port + window allowed => the origin-pinned window transport.
+      var transport = selectContextTransport(event.ports);
       if (transport.mode === 'none') { return; }
       if (transport.mode === 'port') {
         bridgePort = transport.port;
@@ -1071,21 +936,30 @@
         bridgePort.onmessage = onPortMessage;
         activeTransport = 'port';
       } else {
-        activeTransport = 'legacy';
+        activeTransport = 'window';
       }
-      // Set the single-bootstrap latch BEFORE posting so a re-entrant delivery
-      // cannot double-bootstrap. In PORT mode the bootstrap rides ONLY the retained
-      // port; in LEGACY mode event.source === frameWindow was verified above, so
-      // it posts to the exact document that sent READY.
-      bootstrapped = true;
-      sendBootstrap(buildBootstrap(d.nonce, citToken));
+      // Set the one-context latch BEFORE posting so a re-entrant delivery cannot
+      // double-send. In PORT mode the message rides ONLY the retained port; in
+      // WINDOW mode event.source === frameWindow was verified above, so it posts
+      // to the exact document that sent READY.
+      //
+      // A REFUSED SEND IS NOT RETRIED, and that is the point. `sendToFrame`
+      // refuses a payload carrying a credential-shaped value; retrying would
+      // recompose the same selectors from the same page and refuse again, forever.
+      // The latch therefore STAYS SET on a refusal: exactly one attempt per frame,
+      // no storm. The frame keeps drawing its own neutral pre-context state, and
+      // the person is never shown a CMS-side error about it.
+      contextSent = true;
+      if (!sendToFrame(buildEmbedContext(d.nonce))) {
+        console.warn('[cinatra] the assistant frame was not given its context; reload the page to try again');
+      }
       return;
     }
 
-    // Post-bootstrap uplinks. In PORT mode they ride the entangled port
+    // Post-context uplinks. In PORT mode they ride the entangled port
     // (onPortMessage); a window-delivered uplink is IGNORED so the transport
-    // cannot be split/downgraded post-bootstrap.
-    if (!bootstrapped) return;
+    // cannot be split/downgraded afterwards.
+    if (!contextSent) return;
     if (bridgePort) return;
     dispatchUplink(d);
   }
@@ -1135,12 +1009,47 @@
 
   // Build the sandboxed embed iframe and attach the bridge listener. The src is
   // the Cinatra-served `/embed/assistant` route carrying only the NON-SECRET
-  // disambiguators (instanceId, assistant). Tokens are NEVER in the URL — they
-  // arrive only via BOOTSTRAP. The sandbox grants scripts + same-origin (the frame
-  // needs its own origin's storage/streaming) but NOT top-navigation, forms,
-  // popups, modals, downloads, or pointer-lock.
+  // disambiguators (instanceId, assistant). There is no token to keep out of this
+  // URL any more — this shell holds none — and none is put there.
+  //
+  // THE SANDBOX GREW BY EXACTLY TWO TOKENS AT PROTOCOL 2, AND IT HAD TO
+  // (cinatra#2674; codex round 0, finding 1). The sign-in is now the FRAME's: it
+  // calls `window.open()` on the hosted sign-in URL. A sandboxed frame without
+  // `allow-popups` cannot open a window at all — `window.open` returns null, the
+  // frame reports `popup_blocked`, and NOBODY CAN EVER SIGN IN. And a popup that
+  // merely inherits this sandbox is equally dead: it would carry no `allow-forms`
+  // and no top-level navigation, so the hosted sign-in could neither take input
+  // nor complete its redirect. Hence BOTH tokens:
+  //   * allow-popups                     — the frame may open the window;
+  //   * allow-popups-to-escape-sandbox   — that window is an ORDINARY top-level
+  //     Cinatra document, which is the entire point: its session cookie is
+  //     FIRST-PARTY there, so the ceremony works in browsers that block
+  //     third-party cookies outright.
+  //
+  // WHAT THIS DOES NOT GRANT, and why the widening is narrow. The frame itself
+  // still gets NO top-navigation, NO forms, NO modals, NO downloads and NO
+  // pointer-lock. The escape applies to the window the frame opens, not to the
+  // frame. And the marginal capability is small: this document is Cinatra's own,
+  // served from the configured instance origin, and it ALREADY holds
+  // `allow-same-origin` + `allow-scripts` — it can already run its own code
+  // against its own origin. What it gains is the ability to open a top-level
+  // window, which browsers render with a visible address bar, on a user gesture.
+  // The parity gate REQUIRES these two and still forbids the rest.
   function mountBridgeIframe() {
     if (iframeEl) return;
+    // `cms.instanceId` is REQUIRED, non-empty and <= 200 chars in the protocol-2
+    // schema, and it must agree with the `?instanceId` this shell puts in the
+    // frame URL. Out of range, the frame would be pointed at nothing and would
+    // reject the context on arrival, so refuse to frame it at all — once — and say
+    // so in one actionable line rather than framing a surface that cannot work.
+    // The launcher chrome stays; the site owner fixes the setting and reloads.
+    if (!boundedSelector(config.instanceId, SELECTOR_MAX.instanceId)) {
+      if (!frameRefused) {
+        frameRefused = true;
+        console.warn('[cinatra] the agent instance id is missing or out of range; the assistant was not started');
+      }
+      return;
+    }
     var src = config.cinatraUrl + '/embed/assistant' +
       '?instanceId=' + encodeURIComponent(config.instanceId || '') +
       '&assistant=' + encodeURIComponent(EMBED_ASSISTANT) +
@@ -1148,13 +1057,14 @@
     iframeEl = document.createElement('iframe');
     iframeEl.className = 'cw-frame';
     iframeEl.setAttribute('title', 'Cinatra assistant');
-    iframeEl.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    iframeEl.setAttribute(
+      'sandbox',
+      'allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox'
+    );
     iframeEl.setAttribute('referrerpolicy', 'no-referrer');
     iframeEl.setAttribute('allow', '');
     // Keep the captured frame window current across loads (source-window binding +
-    // outbound posts target exactly this frame). The bootstrap release does not
-    // depend on this — it is synchronous with READY and posts to the verified
-    // event.source — so a same-WindowProxy navigation cannot receive credentials.
+    // outbound posts target exactly this frame).
     iframeEl.addEventListener('load', function () {
       frameWindow = iframeEl.contentWindow;
     });
@@ -1166,61 +1076,20 @@
     iframeEl.setAttribute('src', src);
   }
 
-  // Tear down the frame + bridge state (used on close-to-login / re-auth). The
-  // NEXT conversation entry mounts a FRESH frame (single bootstrap per frame).
-  function teardownBridge() {
-    try { window.removeEventListener('message', onBridgeMessage); } catch (_) {}
-    // §12b: drop the retained port so the entangled channel is severed with the
-    // frame (the NEXT frame transfers a fresh port on its own READY).
-    if (bridgePort) {
-      try { bridgePort.onmessage = null; } catch (_) {}
-      try { bridgePort.close(); } catch (_) {}
-    }
-    if (iframeEl && iframeEl.parentNode) {
-      try { iframeEl.parentNode.removeChild(iframeEl); } catch (_) {}
-    }
-    iframeEl = null;
-    frameWindow = null;
-    frameNonce = null;
-    correlationId = null;
-    bootstrapped = false;
-    inboundSeqLast = null;
-    outboundSeqLast = null;
-    appliedLru = [];
-    bridgePort = null;
-    activeTransport = null;
-  }
-
-  // Enter conversation mode: a valid cwu_ token is held. PRE-MINT the short-lived
-  // cit_ site token BEFORE mounting the frame, so the READY→BOOTSTRAP release is
-  // fully SYNCHRONOUS (getCachedCitToken reads it without an await) and no async
-  // gap exists for a frame navigation to interleave. Only after the pre-mint
-  // succeeds do we mount the frame (which then posts READY).
-  function enterConversation() {
-    if (!userTokenValid()) { forceReLogin(); return; }
-    panelMode = 'conversation';
-    applyPanelMode();
-    getStreamToken().then(function () {
-      // The user may have backed out / re-logged during the mint.
-      if (panelMode !== 'conversation' || iframeEl) { return; }
-      if (!userTokenValid()) { forceReLogin(); return; }
-      mountBridgeIframe();
-    }).catch(function (err) {
-      forceReLogin((err && err.message) ? err.message : 'Could not start the assistant.');
-    });
-  }
-
   // ---------------------------------------------------------------------------
   // Open / collapse — circle↔widget swap
+  //
+  // The frame is mounted LAZILY, on the first open. That keeps a third-party
+  // iframe off every wp-admin page load while still tying the mount to a plain
+  // user gesture; from then on the frame persists across open/collapse so the
+  // conversation (and the person's frame-held session) survives closing the panel.
   // ---------------------------------------------------------------------------
   function openWidget() {
     isOpen = true;
     circle.style.zIndex = '9999990';
     setWidgetSize();
     cwWidget.style.display = 'block';
-    // If a long-idle widget is reopened in conversation mode but the per-user
-    // token has since expired, drop back to login rather than show a dead frame.
-    if (panelMode === 'conversation' && !userTokenValid()) { forceReLogin(); }
+    mountBridgeIframe();
   }
 
   function collapseWidget() {
@@ -1237,26 +1106,14 @@
     if (isOpen) { collapseWidget(); } else { openWidget(); }
   });
   closeBtn.addEventListener('click', function() { collapseWidget(); });
-  loginBtn.addEventListener('click', function() { startLogin(); });
 
-  // ---------------------------------------------------------------------------
-  // Required-login (cinatra#410): the hosted /widget-auth popup postMessage
-  // listener. Bound three ways — the message must come from the configured
-  // instance ORIGIN, carry the exact type, and its `state` must match the
-  // in-flight PKCE tuple; we additionally bind to the popup window
-  // (ev.source === pkce.popup) so no other same-origin window can complete it.
-  // This is a SEPARATE listener from the bridge (which is bound to the iframe
-  // window): the popup and the frame are distinct source windows.
-  // ---------------------------------------------------------------------------
-  window.addEventListener('message', function (ev) {
-    if (ev.origin !== cinatraOrigin) { return; }
-    var d = ev.data;
-    if (!d || d.type !== 'cinatra-widget-auth' || typeof d.code !== 'string') { return; }
-    if (!pkce) { return; }                              // no handshake in flight
-    if (!pkce.popup || ev.source !== pkce.popup) { return; } // source binding (fail-closed)
-    if (d.state !== pkce.state) { return; }             // CSRF/state binding
-    redeemCode(d.code);                                 // single-use; pkce consumed inside
-  });
+  // NOTE (cinatra#2674): there is deliberately NO second window 'message'
+  // listener here. Protocol 1 kept one for the hosted sign-in popup, because the
+  // popup posted the authorization code back to THIS page and this page redeemed
+  // it. The frame now opens that popup itself and the return step posts to
+  // `window.location.origin` — the frame's own origin — so a CMS page listening
+  // for it receives nothing, whatever it claims. The only inbound listener this
+  // shell installs is `onBridgeMessage`, bound to the frame.
 
   document.addEventListener('click', function(e) {
     if (!isOpen) return;
@@ -1319,20 +1176,14 @@
   // fallback chrome). Set LAST so any throw above leaves the fallback visible.
   rootEl.dataset.cinatraMounted = 'true';
 
-  // Required-login (cinatra#410): render in login mode first (the iframe is not
-  // mounted until a valid per-user token is held), so the conversation is never
-  // shown pre-login.
-  applyPanelMode();
-
   } // end mountWidget()
 
   // ---------------------------------------------------------------------------
-  // Boot: mount UNCONDITIONALLY. The capability/contract handshake moved into the
+  // Boot: mount UNCONDITIONALLY. The capability/contract handshake runs inside the
   // /embed/assistant iframe (unified broker surface — see the header), so the
-  // shell has no pre-flight to gate on. The login gate still holds inside
-  // mountWidget() (no iframe/token until the per-user cwu_ handshake), and the
-  // always-visible fallback button remains until data-cinatra-mounted is set at
-  // the end of synchronous mount construction.
+  // shell has no pre-flight to gate on, and sign-in is the frame's business rather
+  // than a gate here. The always-visible fallback button remains until
+  // data-cinatra-mounted is set at the end of synchronous mount construction.
   // ---------------------------------------------------------------------------
   mountWidget();
 
