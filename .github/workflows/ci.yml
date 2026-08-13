@@ -116,6 +116,29 @@ jobs:
           echo "readme Stable tag = $stable ; plugin header Version = $header"
           test "$stable" = "$header"
 
+  pot-i18n-drift:
+    name: pot-i18n-drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # GATING (wp#109): languages/cinatra.pot must reflect the plugin's CURRENT
+    # translatable strings. Regenerates a .pot from source via the same
+    # `wp i18n make-pot` path a real release uses (bin/generate-pot.sh) and
+    # diffs it against the committed file (POT-Creation-Date excluded, since
+    # that timestamp legitimately differs on every run) — same
+    # regenerate-from-source-of-truth-and-diff idiom as the widget-parity-check
+    # drift gate (cinatra#411), applied to i18n. No WordPress install/DB is
+    # needed: `wp i18n make-pot` is a before_wp_load, static PHP/JS source scan
+    # (verified to run in a bare PHP+wp-cli environment with no WP present).
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Set up PHP + WP-CLI
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: "8.3"
+          tools: wp-cli
+      - name: Regenerate languages/cinatra.pot from source and diff against committed
+        run: bin/generate-pot.sh --check
+
   yaml-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 5
