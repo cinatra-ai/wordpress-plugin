@@ -73,10 +73,16 @@ platform's permission model, see the canonical
 
 ## Trust and credential handling
 
-- **The integration key stays on the server.** A server-side REST endpoint
-  performs a server-to-server exchange with your instance and hands the browser
-  only a short-lived, scope-bound stream token. The integration key never
-  reaches the browser.
+- **The integration key stays on the server.** It identifies the *site* to your
+  instance and is used only for server-to-server calls — Connect, the
+  site-inventory handshake, and signed publish notifications. It never reaches
+  the browser.
+- **Your sign-in is not the site's.** You sign in inside the Cinatra assistant
+  window, on Cinatra's own address. The WordPress page does not start that
+  sign-in and receives nothing from it, so the site cannot hold, log, or reuse
+  your credential. What the page does send the assistant window is a short list
+  of public details — which instance, which site, and which post is open — and
+  your instance checks every one of them against its own records.
 - **The widget is served locally.** The assistant JavaScript ships with the
   plugin and is served from your own site — no executable code is fetched from a
   remote server at runtime.

@@ -15,7 +15,7 @@ This plugin puts an AI assistant inside your WordPress admin. A small button sit
 
 Because it runs through your own [Cinatra](https://cinatra.ai) instance, it isn't a generic writing tool. It can draw on what your Cinatra instance is set up to do, including your AI agents and the tools, data, and knowledge you have connected, and bring that capability straight into your CMS.
 
-The plugin is built for safe connections: your long-lived integration key stays on the server and is never exposed to the browser — the assistant streams through a short-lived, site-bound token instead.
+The plugin is built for safe connections. Your site's integration key stays on the server and is never exposed to the browser. Your own sign-in is separate: you sign in inside the Cinatra assistant window, and the site never receives or holds your credential.
 
 = WordPress AI tools (recommended companion) =
 To let the assistant read and edit your WordPress content — drafting posts, updating pages, working with your media — install the [WordPress MCP Adapter](https://github.com/WordPress/mcp-adapter/releases/latest) alongside this plugin and activate it. The adapter gives the assistant access to your site through the Model Context Protocol (MCP).
@@ -55,7 +55,7 @@ WordPress supports plugin-to-plugin dependencies via the `Requires Plugins:` hea
 
 == Screenshots ==
 1. The Cinatra assistant in action — the chat panel open over the post editor, asked to rewrite the article's title. It shows a clear before-and-after of the headline change it applied.
-2. Sign in with your Cinatra account. The assistant works with your own permissions, so you only do what you are already allowed to do on the site.
+2. Sign in with your Cinatra account. Sign-in happens inside the Cinatra assistant window, so the site never sees your credential. The assistant works with your own permissions, so you only do what you are already allowed to do on the site.
 3. Connect the plugin to your Cinatra instance from the Cinatra settings page: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
 
 == Changelog ==

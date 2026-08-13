@@ -64,16 +64,41 @@ jobs:
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "20"
-      - name: Widget mount + embed-bridge behavior tests (no bundler required)
+      - name: Widget mount + embed-bridge behavior tests (protocol 2, no bundler required)
         run: node tests/test-widget-negotiation.mjs
+      - name: No credential leaves plugin code (cinatra#2674, with positive control)
+        # Drives the widget on both bridge transports and scans EVERY outbound
+        # payload for a credential-shaped value at any depth, then poisons each
+        # CMS-supplied selector in turn and requires the message to be REFUSED
+        # rather than sent. Runs its own positive control first: an absence proof
+        # from a detector that cannot detect is worthless.
+        run: node tests/test-no-credential-egress.mjs
       - name: Widget source-of-truth drift / parity gate (cinatra#411)
         # Asserts the security-critical invariants on the canonical vendored
-        # widget (assets/cinatra-widget.js): no apiKey in the browser, the
-        # tokenEndpoint broker + short-lived-token Bearer stream, the shared
-        # contract-version set, and NO reintroduction of the dead
-        # /api/{wordpress,drupal}/bundle.js route in shipped/admin/schema strings.
-        # See cinatra docs/widget-source-of-truth.md.
+        # widget (assets/cinatra-widget.js): no apiKey and no credential
+        # acquisition of any kind in the browser, the protocol-2 selector-only
+        # context envelope, the outbound credential-shaped value guard as the
+        # single send choke point, no login gate on the CMS origin, and NO
+        # reintroduction of the dead /api/{wordpress,drupal}/bundle.js route in
+        # shipped/admin/schema strings. See cinatra docs/widget-source-of-truth.md.
         run: node tools/widget-parity-check.mjs
+      - name: Lexer probes for the parity gate's comment/regex stripper (cinatra#411)
+        # Direct unit probes of stripComments() against the counterexamples that
+        # motivated replacing the old per-line comment heuristic with a real
+        # scanner: a banned token hidden behind a regex literal, a comment inside
+        # a template expression, and regex-vs-division disambiguation after
+        # `return` / a control-condition `)` / a keyword-named member. Reads the
+        # function straight out of tools/widget-parity-check.mjs, so a change to
+        # the real stripper is probed as written, not as remembered. Byte-
+        # identical to the sibling repo's copy (cross-repo lockstep).
+        run: node tools/lexer-probe.mjs
+      - name: Mutation coverage of the parity gate's invariants (cinatra#411)
+        # Negative controls: 37 mutations, each removing exactly one protection
+        # from the canonical vendored widget, must turn the gate above RED. An
+        # assertion that stays green under its own mutation is hollow — this is
+        # what keeps the gate itself honest as the widget evolves. Byte-identical
+        # to the sibling repo's copy (cross-repo lockstep).
+        run: node tools/mutate-check.mjs
 
   readme-validate:
     runs-on: ubuntu-latest
