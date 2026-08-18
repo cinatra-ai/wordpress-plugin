@@ -28,13 +28,16 @@ reference. The same six chapters are available in this repository's
 - Ships the assistant widget JavaScript **locally** (`assets/cinatra-widget.js`,
   served via `plugins_url()`) — no executable code is fetched from a remote
   server at runtime.
-- Keeps the long-lived integration key on the server. A server-side REST
-  endpoint (`/wp-json/cinatra/v1/token`, gated to `manage_options` + a
-  `wp_rest` nonce) performs a server-to-server exchange with the instance and
-  hands the browser only a short-lived, scope-bound stream token. The
-  integration key never reaches the browser.
-- Negotiates capabilities and contract version with the instance at boot and
-  degrades gracefully against older instances.
+- Keeps the site's integration credential on the server. It is used only for
+  server-to-server calls (Connect, the site-inventory handshake, signed publish
+  notifications) and never reaches the browser.
+- Holds no user credential at all. Sign-in happens inside the Cinatra assistant
+  window, on the Cinatra origin; the WordPress page neither starts it nor
+  receives anything from it. The page sends the assistant window one message
+  carrying public selectors only — which instance, which site, which post is
+  open — at embed protocol version 2.
+- Negotiates the assistant capability/contract handshake inside that window,
+  against the connected instance.
 - Provides a webhook-subscription REST registry (`/wp-json/cinatra/v1/webhooks`)
   that enables `post_published` notifications per post type. When a post is
   published, the plugin signs the notification as a
@@ -74,22 +77,31 @@ links to the GitHub release if it is not active.
 ## Plugin ↔ core contract
 
 The assistant conversation renders inside a sandboxed, Cinatra-served
-`/embed/assistant` iframe that the widget frames as the sole session owner. The
-AG-UI capability/contract handshake runs **client-side inside that iframe**
-against the unified assistant broker (`GET /api/assistants/chat/capabilities`,
-using the short-lived `cit_`/`cwu_` broker tokens), and the conversational wire
-is `POST /api/assistants/chat`. The shell no longer pre-flight-negotiates a
-contract version; it mounts unconditionally (login-gated) and mints the
-short-lived `cit_` site token through the same-origin PHP broker. The
-token-exchange contract schemas live in the cinatra repository under
-`contracts/wp-drupal-assistant/`.
+`/embed/assistant` iframe that owns the session **and the credential**. The AG-UI
+capability/contract handshake runs **client-side inside that iframe** against the
+unified assistant broker (`GET /api/assistants/chat/capabilities`), and the
+conversational wire is `POST /api/assistants/chat`.
 
-> Requires the matching Cinatra instance changes for the token-exchange
-> (`/api/agents/{slug}/token`), the unified assistant broker
-> (`POST /api/assistants/chat` + `GET /api/assistants/chat/capabilities`), and
-> one-click connect (`/connect/authorize` + `/api/connect/token`) endpoints. The
-> legacy `/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
-> relay were retired; a pre-cutover instance is no longer supported.
+The parent side of the embed protocol is at **version 2**. The shell sends one
+message, `cinatra.embed.context`, carrying public selectors only — no credential
+field, and a recursive guard refuses a credential-shaped *value* in either
+direction. It mints no token, calls no broker, and runs no sign-in: the frame
+starts its own PKCE transaction same-origin and opens the hosted sign-in as a
+top-level Cinatra window. The iframe sandbox is therefore
+`allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox` —
+the two popup grants are what make that window possible, and every other
+escalation stays denied.
+
+> Requires a Cinatra instance that serves the **version-2 embed protocol**
+> (`/embed/assistant` + `POST /api/widget-auth/frame/{init,token}`), the unified
+> assistant broker (`POST /api/assistants/chat` +
+> `GET /api/assistants/chat/capabilities`), and one-click connect
+> (`/connect/authorize` + `/api/connect/token`). There is no fallback to
+> protocol 1: `POST /api/widget-auth/{init,token}` answer `410 Gone`, and the
+> version literal does not negotiate downward — that is deliberate, because
+> protocol 1 is precisely the version in which the site handled the user's
+> credential. The legacy `/api/agents/{slug}/capabilities` negotiation and
+> `/api/agents/{slug}/stream` relay were retired earlier.
 
 ## Development
 

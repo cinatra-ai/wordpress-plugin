@@ -24,6 +24,7 @@ function cinatra_uninstall_option_keys(): array {
 		'cinatra_url',
 		'cinatra_api_key',
 		'cinatra_instance_id',
+		'cinatra_site_id',
 		'cinatra_webhook_secret',
 		'cinatra_webhook_binding_id',
 		'cinatra_webhook_subscriptions',

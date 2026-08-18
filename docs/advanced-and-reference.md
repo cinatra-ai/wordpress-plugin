@@ -19,47 +19,60 @@ and links out to the canonical platform reference rather than duplicating it.
 
 ## How the credential path works
 
-The plugin keeps the long-lived integration key on the server. A server-side
-REST endpoint performs a server-to-server exchange with your Cinatra instance and
-hands the browser only a short-lived, scope-bound stream token. That token, not
-the integration key, is what the in-browser assistant uses — so the key never
-reaches the page.
+There are two credentials, and the site holds exactly one of them.
 
-One-click **Connect with Cinatra** uses an authorization-code exchange with PKCE
-(S256): the admin approves a consent screen, the site exchanges the code
-server-side, and the resulting credential is stored server-side. A
-connection-string (install-code) fallback is available for environments where the
-redirect flow is not usable.
+**The site credential** is issued once, when you connect. One-click **Connect
+with Cinatra** uses an authorization-code exchange with PKCE (S256): an
+administrator approves a consent screen, the site exchanges the code
+server-side, and the credential is stored server-side. A connection-string
+(install-code) fallback is available where the redirect flow is not usable. This
+credential identifies *the site* to your instance. It stays on your server. It is
+used only for server-to-server calls — the connection itself, the site-inventory
+handshake, and signed publish notifications — and it never reaches the browser.
+
+**Your sign-in credential** is not the site's at all. When you use the assistant,
+you sign in to Cinatra inside the Cinatra window, and the result goes back to
+Cinatra and stops there. The WordPress page does not start that sign-in, does not
+receive anything from it, and holds nothing afterwards. Earlier versions worked
+differently: the site's own server started the sign-in, received your credential
+back, and passed it into the assistant window. That is over — the site is no
+longer a party to your sign-in.
+
+What the page does hand the assistant window is a short list of **public
+selectors**: which instance to talk to, which site this is, and which post is
+open. None of them is a secret, and none of them grants anything: your instance
+checks each one against its own records and refuses anything that does not match.
 
 ## The plugin–core contract
 
 The assistant conversation renders inside a sandboxed, Cinatra-served
-`/embed/assistant` iframe. The AG-UI capability/contract handshake runs
-client-side **inside that iframe** against the unified assistant broker
-(`GET /api/assistants/chat/capabilities`), and the conversational wire is
-`POST /api/assistants/chat`. The shell no longer pre-flight-negotiates a contract
-version; it mounts unconditionally (login-gated) and mints the short-lived `cit_`
-site token through the same-origin PHP broker. Server-side token exchange is
-always required — the browser never holds a long-lived key. The legacy
-`/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
-relay were retired; a pre-cutover instance is no longer supported.
+`/embed/assistant` iframe, which owns the session. The AG-UI capability/contract
+handshake runs client-side **inside that iframe** against the unified assistant
+broker (`GET /api/assistants/chat/capabilities`), and the conversational wire is
+`POST /api/assistants/chat`. The WordPress side of the embed protocol is at
+**version 2**: it sends one message carrying public selectors only, and it
+deliberately cannot talk to a version-1 instance. Requires an instance that
+serves the version-2 embed protocol; earlier instances are not supported. The
+legacy `/api/agents/{slug}/capabilities` negotiation and `/api/agents/{slug}/stream`
+relay were retired.
 
 ## REST surface (high level)
 
-The plugin registers admin-gated REST endpoints under `wp-json/cinatra/v1/`:
+The plugin registers one admin-gated REST endpoint under `wp-json/cinatra/v1/`:
 
-- a **token** endpoint that performs the server-to-server exchange and returns a
-  short-lived stream token (gated to administrators plus a request nonce), and
 - a **webhooks** registry that stores the subscriptions enabling outbound
   `post_published` notifications. The notifications are signed
   (Standard-Webhooks) with per-site credentials issued by the connected Cinatra
   instance during Connect.
 
+The earlier session-token and sign-in endpoints are removed. They existed to
+fetch a credential for the browser, and the browser no longer takes one.
+
 ## Compatibility
 
 - **WordPress:** 5.9 or later (tested up to 7.0).
 - **PHP:** 7.4 or later.
-- **Cinatra instance:** an instance that supports server-side token exchange and
+- **Cinatra instance:** an instance that serves the version-2 embed protocol and
   a mutually-supported assistant contract version.
 
 ## Reference and source

@@ -76,7 +76,23 @@ function add_filter($hook, $cb, $priority = 10, $args = 1) {
     // safe-request validation (host-externality + safe-port).
     $GLOBALS['cinatra_test']['filters'][$hook] = ($GLOBALS['cinatra_test']['filters'][$hook] ?? 0) + 1;
     $GLOBALS['cinatra_test']['filter_cbs'][$hook][] = $cb;
+    // ALSO captured OUTSIDE $GLOBALS['cinatra_test'], for the same reason
+    // add_action does: filters registered at plugin LOAD time (the
+    // sanitize_option_* selector gates) would otherwise be wiped by the first
+    // reset_fixture() and every later assertion about them would pass vacuously.
+    $GLOBALS['cinatra_test_filters'][$hook][] = $cb;
     return true;
+}
+/** Replay a load-time filter chain the way WordPress's apply_filters() would. */
+function cinatra_test_apply_filters($hook, $value, ...$args) {
+    foreach ($GLOBALS['cinatra_test_filters'][$hook] ?? [] as $cb) {
+        $value = call_user_func($cb, $value, ...$args);
+    }
+    return $value;
+}
+/** True when at least one callback is registered on $hook (load-time capture). */
+function cinatra_test_has_filter($hook): bool {
+    return !empty($GLOBALS['cinatra_test_filters'][$hook]);
 }
 function remove_filter($hook, $cb, $priority = 10) {
     if (!empty($GLOBALS['cinatra_test']['filters'][$hook])) {
@@ -86,6 +102,14 @@ function remove_filter($hook, $cb, $priority = 10) {
         // Remove one matching callback instance (request-scoped add/remove pairs).
         foreach ($GLOBALS['cinatra_test']['filter_cbs'][$hook] as $i => $stored) {
             if ($stored === $cb) { unset($GLOBALS['cinatra_test']['filter_cbs'][$hook][$i]); break; }
+        }
+    }
+    // The persistent registry must be symmetric with add_filter(), or a
+    // request-scoped filter that was added and removed would keep running for the
+    // rest of the process and leak across tests (codex round 2).
+    if (!empty($GLOBALS['cinatra_test_filters'][$hook])) {
+        foreach ($GLOBALS['cinatra_test_filters'][$hook] as $i => $stored) {
+            if ($stored === $cb) { unset($GLOBALS['cinatra_test_filters'][$hook][$i]); break; }
         }
     }
     return true;
@@ -122,7 +146,22 @@ function cinatra_test_safe_request_allowed($url) {
     return true;
 }
 function register_setting() { return true; }
-function register_rest_route() { return true; }
+// Records what the plugin registers so a test can assert BOTH that a route is
+// present and that a retired one is absent (cinatra#2674). Kept outside
+// $GLOBALS['cinatra_test'] only when that array is missing, so a reset_fixture()
+// that runs between registrations does not silently empty the capture and turn
+// an absence assertion into a vacuous pass.
+function register_rest_route($namespace = '', $route = '', $args = []) {
+    if (!isset($GLOBALS['cinatra_test']) || !is_array($GLOBALS['cinatra_test'])) {
+        $GLOBALS['cinatra_test'] = [];
+    }
+    $GLOBALS['cinatra_test']['rest_routes'][] = [
+        'namespace' => (string) $namespace,
+        'route'     => (string) $route,
+        'args'      => $args,
+    ];
+    return true;
+}
 function __($text, $domain = 'default') { return $text; }
 function esc_html__($text, $domain = 'default') { return $text; }
 function esc_attr__($text, $domain = 'default') { return $text; }
@@ -293,6 +332,11 @@ function update_option($name, $value) {
     // an unchanged value is a no-op that fires NOTHING; a missing option is an
     // add (fires add_option_{$name}($name, $value)); a real change fires
     // update_option_{$name}($old, $value, $name).
+    // WP runs every write through sanitize_option(), which fires
+    // sanitize_option_{$name}. The plugin registers its public-selector gate
+    // there (cinatra#2674), so the stub must fire it too — otherwise a test could
+    // "prove" the gate exists while no write ever passes through it.
+    $value  = cinatra_test_apply_filters('sanitize_option_' . $name, $value, $name, $value);
     $exists = array_key_exists($name, $GLOBALS['cinatra_test']['options']);
     $old    = $exists ? $GLOBALS['cinatra_test']['options'][$name] : null;
     if ($exists && $old === $value) {
