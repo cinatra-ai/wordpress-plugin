@@ -16,7 +16,7 @@ reference. The same six chapters are available in this repository's
 
 ## Works with
 
-- WordPress (5.9 or later; tested up to 7.0)
+- WordPress (5.9 or later; tested up to 7.1)
 - Your self-hosted or cloud Cinatra instance
 - [WordPress MCP Adapter](https://github.com/WordPress/mcp-adapter) (optional
   companion — required only for AI content-editing tools)

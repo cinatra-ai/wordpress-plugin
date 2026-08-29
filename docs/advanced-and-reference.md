@@ -70,7 +70,7 @@ fetch a credential for the browser, and the browser no longer takes one.
 
 ## Compatibility
 
-- **WordPress:** 5.9 or later (tested up to 7.0).
+- **WordPress:** 5.9 or later (tested up to 7.1).
 - **PHP:** 7.4 or later.
 - **Cinatra instance:** an instance that serves the version-2 embed protocol and
   a mutually-supported assistant contract version.
