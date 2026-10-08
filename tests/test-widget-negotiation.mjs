@@ -508,6 +508,7 @@ async function main() {
     const applyMsg = (seq, id) => ({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.apply_intent", protocolVersion: 2, correlationId, seq, viewType: "content_change_proposal", proposalId: id } });
     deliverToWindow(applyMsg(3, "prop-A"));
     await flush();
+    check("bridge: the first apply_intent is ACCEPTED (one refresh before the duplicate)", captured.invalidations.length === 1);
     deliverToWindow(applyMsg(4, "prop-A"));      // duplicate id -> LRU dedup
     await flush();
     deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.apply_intent", protocolVersion: 2, correlationId: "WRONGcorrelationId012345", seq: 5, viewType: "content_change_proposal", proposalId: "prop-B" } });
@@ -529,6 +530,14 @@ async function main() {
     deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.apply_intent", protocolVersion: 2, correlationId, seq: 7, viewType: "content_change_proposal", proposalId: "", changeSetId: "cs-1" } });
     await flush();
     check("bridge: apply carrying BOTH selector keys is rejected (presence-XOR, no refresh)", captured.invalidations.length === beforeBoth);
+    // The panel FLOOR: a reported height below it is RAISED to the floor, never
+    //     honoured below it. MIN_PANEL_HEIGHT == 460, the height the panel opens
+    //     at; 100 + the 46px header is far below it. Its seq follows the apply
+    //     uplinks above, so it consumes no seq they rely on.
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.resize", protocolVersion: 2, correlationId, seq: 8, height: 100 } });
+    await flush();
+    const flooredH = cwWidget && parseInt(String(cwWidget.style.height || "0"), 10);
+    check("bridge: a resize height below the panel floor is RAISED to the floor (exactly 460px)", flooredH === 460);
 
     // (11) The whole drive stayed offline and popup-free.
     check("bridge: the whole drive issued NO network request and opened NO window", fetched.length === 0 && env.openedWindows.length === 0);
@@ -934,7 +943,7 @@ async function main() {
     check("§12b: a PORT-delivered uplink is handled (resize clamped to 680px)", clampedH === 680);
 
     // (3) A WINDOW-delivered uplink in PORT mode is IGNORED (no transport split):
-    //     height 100 would clamp to MIN_PANEL_HEIGHT (260) if wrongly processed;
+    //     height 100 would clamp to MIN_PANEL_HEIGHT (460) if wrongly processed;
     //     it stays 680 because the window path is inert once a port is bound.
     deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.resize", protocolVersion: 2, correlationId, seq: 2, height: 100 } });
     await flush();
