@@ -500,6 +500,13 @@ async function main() {
     await flush();
     const afterOverMax = cwWidget && parseInt(String(cwWidget.style.height || "0"), 10);
     check("bridge: over-schema-max resize height (>20000) is REJECTED (height unchanged)", afterOverMax === clampedH);
+    // The panel FLOOR: a reported height below it is RAISED to the floor, never
+    //     honoured below it. MIN_PANEL_HEIGHT == 460, the height the panel opens
+    //     at; 100 + the 46px header is far below it.
+    deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.resize", protocolVersion: 2, correlationId, seq: 3, height: 100 } });
+    await flush();
+    const flooredH = cwWidget && parseInt(String(cwWidget.style.height || "0"), 10);
+    check("bridge: a resize height below the panel floor is RAISED to the floor (exactly 460px)", flooredH === 460);
 
     // (8) apply_intent (untrusted selector) -> ONE in-place draft refresh via the
     //     WP data layer; a DUPLICATE id is deduped (LRU); a WRONG correlationId is
@@ -934,7 +941,7 @@ async function main() {
     check("§12b: a PORT-delivered uplink is handled (resize clamped to 680px)", clampedH === 680);
 
     // (3) A WINDOW-delivered uplink in PORT mode is IGNORED (no transport split):
-    //     height 100 would clamp to MIN_PANEL_HEIGHT (260) if wrongly processed;
+    //     height 100 would clamp to MIN_PANEL_HEIGHT (460) if wrongly processed;
     //     it stays 680 because the window path is inert once a port is bound.
     deliverToWindow({ origin: INSTANCE_ORIGIN, source: frameWin, data: { type: "cinatra.embed.resize", protocolVersion: 2, correlationId, seq: 2, height: 100 } });
     await flush();
