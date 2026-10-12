@@ -675,7 +675,7 @@
   // ---------------------------------------------------------------------------
   var currentWidth = 580;
   var currentPanelHeight = 460;   // total panel height (header + body)
-  var MIN_PANEL_HEIGHT = 260;
+  var MIN_PANEL_HEIGHT = 460;
   var userResizedPanel = false;   // a manual drag pins the height (disables auto-grow)
 
   function maxPanelHeight() { return Math.max(MIN_PANEL_HEIGHT, window.innerHeight - 120); }
