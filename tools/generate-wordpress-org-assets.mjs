@@ -174,7 +174,7 @@ function placeLockup(fill, x, y, h) {
   return `<g transform="translate(${x} ${y}) scale(${r2(s)})" fill="${fill}">${lockContent}</g>`;
 }
 function bannerSvg(W, H) {
-  const tagline = tokens.voice.tagline; // "The open source AI workspace"
+  const tagline = tokens.voice.tagline; // "The Open Source Agentic Teams Workspace"
   const lockH = Math.min(H * 0.34, 120);
   const lockW = LOCK.w * (lockH / LOCK.h);
   const x = (W - lockW) / 2;
