@@ -43,7 +43,7 @@ Go to Settings → Cinatra, enter the web address of your Cinatra instance, clic
 Anyone who can manage your WordPress site (site administrators). The assistant and its settings are only shown to those users.
 
 = Do I need a Cinatra account? =
-You need access to a running Cinatra instance. Cinatra is an open source AI platform that you or your organisation host and connect the assistant to — learn more and get the source at https://www.cinatra.ai. Once your instance is running, open the Cinatra settings, enter the instance's web address, and connect.
+You need access to a running Cinatra instance. Cinatra is The Open Source Agentic Teams Workspace, which you or your organisation host and connect the assistant to — learn more and get the source at https://www.cinatra.ai. Once your instance is running, open the Cinatra settings, enter the instance's web address, and connect.
 
 = What is the WordPress MCP Adapter and do I need it? =
 The WordPress MCP Adapter (available at https://github.com/WordPress/mcp-adapter) is a companion plugin that gives the Cinatra assistant access to your WordPress content via the Model Context Protocol (MCP). Without it, the assistant works as a general chat tool; with it, the assistant can read and edit your posts, pages, and other content directly.
