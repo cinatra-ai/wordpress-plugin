@@ -16,7 +16,7 @@ established brand rules — never an ad-hoc recolour or layout.
 | --- | --- | --- |
 | `icon-128x128.png` | 128×128 | Brand favicon treatment: mustard fedora on a clean white/paper ground with a hairline border ("Mustard on paper or surface ... never on the navy ground"). Fedora kept clear of corners so it survives the circular mask WordPress applies. |
 | `icon-256x256.png` | 256×256 | Same as the 128 icon, rendered at 2×. |
-| `banner-772x250.png` | 772×250 | Light banner: paper (cream) ground + mustard horizontal lockup + tagline "The open source AI workspace" in slate. "Mustard on paper" is the Primary colourway. |
+| `banner-772x250.png` | 772×250 | Light banner: paper (cream) ground + mustard horizontal lockup + the product claim "The Open Source Agentic Teams Workspace" in slate, set in tracked capitals. "Mustard on paper" is the Primary colourway. |
 | `banner-1544x500.png` | 1544×500 | Same as the 772 banner, rendered at 2× (retina). |
 | `manifest.json` | — | Provenance for each generated file (source master, colourway, tokens version, sha256). |
 

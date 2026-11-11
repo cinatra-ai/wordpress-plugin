@@ -30,7 +30,7 @@
       "colorway": "mustard on paper + slate tagline",
       "dimensions": "772x250",
       "tokensVersion": "0.1.0",
-      "sha256": "5b6d963383248fc94db74ddaa68c0b1e4b6ff9e30e2433bf958b8d48e325232d",
+      "sha256": "3d3a2f0017c42a5c4db2631707d959be926864c4bce82ac690dbca8aea5af983",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     },
     {
@@ -39,7 +39,7 @@
       "colorway": "mustard on paper + slate tagline",
       "dimensions": "1544x500",
       "tokensVersion": "0.1.0",
-      "sha256": "03420f3724259b30efff47b3844578eefe5a965ecf1a545da1b1c1cc77f3b4bc",
+      "sha256": "0973f3c1f62cc19b5baf14d1019e5d7ba60dfe4f09a4955a503ffbab2fd85680",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     }
   ]

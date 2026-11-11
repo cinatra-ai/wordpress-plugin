@@ -173,13 +173,26 @@ function placeLockup(fill, x, y, h) {
   const s = h / LOCK.h;
   return `<g transform="translate(${x} ${y}) scale(${r2(s)})" fill="${fill}">${lockContent}</g>`;
 }
+// The one product claim; the banner states it verbatim (the mono caption is set in
+// capitals by caption(), a display style, not a variant of the words).
+const PRODUCT_CLAIM = "The Open Source Agentic Teams Workspace";
 function bannerSvg(W, H) {
-  const tagline = tokens.voice.tagline; // "The open source AI workspace"
+  const tagline = tokens.voice.tagline;
+  if (tagline !== PRODUCT_CLAIM)
+    throw new Error(
+      `Design token voice.tagline is "${tagline}", not the product claim "${PRODUCT_CLAIM}" — update the design checkout (DESIGN_REPO) first`
+    );
   const lockH = Math.min(H * 0.34, 120);
   const lockW = LOCK.w * (lockH / LOCK.h);
   const x = (W - lockW) / 2;
   const y = (H - lockH) / 2 - H * 0.06;
-  const cap = caption(tagline, Math.max(16, H * 0.052), MUTED, 0.22);
+  // Caption: tracked mono capitals, fitted so it never runs wider than the lockup.
+  let size = Math.max(16, H * 0.052);
+  let cap = caption(tagline, size, MUTED, 0.22);
+  if (cap.w > lockW) {
+    size = size * (lockW / cap.w);
+    cap = caption(tagline, size, MUTED, 0.22);
+  }
   const tag = cap.path((W - cap.w) / 2, y + lockH + H * 0.14);
   return conform(
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">` +
@@ -239,7 +252,7 @@ const manifest = {
     description:
       "Provenance for the WordPress.org plugin-directory assets in .wordpress-org/. Derived from the Cinatra design system (masters + tokens + brand spec); regenerate with tools/generate-wordpress-org-assets.mjs — never hand-edit.",
     designSource: "Cinatra design system",
-    note: "icon + banner derive from the design system masters. The directory icon follows the brand favicon treatment — the mustard fedora on a clean white/paper ground with a hairline border (design assets/logo/variants.json: 'Mustard on paper or surface ... Never mustard on a coloured chip or on the navy ground'). No screenshots are shipped yet; a real browser capture of a live WordPress install will be added in a later release.",
+    note: "icon + banner derive from the design system masters. The directory icon follows the brand favicon treatment — the mustard fedora on a clean white/paper ground with a hairline border (design assets/logo/variants.json: 'Mustard on paper or surface ... Never mustard on a coloured chip or on the navy ground'). screenshot-1.png, screenshot-2.png and screenshot-3.png are real captures of the plugin running in a live wp-admin (assistant in action, account sign-in, and the connect/settings page), not generated assets; their captions live in readme.txt under == Screenshots ==.",
   },
   entries,
 };
