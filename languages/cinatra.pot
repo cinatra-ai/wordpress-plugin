@@ -17,7 +17,7 @@ msgstr ""
 #. Plugin Name of the plugin
 #. Author of the plugin
 #: cinatra.php
-#: cinatra.php:438
+#: cinatra.php:437
 msgid "Cinatra"
 msgstr ""
 
@@ -31,392 +31,392 @@ msgstr ""
 msgid "Embeds the Cinatra AI assistant chat widget in WordPress admin. Floating button bottom-right; opens chat panel on click."
 msgstr ""
 
-#: cinatra.php:437
-#: cinatra.php:488
+#: cinatra.php:436
+#: cinatra.php:487
 msgid "Cinatra Settings"
 msgstr ""
 
-#: cinatra.php:449
+#: cinatra.php:448
 msgid "Settings"
 msgstr ""
 
-#: cinatra.php:491
+#: cinatra.php:490
 msgid "Connect to Cinatra"
 msgstr ""
 
-#: cinatra.php:493
+#: cinatra.php:492
 msgid "Enter your Cinatra instance URL and click Connect. You will be sent to Cinatra to approve the connection; the integration credential is then provisioned automatically and stored on this server. You never copy or paste a key."
 msgstr ""
 
-#: cinatra.php:499
+#: cinatra.php:498
 msgid "Cinatra instance URL"
 msgstr ""
 
-#: cinatra.php:512
+#: cinatra.php:511
 msgid "Connect with Cinatra"
 msgstr ""
 
-#: cinatra.php:515
+#: cinatra.php:514
 msgid "Currently connected. Reconnecting replaces the stored credential."
 msgstr ""
 
-#: cinatra.php:521
+#: cinatra.php:520
 msgid "No browser redirect? Use a connection string instead"
 msgstr ""
 
-#: cinatra.php:526
+#: cinatra.php:525
 msgid "Connection string from Cinatra"
 msgstr ""
 
-#: cinatra.php:536
+#: cinatra.php:535
 msgid "Connect with code"
 msgstr ""
 
-#: cinatra.php:544
+#: cinatra.php:543
 msgid "Advanced / manual configuration"
 msgstr ""
 
-#: cinatra.php:545
+#: cinatra.php:544
 msgid "Most sites should use Connect above. These fields let you set or override the connection manually."
 msgstr ""
 
-#: cinatra.php:550
+#: cinatra.php:549
 msgid "Cinatra URL"
 msgstr ""
 
 #. translators: %s: example URL
-#: cinatra.php:565
+#: cinatra.php:564
 #, php-format
 msgid "Base URL of your Cinatra instance (e.g. %s)."
 msgstr ""
 
-#: cinatra.php:573
+#: cinatra.php:572
 msgid "API Key"
 msgstr ""
 
-#: cinatra.php:582
+#: cinatra.php:581
 msgid "(stored — leave blank to keep)"
 msgstr ""
 
-#: cinatra.php:585
+#: cinatra.php:584
 msgid "Bearer token from Cinatra at"
 msgstr ""
 
-#: cinatra.php:587
+#: cinatra.php:586
 msgid "Leave blank to keep the stored value."
 msgstr ""
 
-#: cinatra.php:592
+#: cinatra.php:591
 msgid "Agent Instance ID"
 msgstr ""
 
-#: cinatra.php:603
+#: cinatra.php:602
 msgid "WordPress instance ID copied from Cinatra. Required for the agent to resolve which WordPress site to edit."
 msgstr ""
 
-#: cinatra.php:607
+#: cinatra.php:606
 msgid "Publish Webhooks"
 msgstr ""
 
-#: cinatra.php:611
+#: cinatra.php:610
 msgid "Provisioned."
 msgstr ""
 
-#: cinatra.php:612
+#: cinatra.php:611
 msgid "Publish events are signed and delivered to your Cinatra instance."
 msgstr ""
 
-#: cinatra.php:614
+#: cinatra.php:613
 msgid "Not provisioned."
 msgstr ""
 
-#: cinatra.php:615
+#: cinatra.php:614
 msgid "Use \"Connect with Cinatra\" (or reconnect) to provision publish webhooks. The signing credentials are issued by your Cinatra instance during the connection — there is nothing to paste here."
 msgstr ""
 
 #. translators: 1: plugin name, 2: parenthesized version suffix shown when the installed version is known (may be empty)
-#: cinatra.php:793
+#: cinatra.php:792
 #, php-format
 msgid "%1$s%2$s is active."
 msgstr ""
 
-#: cinatra.php:805
+#: cinatra.php:804
 msgid "Activate it on the Installed Plugins screen"
 msgstr ""
 
 #. translators: 1: plugin name, 2: parenthesized version suffix shown when the installed version is known (may be empty), 3: "Activate it..." link HTML
-#: cinatra.php:811
+#: cinatra.php:810
 #, php-format
 msgid "%1$s%2$s is installed but not active. %3$s"
 msgstr ""
 
 #. translators: 1: plugin name, 2: download/info link HTML
-#: cinatra.php:829
+#: cinatra.php:828
 #, php-format
 msgid "%1$s is not installed. %2$s"
 msgstr ""
 
-#: cinatra.php:868
+#: cinatra.php:867
 msgid "Site AI stack"
 msgstr ""
 
-#: cinatra.php:870
+#: cinatra.php:869
 msgid "The Cinatra assistant works without the items below, but installing them unlocks WordPress AI tools — letting the assistant read and edit your site content directly from the chat."
 msgstr ""
 
-#: cinatra.php:877
+#: cinatra.php:876
 msgid "WordPress version meets the requirement for AI tools."
 msgstr ""
 
 #. translators: 1: minimum required WordPress version, 2: the WordPress version this site is currently running
-#: cinatra.php:880
+#: cinatra.php:879
 #, php-format
 msgid "WordPress %1$s or newer is required for AI tools (this site is running %2$s)."
 msgstr ""
 
-#: cinatra.php:888
+#: cinatra.php:887
 msgid "PHP version meets the requirement for AI tools."
 msgstr ""
 
 #. translators: 1: minimum required PHP version, 2: the PHP version this server is currently running
-#: cinatra.php:891
+#: cinatra.php:890
 #, php-format
 msgid "PHP %1$s or newer is required for AI tools (this server is running %2$s)."
 msgstr ""
 
-#: cinatra.php:899
+#: cinatra.php:898
 msgid "Site is served over HTTPS."
 msgstr ""
 
-#: cinatra.php:900
+#: cinatra.php:899
 msgid "Site is not served over HTTPS — HTTPS is required for AI tools."
 msgstr ""
 
-#: cinatra.php:904
+#: cinatra.php:903
 msgid "WordPress MCP Adapter"
 msgstr ""
 
-#: cinatra.php:906
+#: cinatra.php:905
 msgid "Download the WordPress MCP Adapter from GitHub"
 msgstr ""
 
-#: cinatra.php:910
+#: cinatra.php:909
 msgid "Enable Abilities for MCP"
 msgstr ""
 
-#: cinatra.php:912
+#: cinatra.php:911
 msgid "Get Enable Abilities for MCP from wordpress.org"
 msgstr ""
 
 #. translators: %s: the signed-in user's WordPress role slug (e.g. "administrator")
-#: cinatra.php:919
+#: cinatra.php:918
 #, php-format
 msgid "Signed in as: %s."
 msgstr ""
 
 #. translators: %s: URL to WordPress MCP Adapter releases
-#: cinatra.php:930
+#: cinatra.php:929
 #, php-format
 msgid "The WordPress MCP Adapter is distributed via GitHub Releases (%s) and is not in the wordpress.org directory. Install it manually and activate it like any other plugin."
 msgstr ""
 
-#: cinatra.php:931
+#: cinatra.php:930
 msgid "WordPress/mcp-adapter"
 msgstr ""
 
-#: cinatra.php:989
+#: cinatra.php:988
 msgid "WordPress AI tools are not enabled:"
 msgstr ""
 
-#: cinatra.php:990
+#: cinatra.php:989
 msgid "To let the Cinatra assistant read and edit your WordPress content, install and activate the WordPress MCP Adapter. The chat widget works without it."
 msgstr ""
 
-#: cinatra.php:992
+#: cinatra.php:991
 msgid "Get the WordPress MCP Adapter"
 msgstr ""
 
-#: cinatra.php:1000
+#: cinatra.php:999
 msgid "Cinatra:"
 msgstr ""
 
-#: cinatra.php:1001
+#: cinatra.php:1000
 msgid "The Agent Instance ID is not set — the AI assistant will not be able to edit content. Set it in the manual configuration below."
 msgstr ""
 
-#: cinatra.php:1007
+#: cinatra.php:1006
 msgid "Cinatra publish webhooks are paused:"
 msgstr ""
 
-#: cinatra.php:1008
+#: cinatra.php:1007
 msgid "This site has a publish-webhook subscription but no server-issued webhook credentials. Reconnect this site to your Cinatra instance (\"Connect with Cinatra\") to provision them — publish events are not delivered until then."
 msgstr ""
 
-#: cinatra.php:1390
-#: cinatra.php:1460
-#: cinatra.php:1516
+#: cinatra.php:1389
+#: cinatra.php:1459
+#: cinatra.php:1515
 msgid "You do not have permission to do this."
 msgstr ""
 
-#: cinatra.php:1397
+#: cinatra.php:1396
 msgid "Enter a valid https Cinatra instance URL."
 msgstr ""
 
-#: cinatra.php:1471
+#: cinatra.php:1470
 msgid "Cinatra did not return an authorization code. Connection cancelled."
 msgstr ""
 
-#: cinatra.php:1483
+#: cinatra.php:1482
 msgid "This connection request expired or did not match. Please try again."
 msgstr ""
 
-#: cinatra.php:1523
+#: cinatra.php:1522
 msgid "That connection string is not valid."
 msgstr ""
 
-#: cinatra.php:1668
+#: cinatra.php:1667
 msgid "Could not complete the connection. Check the URL and try again, or contact your administrator."
 msgstr ""
 
-#: cinatra.php:1703
+#: cinatra.php:1702
 msgid "Connected to Cinatra. The integration credential is stored on this server."
 msgstr ""
 
-#: cinatra.php:1919
+#: cinatra.php:1918
 msgid "You do not have permission to install plugins on this site."
 msgstr ""
 
-#: cinatra.php:2116
+#: cinatra.php:2115
 msgid "An install is already in progress for the WordPress MCP Adapter. Please wait for it to finish."
 msgstr ""
 
-#: cinatra.php:2128
+#: cinatra.php:2127
 msgid "Could not download the WordPress MCP Adapter. Check the server's outbound network access and try again."
 msgstr ""
 
-#: cinatra.php:2135
+#: cinatra.php:2134
 msgid "The downloaded file failed a safety check. Nothing was installed."
 msgstr ""
 
 #. translators: %s: URL of the GitHub release page
-#: cinatra.php:2147
+#: cinatra.php:2146
 #, php-format
 msgid "Checksum mismatch — the download may be corrupted or tampered with. Nothing was installed. Install manually from %s if this persists."
 msgstr ""
 
-#: cinatra.php:2160
+#: cinatra.php:2159
 msgid "Checksum mismatch on re-verification. Nothing was installed."
 msgstr ""
 
-#: cinatra.php:2173
+#: cinatra.php:2172
 msgid "The WordPress MCP Adapter was installed, checksum-verified, and activated."
 msgstr ""
 
-#: cinatra.php:2174
+#: cinatra.php:2173
 msgid "The WordPress MCP Adapter was installed and checksum-verified. Activate it from the Plugins screen when ready."
 msgstr ""
 
-#: cinatra.php:2177
+#: cinatra.php:2176
 msgid "The WordPress MCP Adapter was installed, but its version does not match what this plugin expects. It has been LEFT INACTIVE for manual inspection — it was NOT auto-removed or auto-activated."
 msgstr ""
 
-#: cinatra.php:2179
+#: cinatra.php:2178
 msgid "The WordPress MCP Adapter download passed its checksum check, but installation failed. Nothing was activated."
 msgstr ""
 
-#: cinatra.php:2204
+#: cinatra.php:2203
 msgid "An install is already in progress for the Abilities plugin. Please wait for it to finish."
 msgstr ""
 
-#: cinatra.php:2221
+#: cinatra.php:2220
 msgid "Could not reach the wordpress.org plugin directory. Try again later."
 msgstr ""
 
-#: cinatra.php:2236
+#: cinatra.php:2235
 msgid "The Abilities plugin was installed and activated."
 msgstr ""
 
-#: cinatra.php:2237
+#: cinatra.php:2236
 msgid "The Abilities plugin was installed. Activate it from the Plugins screen when ready."
 msgstr ""
 
-#: cinatra.php:2240
+#: cinatra.php:2239
 msgid "Installation of the Abilities plugin failed."
 msgstr ""
 
-#: cinatra.php:2272
+#: cinatra.php:2271
 msgid "One-click install"
 msgstr ""
 
-#: cinatra.php:2274
+#: cinatra.php:2273
 msgid "Installs are checksum-verified where applicable and never run automatically — each requires this explicit click."
 msgstr ""
 
-#: cinatra.php:2282
-#: cinatra.php:2303
+#: cinatra.php:2281
+#: cinatra.php:2302
 msgid "Activate after installing"
 msgstr ""
 
 #. translators: %s: pinned plugin version, e.g. 0.5.0
-#: cinatra.php:2288
+#: cinatra.php:2287
 #, php-format
 msgid "Install WordPress MCP Adapter v%s (checksum-verified)"
 msgstr ""
 
-#: cinatra.php:2305
+#: cinatra.php:2304
 msgid "Install Abilities plugin (enable-abilities-for-mcp)"
 msgstr ""
 
-#: cinatra.php:2515
+#: cinatra.php:2514
 msgid "No Cinatra instance URL is configured."
 msgstr ""
 
-#: cinatra.php:2516
+#: cinatra.php:2515
 msgid "Cinatra is reachable but the widget has not loaded yet. Try refreshing the page."
 msgstr ""
 
 #. translators: %s: instance URL
-#: cinatra.php:2518
+#: cinatra.php:2517
 #, php-format
 msgid "Cannot reach %s. Check that your Cinatra instance is running."
 msgstr ""
 
-#: cinatra.php:2593
+#: cinatra.php:2592
 msgid "Cinatra AI Assistant"
 msgstr ""
 
-#: cinatra.php:2601
+#: cinatra.php:2600
 msgid "Cinatra is unavailable"
 msgstr ""
 
-#: cinatra.php:2602
+#: cinatra.php:2601
 msgid "Close"
 msgstr ""
 
-#: cinatra.php:2604
+#: cinatra.php:2603
 msgid "Could not connect to your Cinatra instance."
 msgstr ""
 
-#: cinatra.php:2780
+#: cinatra.php:2779
 msgid "event_type and target_url are required."
 msgstr ""
 
-#: cinatra.php:2790
+#: cinatra.php:2789
 msgid "Maximum number of webhook subscriptions reached."
 msgstr ""
 
-#: cinatra.php:2836
+#: cinatra.php:2835
 msgid "Subscription not found."
 msgstr ""
 
-#: cinatra.php:3479
+#: cinatra.php:3478
 msgid "Post not found."
 msgstr ""
 
-#: cinatra.php:3482
+#: cinatra.php:3481
 msgid "This object cannot be previewed."
 msgstr ""
 
-#: cinatra.php:3486
+#: cinatra.php:3485
 msgid "This post type cannot be previewed."
 msgstr ""
