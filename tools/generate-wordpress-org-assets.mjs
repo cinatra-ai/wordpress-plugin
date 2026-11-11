@@ -114,28 +114,6 @@ const toAB = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 const mono = opentype.parse(
   toAB(readFileSync(join(DESIGN, "scripts/.fontcache/JetBrainsMono-700.ttf")))
 );
-// The wordmark is Cinatra™ (pending registration: ™, never ®; design TRADEMARK.md).
-// The design lockup master is the bare outlined wordmark, so the banner appends a
-// superscript ™ set in the same face as the wordmark (Archivo ExtraBold Italic,
-// pinned in the design font cache), top-aligned with the cap height.
-const archivo = opentype.parse(
-  toAB(readFileSync(join(DESIGN, "scripts/.fontcache/Archivo-Italic-800.ttf")))
-);
-const lockBaselineMatch = lockSrc.match(/translate\(0 ([\d.]+)\) scale\(/);
-if (!lockBaselineMatch)
-  throw new Error("Cannot read the baseline of the lockup master to place the trademark mark");
-const LOCK_BASELINE = Number(lockBaselineMatch[1]);
-const TM_FONT_SIZE = 80; // ~0.55 of the wordmark size (cap height 100 units -> ~145.8)
-const TM_GAP = 6; // lockup units between the wordmark and the mark
-const tmPathData = (() => {
-  const ref = archivo.getPath("™", 0, 0, TM_FONT_SIZE);
-  const b = ref.getBoundingBox();
-  const capTop = LOCK_BASELINE - 100; // wordmark cap height is 100 units in the master
-  const p = archivo.getPath("™", LOCK.w + TM_GAP - b.x1, capTop - b.y1, TM_FONT_SIZE);
-  const pb = p.getBoundingBox();
-  return { d: p.toPathData(2), right: pb.x2 };
-})();
-const LOCK_TM = { w: tmPathData.right, h: LOCK.h };
 function outlined(font, text, size, { letterSpacing = 0 } = {}) {
   const p = font.getPath(text, 0, 0, size, { kerning: true, letterSpacing });
   const b = p.getBoundingBox();
@@ -193,7 +171,7 @@ function iconSvg() {
 // Mirrors design bannerSvg(...,"light"): lockup height capped, tagline tracked.
 function placeLockup(fill, x, y, h) {
   const s = h / LOCK.h;
-  return `<g transform="translate(${x} ${y}) scale(${r2(s)})" fill="${fill}">${lockContent}<path d="${tmPathData.d}"/></g>`;
+  return `<g transform="translate(${x} ${y}) scale(${r2(s)})" fill="${fill}">${lockContent}</g>`;
 }
 // The one product claim; the banner states it verbatim (the mono caption is set in
 // capitals by caption(), a display style, not a variant of the words).
@@ -205,7 +183,7 @@ function bannerSvg(W, H) {
       `Design token voice.tagline is "${tagline}", not the product claim "${PRODUCT_CLAIM}" — update the design checkout (DESIGN_REPO) first`
     );
   const lockH = Math.min(H * 0.34, 120);
-  const lockW = LOCK_TM.w * (lockH / LOCK_TM.h);
+  const lockW = LOCK.w * (lockH / LOCK.h);
   const x = (W - lockW) / 2;
   const y = (H - lockH) / 2 - H * 0.06;
   // Caption: tracked mono capitals, fitted so it never runs wider than the lockup.
@@ -257,11 +235,11 @@ await emit("icon-256x256.png", icon, 256, 256, {
 });
 await emit("banner-772x250.png", bannerSvg(772, 250), 772, 250, {
   source: "design assets/logo/cinatra-lockup-horizontal.svg",
-  colorway: "mustard on paper + slate tagline (wordmark Cinatra™)",
+  colorway: "mustard on paper + slate tagline",
 });
 await emit("banner-1544x500.png", bannerSvg(1544, 500), 1544, 500, {
   source: "design assets/logo/cinatra-lockup-horizontal.svg",
-  colorway: "mustard on paper + slate tagline (wordmark Cinatra™)",
+  colorway: "mustard on paper + slate tagline",
 });
 
 // No screenshots are generated. wp.org screenshots must be real browser captures

@@ -27,19 +27,19 @@
     {
       "path": ".wordpress-org/banner-772x250.png",
       "source": "design assets/logo/cinatra-lockup-horizontal.svg",
-      "colorway": "mustard on paper + slate tagline (wordmark Cinatra™)",
+      "colorway": "mustard on paper + slate tagline",
       "dimensions": "772x250",
       "tokensVersion": "0.1.0",
-      "sha256": "ce407d76e737e45f66ae9ec97a0bdce07b4648e77cf71117d202fc26d8f194b7",
+      "sha256": "3d3a2f0017c42a5c4db2631707d959be926864c4bce82ac690dbca8aea5af983",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     },
     {
       "path": ".wordpress-org/banner-1544x500.png",
       "source": "design assets/logo/cinatra-lockup-horizontal.svg",
-      "colorway": "mustard on paper + slate tagline (wordmark Cinatra™)",
+      "colorway": "mustard on paper + slate tagline",
       "dimensions": "1544x500",
       "tokensVersion": "0.1.0",
-      "sha256": "2589500d70152dbf9460909e45ee746ba2322769f25c3453b05e68924dd8139e",
+      "sha256": "0973f3c1f62cc19b5baf14d1019e5d7ba60dfe4f09a4955a503ffbab2fd85680",
       "generatedBy": "node tools/generate-wordpress-org-assets.mjs"
     }
   ]
