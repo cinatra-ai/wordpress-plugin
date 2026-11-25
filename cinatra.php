@@ -4268,9 +4268,10 @@ add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );
 // before-values of the whole reviewed post (title, content, excerpt, status)
 // byte for byte, runs WordPress's per-field save filters over the WRITTEN
 // fields only, and writes exactly those columns ( plus post_status "draft"
-// when asked, and the two modification times ) with one $wpdb->update(). It
-// does not go through wp_update_post(): that would merge the cached post, run
-// the save filters over every field, rewrite terms and fire hooks inside the
+// when asked, and the two modification times ) with one conditional UPDATE
+// that applies only while the row is exactly the locked row. It does not go
+// through wp_update_post(): that would merge the cached post, run the save
+// filters over every field, rewrite terms and fire hooks inside the
 // transaction. The hooks WordPress fires after an update run only after the
 // COMMIT. An edit saved in between makes the write refuse, nothing is
 // written, and no after-save hook fires.
@@ -5057,8 +5058,11 @@ function cinatra_content_session_state(): string {
  * get_var() and get_results() add no hook, and a prepare() with only %d
  * placeholders and matching arguments reaches none ( %s escaping needs the
  * connection and can reach _doing_it_wrong() without one, so statements with
- * %s are prepared before the window ). So for the duration of $run the
- * callbacks of those seven filter hooks are taken out ( the WP_Hook objects
+ * %s are prepared before the window ). apply_filters() first calls the
+ * callbacks of WordPress's special "all" hook for every hook name
+ * ( _wp_call_all_hook() ), also when the named hook has none. So for the
+ * duration of $run the callbacks of "all" and of those seven filter hooks
+ * are taken out ( the WP_Hook objects
  * in $wp_filter are removed and the same objects put back in finally, also
  * on an exception ) and errors are suppressed ( last_error and errno stay
  * readable ). The ability's own code inside a window calls no translation
@@ -5076,7 +5080,7 @@ function cinatra_content_session_state(): string {
 function cinatra_content_control( callable $run ) {
 	global $wp_filter, $wpdb;
 	$saved = array();
-	foreach ( array( 'query', 'log_query_custom_data', 'incompatible_sql_modes', 'pre_get_table_charset', 'pre_get_col_charset', 'gettext', 'gettext_default' ) as $hook ) {
+	foreach ( array( 'all', 'query', 'log_query_custom_data', 'incompatible_sql_modes', 'pre_get_table_charset', 'pre_get_col_charset', 'gettext', 'gettext_default' ) as $hook ) {
 		if ( isset( $wp_filter[ $hook ] ) ) {
 			$saved[ $hook ] = $wp_filter[ $hook ];
 			unset( $wp_filter[ $hook ] ); // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- Restored ( the same object ) in finally.

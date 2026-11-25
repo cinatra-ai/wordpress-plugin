@@ -58,6 +58,14 @@ if (!class_exists('WP_Hook')) {
             }
             return $value;
         }
+        /** As core's WP_Hook::do_all_hook(): each callback gets the hook name and its arguments. */
+        public function do_all_hook(&$args) {
+            foreach ($this->callbacks as $cbs) {
+                foreach ($cbs as $c) {
+                    ($c['function'])(...$args);
+                }
+            }
+        }
     }
 }
 /** Site code on WordPress's query filter that rewrites statements: the statement sent is $f( $sql ). */
@@ -124,6 +132,13 @@ class wpdb {
     // can rewrite it ).
     private function filter_query($sql) {
         $this->last_error = '';
+        // As apply_filters(): the "all" hook first ( _wp_call_all_hook() ),
+        // also when the named hook has no callback.
+        if (isset($GLOBALS['wp_filter']['all'])) {
+            $all_args = ['query', $sql];
+            $GLOBALS['wp_filter']['all']->do_all_hook($all_args);
+            $this->last_error = '';
+        }
         if (isset($GLOBALS['wp_filter']['query'])) {
             $GLOBALS['cinatra_test']['query_filter_saw'][] = $sql;
             $sql = $GLOBALS['wp_filter']['query']->apply_filters($sql, [$sql]);
@@ -724,7 +739,7 @@ function t_row(int $id, string $type, array $over = []): array {
 function reset_fixture(array $overrides = []) {
     global $wpdb;
     $wpdb = new wpdb();
-    unset($GLOBALS['wp_filter']['query'], $GLOBALS['wp_filter']['gettext']);
+    unset($GLOBALS['wp_filter']['query'], $GLOBALS['wp_filter']['gettext'], $GLOBALS['wp_filter']['all']);
     $GLOBALS['cinatra_test']['query_filter_saw'] = [];
     $GLOBALS['_wp_suspend_cache_invalidation'] = false;
     $wpdb->rows = [
@@ -2255,6 +2270,28 @@ check('an after-save hook changes the slug: the answer\'s permalink is the store
 reset_fixture(['permalinks' => [T_ID => 'https://blog.example/stale-cache/']]);
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('a stale by-ID permalink source is not used: the permalink comes from the stored row object', true === ($r['success'] ?? null) && 'https://blog.example/about/' === $r['permalink']);
+
+
+// WordPress's "all" hook runs before every named filter, so it is suspended too.
+reset_fixture();
+$all_in_window = [];
+$all_seen = 0;
+$GLOBALS['wp_filter']['all'] = new WP_Hook();
+$GLOBALS['wp_filter']['all']->add_filter('all', function ($hook, ...$args) use (&$all_in_window, &$all_seen) {
+    global $wpdb;
+    $all_seen++;
+    if ('query' === $hook && $wpdb->suppress_calls_last()) {
+        $all_in_window[] = $args[0];
+        if ('COMMIT' === $args[0]) { $wpdb->query('ROLLBACK'); }
+    }
+}, 10, 2);
+$all_hook = $GLOBALS['wp_filter']['all'];
+$all_callbacks = $all_hook->callbacks;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+$seen_during = $all_seen;
+$wpdb->query('SELECT 1');
+check('an "all" callback is not called during any control statement ( no ROLLBACK at the terminal COMMIT ): success, stored', true === ($r['success'] ?? null) && [] === $all_in_window && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content'] && null === $wpdb->snapshot_for_test());
+check('the same "all" WP_Hook object is back afterwards, callbacks unchanged, and runs again', $all_hook === ($GLOBALS['wp_filter']['all'] ?? null) && $all_callbacks === $all_hook->callbacks && $all_seen === $seen_during + 1);
 
 echo "\n";
 if ($failures > 0) {
