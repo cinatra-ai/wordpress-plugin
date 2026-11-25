@@ -4253,3 +4253,324 @@ register_deactivation_hook( __FILE__, 'cinatra_unschedule_site_inventory_cron' )
 // trigger; drift coverage is the entire point of this trigger, so it carries
 // no debounce/hash gate of its own).
 add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );
+
+// ---------------------------------------------------------------------------
+// Content ability: a fresh read for a review (cinatra#3745).
+//
+// An agent's page edit shows a person a review of the exact change. The
+// review must start from the value the site really stores, so
+// cinatra/post-read reads the RAW stored values straight from the posts table
+// ( not the object cache ) and returns a row_token, a fingerprint of the
+// whole row, that a later write can compare with.
+//
+// It registers on the Abilities API hooks only; the plugin loads unchanged
+// when the Abilities API is absent, and nothing runs until a caller invokes
+// the ability. A refusal is returned as a RESULT ( success false, a code,
+// data ), not a WP_Error: the MCP Adapter passes a WP_Error to the client as
+// its message text only, so the code would be lost. The refusal has no
+// "error" key on purpose: the adapter turns { success: false, error: "..." }
+// into a bare error text as well.
+// ---------------------------------------------------------------------------
+
+const CINATRA_ABILITY_CATEGORY  = 'cinatra';
+const CINATRA_ABILITY_POST_READ = 'cinatra/post-read';
+
+/**
+ * Invoke a function provided by an optional dependency (the Abilities API)
+ * only when it is available. The plugin supports WordPress 5.9+, while the
+ * Abilities API ships in WordPress 6.9 (or its feature plugin); the call is a
+ * no-op (returns null) when the function is absent.
+ *
+ * @param string $function_name Function name to invoke.
+ * @param mixed  ...$args       Arguments forwarded to the function.
+ * @return mixed The function's return value, or null when it is unavailable.
+ */
+function cinatra_call_optional( string $function_name, ...$args ) {
+	if ( ! function_exists( $function_name ) ) {
+		return null;
+	}
+	return $function_name( ...$args );
+}
+
+/**
+ * Post types the content abilities operate on.
+ *
+ * @return string[] Allowed post-type slugs.
+ */
+function cinatra_content_post_types(): array {
+	return array( 'post', 'page' );
+}
+
+/**
+ * Read the positive post ID from an ability input, or 0.
+ *
+ * @param mixed $input Ability input.
+ * @return int The post ID, or 0 when absent or not a positive integer.
+ */
+function cinatra_content_post_id( $input ): int {
+	if ( ! is_array( $input ) || ! isset( $input['post_id'] ) ) {
+		return 0;
+	}
+	$raw = $input['post_id'];
+	if ( is_int( $raw ) ) {
+		return 0 < $raw ? $raw : 0;
+	}
+	if ( is_string( $raw ) && 1 === preg_match( '/^[1-9][0-9]{0,17}$/', $raw ) ) {
+		return (int) $raw;
+	}
+	return 0;
+}
+
+/**
+ * Permission callback of the content abilities: the caller must be logged
+ * in. The edit_post decision needs the post, so the execute callback makes it
+ * after reading the row; a caller it denies gets the same not_found answer as
+ * for an unknown post.
+ *
+ * @param mixed $input Ability input ( unused: the post is checked later ).
+ * @return bool True when a user is logged in.
+ */
+function cinatra_content_precheck( $input = array() ): bool {
+	unset( $input );
+	return is_user_logged_in();
+}
+
+/**
+ * Build a refusal result. A refusal never carries post content.
+ *
+ * @param string $code    Refusal code.
+ * @param string $message Human-readable message.
+ * @param array  $data    Additional data entries ( field names only, never values ).
+ * @return array<string,mixed> The refusal result.
+ */
+function cinatra_content_refusal( string $code, string $message, array $data = array() ): array {
+	return array(
+		'success' => false,
+		'code'    => $code,
+		'message' => $message,
+		'data'    => $data,
+	);
+}
+
+/**
+ * The refusal for an unknown post, a post of another type, or a post the
+ * caller cannot edit. One shape for all three: no existence leak.
+ *
+ * @return array<string,mixed> The refusal result.
+ */
+function cinatra_content_not_found(): array {
+	return cinatra_content_refusal(
+		'not_found',
+		__( 'The post does not exist or you are not allowed to edit it.', 'cinatra' )
+	);
+}
+
+/**
+ * The post row ( every column ), read plainly and fresh from the posts table,
+ * if the current user may edit it; otherwise the refusal. A missing post, a
+ * post of another type and a post the user may not edit all give the same
+ * not_found. A failed read is db_error, never not_found.
+ *
+ * @param int $id Post ID.
+ * @return array{0:array<string,mixed>|null,1:array<string,string>|null} The refusal, or null and the row.
+ */
+function cinatra_content_permitted_row( int $id ): array {
+	global $wpdb;
+	$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->posts} WHERE ID = %d", $id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The fresh stored value is the purpose; a cached value could be stale.
+	if ( ! is_array( $row ) ) {
+		if ( '' !== (string) $wpdb->last_error ) {
+			return array( cinatra_content_refusal( 'db_error', __( 'The database could not read the post.', 'cinatra' ) ), null );
+		}
+		return array( cinatra_content_not_found(), null );
+	}
+	if ( ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true )
+		|| ! current_user_can( 'edit_post', $id ) ) { // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
+		return array( cinatra_content_not_found(), null );
+	}
+	return array( null, $row );
+}
+
+/**
+ * The row token: a fingerprint of EVERY column of the posts row, so a write
+ * can tell whether anything in the row changed since the read, also within
+ * the same second ( post_modified_gmt has one-second resolution ).
+ *
+ * Canonical encoding, fixed and documented: the ASCII prefix
+ * "cinatra-post-row-v1", then each column in byte order of its name, as a
+ * 4-byte big-endian name length, the name, then "\x00" for NULL, or "\x01",
+ * a 4-byte big-endian value length and the value bytes as stored. SHA-256 of
+ * that, as 64 lower-case hex characters. The length prefixes make every
+ * encoding unambiguous ( no byte can move between columns unseen ). The
+ * token covers the posts row only: post meta and terms are outside it.
+ *
+ * @param array<string,mixed> $row A posts row as read ( SELECT * ).
+ * @return string The token.
+ */
+function cinatra_content_row_token( array $row ): string {
+	ksort( $row, SORT_STRING );
+	$encoded = 'cinatra-post-row-v1';
+	foreach ( $row as $name => $value ) {
+		$name     = (string) $name;
+		$encoded .= pack( 'N', strlen( $name ) ) . $name;
+		if ( null === $value ) {
+			$encoded .= "\x00";
+			continue;
+		}
+		$value    = (string) $value;
+		$encoded .= "\x01" . pack( 'N', strlen( $value ) ) . $value;
+	}
+	return hash( 'sha256', $encoded );
+}
+
+/**
+ * Shape a posts-table row into the success payload ( raw values ). Every
+ * field describes this one row state, the permalink too: it is computed
+ * from a WP_Post built from the row itself, as WP_Post::get_instance()
+ * builds one, so get_permalink() never reads the post again by its ID ( from
+ * a cache that may hold an older copy ). What the link takes from outside
+ * the row ( a page's parents, a post's category, the permalink settings ) is
+ * read as it is now.
+ *
+ * @param array<string,string> $row Posts-table row.
+ * @return array<string,mixed> The success payload.
+ */
+function cinatra_content_shape_row( array $row ): array {
+	$permalink = get_permalink( new WP_Post( sanitize_post( (object) $row, 'raw' ) ) );
+	return array(
+		'success'           => true,
+		'post_id'           => (int) $row['ID'],
+		'post_title'        => (string) $row['post_title'],
+		'post_content'      => (string) $row['post_content'],
+		'post_excerpt'      => (string) $row['post_excerpt'],
+		'post_status'       => (string) $row['post_status'],
+		'post_type'         => (string) $row['post_type'],
+		'post_modified_gmt' => (string) $row['post_modified_gmt'],
+		'permalink'         => is_string( $permalink ) ? $permalink : '',
+		'row_token'         => cinatra_content_row_token( $row ),
+	);
+}
+
+/**
+ * Execute callback for cinatra/post-read: the raw stored values of one post
+ * or page, read straight from the database.
+ *
+ * @param mixed $input Ability input ( expects 'post_id' ).
+ * @return array<string,mixed> The post payload, or a refusal result.
+ */
+function cinatra_ability_post_read( $input = array() ): array {
+	$id = cinatra_content_post_id( $input );
+	if ( 1 > $id ) {
+		return cinatra_content_not_found();
+	}
+	list( $refusal, $row ) = cinatra_content_permitted_row( $id );
+	return $refusal ?? cinatra_content_shape_row( $row );
+}
+
+/**
+ * JSON Schema of the read's result: the post payload or a refusal.
+ *
+ * @return array<string,mixed> Output schema.
+ */
+function cinatra_content_read_output_schema(): array {
+	$text = array( 'type' => 'string' );
+	return array(
+		'type'                 => 'object',
+		'properties'           => array(
+			'success'           => array( 'type' => 'boolean' ),
+			'code'              => array(
+				'type'        => 'string',
+				'enum'        => array( 'not_found', 'db_error' ),
+				'description' => __( 'Refusal code, present only when success is false.', 'cinatra' ),
+			),
+			'message'           => $text,
+			'data'              => array( 'type' => 'object' ),
+			'post_id'           => array( 'type' => 'integer' ),
+			'post_title'        => $text,
+			'post_content'      => $text,
+			'post_excerpt'      => $text,
+			'post_status'       => $text,
+			'post_type'         => $text,
+			'post_modified_gmt' => $text,
+			'permalink'         => $text,
+			'row_token'         => array(
+				'type'        => 'string',
+				'pattern'     => '^[0-9a-f]{64}$',
+				'description' => __( 'SHA-256 fingerprint of every column of the posts row as read ( meta and terms are outside it ).', 'cinatra' ),
+			),
+		),
+		'required'             => array( 'success' ),
+		'additionalProperties' => false,
+	);
+}
+
+/**
+ * Register the Cinatra ability category. Runs on
+ * wp_abilities_api_categories_init, the only hook on which
+ * wp_register_ability_category() succeeds.
+ *
+ * @return void
+ */
+function cinatra_register_ability_category(): void {
+	if ( ! function_exists( 'wp_register_ability_category' ) ) {
+		return;
+	}
+	if ( true === cinatra_call_optional( 'wp_has_ability_category', CINATRA_ABILITY_CATEGORY ) ) {
+		return;
+	}
+	cinatra_call_optional(
+		'wp_register_ability_category',
+		CINATRA_ABILITY_CATEGORY,
+		array(
+			'label'       => __( 'Cinatra', 'cinatra' ),
+			'description' => __( 'Cinatra abilities for reading a post and writing a reviewed change to it.', 'cinatra' ),
+		)
+	);
+}
+add_action( 'wp_abilities_api_categories_init', 'cinatra_register_ability_category' );
+
+/**
+ * Register cinatra/post-read. Runs on wp_abilities_api_init, the only hook on
+ * which wp_register_ability() succeeds; without the Abilities API the hook
+ * never fires.
+ *
+ * @return void
+ */
+function cinatra_register_content_read_ability(): void {
+	if ( ! function_exists( 'wp_register_ability' ) ) {
+		return;
+	}
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_READ,
+		array(
+			'label'               => __( 'Read a post for review', 'cinatra' ),
+			'description'         => __( 'Read the raw stored title, content, excerpt, status, type, permalink and post_modified_gmt of a post or page, fresh from the database, with the row_token of the whole row.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'post_id' => array(
+						'type'        => 'integer',
+						'minimum'     => 1,
+						'description' => __( 'The numeric ID of the post or page.', 'cinatra' ),
+					),
+				),
+				'required'             => array( 'post_id' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => cinatra_content_read_output_schema(),
+			'execute_callback'    => 'cinatra_ability_post_read',
+			'permission_callback' => 'cinatra_content_precheck',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => true,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+}
+add_action( 'wp_abilities_api_init', 'cinatra_register_content_read_ability' );

@@ -54,6 +54,8 @@ jobs:
         run: php tests/test-installer-pin-provenance.php
       - name: Run handshake enrichment sender behavior tests (cinatra#2021 S6/eta, no WP install required)
         run: php tests/test-site-inventory-sender.php
+      - name: Run content read ability behavior tests (cinatra/post-read, cinatra#3745, no WP install required)
+        run: php tests/test-post-read.php
 
   js-tests:
     runs-on: ubuntu-latest
