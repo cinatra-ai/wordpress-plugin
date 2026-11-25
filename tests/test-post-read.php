@@ -56,10 +56,21 @@ if (!function_exists('sanitize_post')) {
     }
 }
 if (!function_exists('get_post')) {
-    /** The object cache: a test can make it hold an older copy than the database. */
+    /** As core: the object cache first; on a miss the row from the database, cached. */
     function get_post($id = null) {
-        return isset($GLOBALS['cinatra_test']['post_cache'][(int) $id]) ? new WP_Post($GLOBALS['cinatra_test']['post_cache'][(int) $id]) : null;
+        global $wpdb;
+        $id = (int) $id;
+        if (!isset($GLOBALS['cinatra_test']['post_cache'][$id])) {
+            if (!isset($wpdb->rows[$id])) {
+                return null;
+            }
+            $GLOBALS['cinatra_test']['post_cache'][$id] = $wpdb->rows[$id];
+        }
+        return new WP_Post($GLOBALS['cinatra_test']['post_cache'][$id]);
     }
+}
+if (!function_exists('clean_post_cache')) {
+    function clean_post_cache($id) { unset($GLOBALS['cinatra_test']['post_cache'][(int) $id]); }
 }
 if (!function_exists('wp_register_ability')) {
     function wp_register_ability($id, $args) {
@@ -136,11 +147,11 @@ function reset_fixture(array $overrides = []) {
         'current_user_id' => 3,
         'permalink_base'  => 'https://blog.example/',
         'post_cache'      => [],
-        // edit_post: the current user must be the post's author.
+        // edit_post as map_meta_cap decides it: on the post get_post() returns
+        // ( the object cache first ), the current user must be its author.
         'caps_fn'         => function ($cap, ...$args) {
-            global $wpdb;
-            $row = $wpdb->rows[(int) ($args[0] ?? 0)] ?? null;
-            return 'edit_post' === $cap && null !== $row && (int) $GLOBALS['cinatra_test']['current_user_id'] === (int) $row['post_author'];
+            $post = get_post((int) ($args[0] ?? 0));
+            return 'edit_post' === $cap && null !== $post && (int) $GLOBALS['cinatra_test']['current_user_id'] === (int) $post->post_author;
         },
     ], $overrides);
 }
@@ -192,13 +203,23 @@ $attachment = cinatra_ability_post_read(['post_id' => 7]);
 reset_fixture(['current_user_id' => 5]);
 $forbidden = cinatra_ability_post_read(['post_id' => T_ID]);
 check('missing post -> not_found', false === $missing['success'] && 'not_found' === $missing['code']);
-check('a post of another type ( attachment ) -> the same not_found', $missing === $attachment);
-check('a post the caller may not edit -> the same not_found, no content', $missing === $forbidden && !isset($forbidden['post_content']));
+check('a post of another type ( attachment ) -> the same not_found', json_encode($missing) === json_encode($attachment));
+check('a post the caller may not edit -> the same not_found, no content', json_encode($missing) === json_encode($forbidden) && !isset($forbidden['post_content']));
 check('refusal shape: success, code, message, data; no "error" key', ['success', 'code', 'message', 'data'] === array_keys($missing));
 foreach ([0, -1, '0', 'abc', '1e3', null, 4.2] as $bad) {
     check('post_id ' . var_export($bad, true) . ' -> not_found, no statement', 'not_found' === cinatra_ability_post_read(['post_id' => $bad])['code']);
 }
 check('not an object -> not_found', 'not_found' === cinatra_ability_post_read('42')['code']);
+
+echo "Permission decided on the row read, not a stale cache copy\n";
+reset_fixture(['post_cache' => [T_ID => t_row(T_ID, 'page', ['post_author' => '5'])]]);
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('a stale cached copy with another author does not deny the current author', true === ($r['success'] ?? null));
+reset_fixture(['post_cache' => [T_ID => t_row(T_ID, 'page')]]);
+$wpdb->rows[T_ID]['post_author'] = '5';
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('a stale cached copy naming the caller as author does not allow a row the caller may not edit: not_found, no content', 'not_found' === ($r['code'] ?? null) && !isset($r['post_content']));
+check('a refusal\'s data serialises as a JSON object', '{}' === json_encode($r['data']) && 1 === preg_match('/"data":\{\}/', json_encode($r)));
 
 echo "Failed read\n";
 reset_fixture();

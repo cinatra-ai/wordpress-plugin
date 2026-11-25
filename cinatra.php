@@ -4348,7 +4348,8 @@ function cinatra_content_refusal( string $code, string $message, array $data = a
 		'success' => false,
 		'code'    => $code,
 		'message' => $message,
-		'data'    => $data,
+		// An empty array would serialise as [ ]; the schema declares an object.
+		'data'    => array() === $data ? new stdClass() : $data,
 	);
 }
 
@@ -4371,6 +4372,12 @@ function cinatra_content_not_found(): array {
  * post of another type and a post the user may not edit all give the same
  * not_found. A failed read is db_error, never not_found.
  *
+ * Core resolves edit_post on the post that get_post() returns, which
+ * may be an older copy in the object cache ( for example with another
+ * author ). So the post's cache entry is cleared first ( clean_post_cache() ),
+ * and core loads the current row for the decision: the state just read,
+ * unless another save commits in between.
+ *
  * @param int $id Post ID.
  * @return array{0:array<string,mixed>|null,1:array<string,string>|null} The refusal, or null and the row.
  */
@@ -4383,8 +4390,11 @@ function cinatra_content_permitted_row( int $id ): array {
 		}
 		return array( cinatra_content_not_found(), null );
 	}
-	if ( ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true )
-		|| ! current_user_can( 'edit_post', $id ) ) { // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
+	if ( ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
+		return array( cinatra_content_not_found(), null );
+	}
+	clean_post_cache( $id );
+	if ( ! current_user_can( 'edit_post', $id ) ) { // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
 		return array( cinatra_content_not_found(), null );
 	}
 	return array( null, $row );
