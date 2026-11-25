@@ -4374,9 +4374,11 @@ function cinatra_content_not_found(): array {
  *
  * Core resolves edit_post on the post that get_post() returns, which
  * may be an older copy in the object cache ( for example with another
- * author ). So the post's cache entry is cleared first ( clean_post_cache() ),
- * and core loads the current row for the decision: the state just read,
- * unless another save commits in between.
+ * author ). So only this post's own object-cache entry is dropped first
+ * ( wp_cache_delete( $id, 'posts' ), which fires no hook and touches nothing
+ * else ), and core loads the current row for the decision: the state just
+ * read, unless another save commits in between. No broader clean-up runs
+ * before the caller is authorised.
  *
  * @param int $id Post ID.
  * @return array{0:array<string,mixed>|null,1:array<string,string>|null} The refusal, or null and the row.
@@ -4393,7 +4395,7 @@ function cinatra_content_permitted_row( int $id ): array {
 	if ( ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
 		return array( cinatra_content_not_found(), null );
 	}
-	clean_post_cache( $id );
+	wp_cache_delete( $id, 'posts' );
 	if ( ! current_user_can( 'edit_post', $id ) ) { // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
 		return array( cinatra_content_not_found(), null );
 	}

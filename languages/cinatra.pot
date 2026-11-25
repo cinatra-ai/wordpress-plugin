@@ -9,7 +9,7 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-11-25T21:01:47+00:00\n"
+"POT-Creation-Date: 2026-11-25T21:18:03+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: cinatra\n"
@@ -18,7 +18,7 @@ msgstr ""
 #. Author of the plugin
 #: cinatra.php
 #: cinatra.php:437
-#: cinatra.php:4534
+#: cinatra.php:4536
 msgid "Cinatra"
 msgstr ""
 
@@ -426,30 +426,30 @@ msgstr ""
 msgid "The post does not exist or you are not allowed to edit it."
 msgstr ""
 
-#: cinatra.php:4389
+#: cinatra.php:4391
 msgid "The database could not read the post."
 msgstr ""
 
-#: cinatra.php:4493
+#: cinatra.php:4495
 msgid "Refusal code, present only when success is false."
 msgstr ""
 
-#: cinatra.php:4508
+#: cinatra.php:4510
 msgid "SHA-256 fingerprint of every column of the posts row as read ( meta and terms are outside it )."
 msgstr ""
 
-#: cinatra.php:4535
+#: cinatra.php:4537
 msgid "Cinatra abilities for reading a post and writing a reviewed change to it."
 msgstr ""
 
-#: cinatra.php:4556
+#: cinatra.php:4558
 msgid "Read a post for review"
 msgstr ""
 
-#: cinatra.php:4557
+#: cinatra.php:4559
 msgid "Read the raw stored title, content, excerpt, status, type, permalink and post_modified_gmt of a post or page, fresh from the database, with the row_token of the whole row."
 msgstr ""
 
-#: cinatra.php:4565
+#: cinatra.php:4567
 msgid "The numeric ID of the post or page."
 msgstr ""

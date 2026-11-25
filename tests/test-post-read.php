@@ -69,8 +69,22 @@ if (!function_exists('get_post')) {
         return new WP_Post($GLOBALS['cinatra_test']['post_cache'][$id]);
     }
 }
+if (!function_exists('wp_cache_delete')) {
+    /** The posts group of the object cache: drops one entry, nothing else. */
+    function wp_cache_delete($key, $group = '') {
+        $GLOBALS['cinatra_test']['cache_deletes'][] = [$key, $group];
+        if ('posts' === $group) {
+            unset($GLOBALS['cinatra_test']['post_cache'][(int) $key]);
+        }
+        return true;
+    }
+}
 if (!function_exists('clean_post_cache')) {
-    function clean_post_cache($id) { unset($GLOBALS['cinatra_test']['post_cache'][(int) $id]); }
+    /** Core's broad clean-up ( post, meta, terms, queries, hooks ): recorded so a test can assert it never runs. */
+    function clean_post_cache($id) {
+        $GLOBALS['cinatra_test']['clean_post_cache'][] = (int) $id;
+        unset($GLOBALS['cinatra_test']['post_cache'][(int) $id]);
+    }
 }
 if (!function_exists('wp_register_ability')) {
     function wp_register_ability($id, $args) {
@@ -219,6 +233,7 @@ reset_fixture(['post_cache' => [T_ID => t_row(T_ID, 'page')]]);
 $wpdb->rows[T_ID]['post_author'] = '5';
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
 check('a stale cached copy naming the caller as author does not allow a row the caller may not edit: not_found, no content', 'not_found' === ($r['code'] ?? null) && !isset($r['post_content']));
+check('the denied call performs no broad cache clean-up: only this post\'s posts-group entry is dropped', [] === ($GLOBALS['cinatra_test']['clean_post_cache'] ?? []) && [[T_ID, 'posts']] === $GLOBALS['cinatra_test']['cache_deletes']);
 check('a refusal\'s data serialises as a JSON object', '{}' === json_encode($r['data']) && 1 === preg_match('/"data":\{\}/', json_encode($r)));
 
 echo "Failed read\n";
