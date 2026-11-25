@@ -386,7 +386,8 @@ function wp_verify_nonce($nonce, $action = -1) {
         ? 1 : false;
 }
 function wp_generate_uuid4() { return '00000000-0000-4000-8000-000000000000'; }
-function wp_unslash($v) { return is_string($v) ? stripslashes($v) : $v; }
+/** As core: recursive over arrays. */
+function wp_unslash($v) { return is_array($v) ? array_map('wp_unslash', $v) : (is_string($v) ? stripslashes($v) : $v); }
 
 // ---------------------------------------------------------------------------
 // Transients (in-memory)

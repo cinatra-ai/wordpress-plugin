@@ -4452,7 +4452,40 @@ function cinatra_content_shape_row( array $row ): array {
 		'post_type'         => (string) $row['post_type'],
 		'post_modified_gmt' => (string) $row['post_modified_gmt'],
 		'permalink'         => is_string( $permalink ) ? $permalink : '',
+		'row_token'         => cinatra_content_row_token( $row ),
 	);
+}
+
+/**
+ * The row token: a fingerprint of EVERY column of the posts row, so a write
+ * can tell whether anything in the row changed since the read, also within
+ * the same second ( post_modified_gmt has one-second resolution ).
+ *
+ * Canonical encoding, fixed and documented: the ASCII prefix
+ * "cinatra-post-row-v1", then each column in byte order of its name, as a
+ * 4-byte big-endian name length, the name, then "\x00" for NULL, or "\x01",
+ * a 4-byte big-endian value length and the value bytes as stored. SHA-256 of
+ * that, as 64 lower-case hex characters. The length prefixes make every
+ * encoding unambiguous ( no byte can move between columns unseen ). The
+ * token covers the posts row only: post meta and terms are outside it.
+ *
+ * @param array<string,mixed> $row A posts row as read ( SELECT * ).
+ * @return string The token.
+ */
+function cinatra_content_row_token( array $row ): string {
+	ksort( $row, SORT_STRING );
+	$encoded = 'cinatra-post-row-v1';
+	foreach ( $row as $name => $value ) {
+		$name     = (string) $name;
+		$encoded .= pack( 'N', strlen( $name ) ) . $name;
+		if ( null === $value ) {
+			$encoded .= "\x00";
+			continue;
+		}
+		$value    = (string) $value;
+		$encoded .= "\x01" . pack( 'N', strlen( $value ) ) . $value;
+	}
+	return hash( 'sha256', $encoded );
 }
 
 /**
@@ -4537,10 +4570,14 @@ function cinatra_content_parse_update_input( $input ): array {
 	}
 	$names = array_keys( $expected_in );
 	sort( $names );
-	$required = array_keys( $columns );
+	$required = array_merge( array_keys( $columns ), array( 'row_token' ) );
 	sort( $required );
 	if ( $names !== $required ) {
-		return cinatra_content_refusal( 'invalid', __( 'expected must hold exactly title, content, excerpt and status as read.', 'cinatra' ) );
+		return cinatra_content_refusal( 'invalid', __( 'expected must hold exactly title, content, excerpt, status and row_token as read.', 'cinatra' ) );
+	}
+	$row_token = $expected_in['row_token'];
+	if ( ! is_string( $row_token ) || 1 !== preg_match( '/^[0-9a-f]{64}$/', $row_token ) ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected.row_token must be the row_token of the read the change is based on.', 'cinatra' ) );
 	}
 	$expected = array();
 	foreach ( $columns as $name => $column ) {
@@ -4582,6 +4619,7 @@ function cinatra_content_parse_update_input( $input ): array {
 		'since'    => $since,
 		'fields'   => $fields,
 		'expected' => $expected,
+		'token'    => $row_token,
 		'status'   => $status,
 	);
 }
@@ -4598,6 +4636,49 @@ function cinatra_content_parse_update_input( $input ): array {
  */
 function cinatra_content_writable_statuses(): array {
 	return array( 'publish', 'draft' );
+}
+
+/**
+ * The columns of the post data wp_insert_post() builds, in its compact()
+ * order: what wp_insert_post_data and pre_post_update receive.
+ *
+ * @return string[] Column names.
+ */
+function cinatra_content_core_data_columns(): array {
+	return array( 'post_author', 'post_date', 'post_date_gmt', 'post_content', 'post_content_filtered', 'post_title', 'post_excerpt', 'post_status', 'post_type', 'comment_status', 'ping_status', 'post_password', 'post_name', 'to_ping', 'pinged', 'post_modified', 'post_modified_gmt', 'post_parent', 'menu_order', 'post_mime_type', 'guid' );
+}
+
+/**
+ * The columns a wp_insert_post_data result changes beyond what this save
+ * may store: every column except the free ones ( the written fields and
+ * the two modification times ) must come back exactly as given
+ * ( post_status included: it must stay what this save stores ), and no
+ * column may be added or removed.
+ *
+ * @param array<string,string> $given    The unslashed data passed to the filter.
+ * @param mixed                $filtered The filter's ( slashed ) result.
+ * @param string[]             $free     Columns the filter may change.
+ * @return string[] The conflicting columns; empty when none.
+ */
+function cinatra_content_policy_conflicts( array $given, $filtered, array $free ): array {
+	if ( ! is_array( $filtered ) ) {
+		return array( 'data' );
+	}
+	$filtered  = wp_unslash( $filtered );
+	$conflicts = array();
+	foreach ( array_unique( array_merge( array_keys( $given ), array_keys( $filtered ) ) ) as $column ) {
+		if ( ! array_key_exists( $column, $given ) || ! array_key_exists( $column, $filtered ) || ! is_scalar( $filtered[ $column ] ) ) {
+			$conflicts[] = (string) $column;
+			continue;
+		}
+		if ( in_array( $column, $free, true ) ) {
+			continue;
+		}
+		if ( (string) $filtered[ $column ] !== $given[ $column ] ) {
+			$conflicts[] = (string) $column;
+		}
+	}
+	return $conflicts;
 }
 
 /**
@@ -4621,10 +4702,13 @@ function cinatra_content_rollback( int $touched_id = 0 ): void {
  * Inside one transaction, with the post row locked: verify InnoDB, re-check
  * edit_post against the fresh row, refuse a post that is not published or a
  * draft, refuse when another user holds the edit lock, compare
- * post_modified_gmt and title, content, excerpt and status byte for byte, run
- * the per-field save filters over the written fields, fire pre_post_update,
- * and write only the written columns, post_status "draft" when asked and the
- * two modification times. COMMIT; then clean the cache and fire the hooks
+ * post_modified_gmt, title, content, excerpt and status byte for byte and the
+ * row token over every column, run the per-field save filters over the
+ * written fields, build core's full update data and run wp_insert_post_data
+ * over it ( refusing a result that changes anything this save does not
+ * write ), fire pre_post_update with the full filtered data, and write only
+ * the written columns, post_status "draft" when asked and the two
+ * modification times. COMMIT; then clean the cache and fire the hooks
  * core's wp_insert_post() fires on an update, in core's order with core's
  * arguments ( post_updated also makes core store the revision ). Any refusal
  * or error rolls back, writes nothing and fires no update hook.
@@ -4700,6 +4784,12 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 			$changed[] = $column;
 		}
 	}
+	// The whole row: also a same-second change of any other column ( slug,
+	// type, author, parent, dates, ... ). The field names above say what
+	// changed when it is one of them; the token catches everything else.
+	if ( ! hash_equals( cinatra_content_row_token( $row ), $parsed['token'] ) ) {
+		$changed[] = 'row_token';
+	}
 	if ( array() !== $changed ) {
 		cinatra_content_rollback();
 		return cinatra_content_refusal(
@@ -4710,35 +4800,69 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		);
 	}
 
-	// The values to write. Each written field runs through exactly the chain
-	// wp_insert_post() runs for it ( sanitize_post_field( ..., 'db' ):
-	// pre_post_<field> and <field>_save_pre, which carry kses for a user
-	// without unfiltered_html and the site's own save filters ). Those filters
-	// expect slashed data, as on a normal save. Untouched fields run through
-	// nothing and are not written.
-	$data = array();
+	// The written fields. Each runs through exactly the chain wp_insert_post()
+	// runs for it ( sanitize_post_field( ..., 'db' ): pre_post_<field> and
+	// <field>_save_pre, which carry kses for a user without unfiltered_html
+	// and the site's own save filters ). Those filters expect slashed data, as
+	// on a normal save.
+	$written = array();
 	foreach ( $parsed['fields'] as $column => $value ) {
-		$data[ $column ] = wp_unslash( sanitize_post_field( $column, wp_slash( $value ), $id, 'db' ) );
+		$written[ $column ] = wp_unslash( sanitize_post_field( $column, wp_slash( $value ), $id, 'db' ) );
 		if ( 'utf8' === $wpdb->get_col_charset( $wpdb->posts, $column ) ) {
 			// As wp_insert_post(): a utf8 ( not utf8mb4 ) column stores emoji as entities.
-			$data[ $column ] = wp_encode_emoji( $data[ $column ] );
+			$written[ $column ] = wp_encode_emoji( $written[ $column ] );
 		}
 	}
-	$after = array_merge( $row, $data );
+	$after = array_merge( $row, $written );
 	if ( '' === (string) $after['post_title'] && '' === (string) $after['post_content'] && '' === (string) $after['post_excerpt'] ) {
 		cinatra_content_rollback();
 		return cinatra_content_refusal( 'invalid', __( 'Title, content and excerpt cannot all be empty.', 'cinatra' ), $current_modified );
 	}
 	if ( null !== $parsed['status'] ) {
-		$data['post_status'] = 'draft'; // The literal value: never a filtered one.
+		$written['post_status'] = 'draft'; // The literal value asked for.
 	}
-	$data['post_modified']     = current_time( 'mysql' );
-	$data['post_modified_gmt'] = current_time( 'mysql', 1 );
+	$written['post_modified']     = current_time( 'mysql' );
+	$written['post_modified_gmt'] = current_time( 'mysql', 1 );
+
+	// The full post data, as wp_insert_post() builds it for an update ( its
+	// compact() column list and order ): the locked row, with the written
+	// fields, the status and the new modification times.
+	$prospective = array();
+	foreach ( cinatra_content_core_data_columns() as $column ) {
+		$prospective[ $column ] = array_key_exists( $column, $written ) ? $written[ $column ] : (string) $row[ $column ];
+	}
+
+	// The site's save policy, as on every core save: wp_insert_post_data with
+	// core's arguments, slashed as core passes it. This save takes the
+	// filter's result for the written fields and the modification times
+	// ( core stores whatever the filter returns ). A policy that changes
+	// anything else ( the status this save stores, or any column this save
+	// does not write ) cannot be applied without a wider write than the one
+	// checked: refuse before anything is written or fired.
+	$postarr             = wp_slash( array_merge( $prospective, array( 'ID' => $id ) ) );
+	$unsanitized_postarr = wp_slash( array_merge( $prospective, $parsed['fields'], array( 'ID' => $id ) ) );
+	/** This filter is documented in wp-includes/post.php. */
+	$filtered = apply_filters( 'wp_insert_post_data', wp_slash( $prospective ), $postarr, $unsanitized_postarr, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own save filter, run as wp_insert_post() runs it.
+	$conflict = cinatra_content_policy_conflicts( $prospective, $filtered, array_diff( array_keys( $written ), array( 'post_status' ) ) );
+	if ( array() !== $conflict ) {
+		cinatra_content_rollback();
+		return cinatra_content_refusal(
+			'site_policy_conflict',
+			__( 'A site save policy ( wp_insert_post_data ) would change parts of the post this ability does not write. Nothing was written.', 'cinatra' ),
+			$current_modified,
+			array( 'changed' => $conflict )
+		);
+	}
+	$filtered = wp_unslash( $filtered );
+	$data     = array();
+	foreach ( array_keys( $written ) as $column ) {
+		$data[ $column ] = (string) $filtered[ $column ];
+	}
 
 	$post_before = get_post( $id ); // The locked row ( primed in the object cache above ).
 
-	/** This action is documented in wp-includes/post.php ( fired by core right before the update ). */
-	do_action( 'pre_post_update', $id, $data ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook, fired where wp_insert_post() fires it.
+	/** This action is documented in wp-includes/post.php ( fired by core right before the update, with the full unslashed data ). */
+	do_action( 'pre_post_update', $id, $filtered ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook, fired where wp_insert_post() fires it.
 
 	$updated = $wpdb->update( $wpdb->posts, $data, array( 'ID' => $id ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The narrow write itself; the cache is cleaned after the commit.
 	// MySQL reports CHANGED rows: 0 means the locked row already held these
@@ -4820,6 +4944,11 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 		'post_type'         => array( 'type' => 'string' ),
 		'post_modified_gmt' => array( 'type' => 'string' ),
 		'permalink'         => array( 'type' => 'string' ),
+		'row_token'         => array(
+			'type'        => 'string',
+			'pattern'     => '^[0-9a-f]{64}$',
+			'description' => __( 'SHA-256 fingerprint of every column of the posts row as read ( meta and terms are outside it ). Send it back as expected.row_token.', 'cinatra' ),
+		),
 	);
 	if ( $with_sanitized ) {
 		$properties['sanitized_fields'] = array(
@@ -4927,14 +5056,19 @@ function cinatra_register_content_abilities(): void {
 					'expected'            => array(
 						'type'                 => 'object',
 						'properties'           => array(
-							'title'   => $text,
-							'content' => $text,
-							'excerpt' => $text,
-							'status'  => $text,
+							'title'     => $text,
+							'content'   => $text,
+							'excerpt'   => $text,
+							'status'    => $text,
+							'row_token' => array(
+								'type'        => 'string',
+								'pattern'     => '^[0-9a-f]{64}$',
+								'description' => __( 'The row_token returned by cinatra/post-read for the read the change is based on.', 'cinatra' ),
+							),
 						),
-						'required'             => array( 'title', 'content', 'excerpt', 'status' ),
+						'required'             => array( 'title', 'content', 'excerpt', 'status', 'row_token' ),
 						'additionalProperties' => false,
-						'description'          => __( 'The title, content, excerpt and status as read, byte for byte; always all four.', 'cinatra' ),
+						'description'          => __( 'The title, content, excerpt and status as read, byte for byte, and the row_token of that read; always all five.', 'cinatra' ),
 					),
 					'title'               => $text,
 					'content'             => $text,

@@ -79,13 +79,23 @@ invokes them.
 
 **`cinatra/post-read`** (read-only). Input: `post_id`. Output: the raw stored
 `post_title`, `post_content`, `post_excerpt`, `post_status`, `post_type`,
-`post_modified_gmt` and `permalink` of a post or page. The values come directly
-from the database, not from a cache.
+`post_modified_gmt` and `permalink` of a post or page, and `row_token`. The
+values come directly from the database, not from a cache.
+
+`row_token` is a fingerprint of every column of the post's row in the posts
+table, computed from the same row that the read returns. It is the SHA-256
+hash, as 64 lower-case hexadecimal characters, of this encoding: the ASCII text
+`cinatra-post-row-v1`, then each column in byte order of its name, as a 4-byte
+big-endian length of the name, the name, then the byte `0x00` for NULL, or the
+byte `0x01`, a 4-byte big-endian length of the value and the value as stored.
+The token covers the posts row only. Post meta and terms (categories, tags)
+are not in the row, so the token does not show changes to them.
 
 **`cinatra/post-update-if-unchanged`**. Input: `post_id`,
 `if_unmodified_since` (the `post_modified_gmt` of the read that the change is
-based on), `expected` (the `title`, `content`, `excerpt` and `status` from that
-read), and one or more of `title`, `content`, `excerpt` and `status`.
+based on), `expected` (the `title`, `content`, `excerpt`, `status` and
+`row_token` from that read), and one or more of `title`, `content`, `excerpt`
+and `status`.
 
 The ability changes only the fields that it is asked to change. In one database
 transaction, it does these steps:
@@ -93,27 +103,35 @@ transaction, it does these steps:
 1. It locks the post row.
 2. It checks the `edit_post` capability again against the row that it locked.
    Thus a change of author or type before the lock is seen.
-3. It compares `post_modified_gmt` and all four `expected` values byte for
-   byte. If another save occurred between the read and the write, also a save
-   in the same second or a save of a field that this write does not change,
-   the write is refused.
-4. It writes only the requested fields, `post_status` `draft` when requested,
-   and the two modification times, with one database update.
+3. It compares `post_modified_gmt`, the four `expected` values byte for byte,
+   and `expected.row_token` with the token of the locked row. If another save
+   occurred between the read and the write, also a save in the same second or
+   a save of any other column of the row (for example the slug, the type or
+   the author), the write is refused.
+4. It builds the full post data as WordPress does for an update and runs the
+   site's `wp_insert_post_data` filters over it (see below).
+5. It runs `pre_post_update` with that full data, and then writes only the
+   requested fields, `post_status` `draft` when requested, and the two
+   modification times, with one database update.
 
 If a step refuses, the transaction is rolled back, nothing is written, and no
 WordPress update hook runs.
 
-- `expected` must always contain all four values, `title`, `content`,
-  `excerpt` and `status`, exactly as the read returned them, also for fields
-  that are not written. For example, a change to draft only sends all four
-  values in `expected` and `"status": "draft"`.
+- `expected` must always contain all five values, `title`, `content`,
+  `excerpt`, `status` and `row_token`, exactly as the read returned them, also
+  for fields that are not written. For example, a change to draft only sends
+  all five values in `expected` and `"status": "draft"`. A change to any
+  column of the row refuses with `post_changed`. `data.changed` names
+  `post_modified_gmt` and each of the four fields that differ, and
+  `row_token` when the row differs at all.
 - The ability writes only published posts and drafts. Other statuses have
   their own WordPress flows and are refused with `unsupported_status`:
   `trash` (restoring from the trash goes through WordPress's untrash flow),
   `future`, `private`, `pending` and `auto-draft`.
-- `status` may only be `"draft"`. The ability stores the value `draft` itself,
-  so no filter can make it publish. If `status` is not given, the status does
-  not change. Thus an edit to a published page is live immediately.
+- `status` may only be `"draft"`. If `status` is not given, the status does
+  not change. Thus an edit to a published page is live immediately. The
+  ability never publishes: a site filter that would change the status is
+  refused (see below).
 - Each written field goes through the same save filters that WordPress applies
   to that field on a normal save by that user, including the site's own save
   filters. For users without the `unfiltered_html` capability, WordPress
@@ -133,12 +151,23 @@ WordPress update hook runs.
   arguments: `transition_post_status` (with `{old}_to_{new}` and
   `{new}_{post_type}`), `edit_post_{post_type}`, `edit_post`, `post_updated`
   (WordPress then stores a revision), `save_post_{post_type}`, `save_post`,
-  `wp_insert_post` and `wp_after_insert_post`. `pre_post_update` runs before
-  the update, inside the transaction, as in WordPress. It is an action, so it
-  cannot stop the write.
-- Other plugins' `wp_insert_post_data` filters do not run for this write. These
-  filters work on all fields of a post, and the ability changes only the
-  requested fields.
+  `wp_insert_post` and `wp_after_insert_post`.
+- The site's save policy applies. As in WordPress, the ability builds the
+  full post data (all the columns that WordPress builds for an update: the
+  locked row with the requested fields, the status and the new modification
+  times) and passes it, slashed, through `wp_insert_post_data` with the same
+  arguments as WordPress (the data, the post array, the unsanitized post
+  array, and `true` for an update). The stored values of the requested fields
+  and the modification times are the filters' results. `sanitized_fields`
+  also names a field that one of these filters changed. If a filter changes
+  the status that this save stores, or any column that this save does not
+  write (for example the slug, the author or a date), or adds or removes a
+  column, the write is refused with `site_policy_conflict`. `data.changed`
+  names those columns. Nothing is written, and no hook runs.
+- `pre_post_update` runs after the filters, with the full filtered data,
+  unslashed, inside the transaction, before the update, as in WordPress. It
+  runs only when the write goes ahead. It is an action, so it cannot stop the
+  write.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines
@@ -153,8 +182,10 @@ answer.
 A refusal is a normal result, not an error:
 `{ "success": false, "code": "...", "message": "...", "data": { "current_modified_gmt": ... } }`.
 The codes are `post_changed` (`data.changed` names the fields that differ),
-`post_locked` (another user is editing the post), `unsupported_status`
-(`data.current_status` names the status), `invalid`, `not_found`, `unsupported_storage`, `update_failed` and `db_error`. After a refusal, nothing
+`site_policy_conflict` (`data.changed` names the columns that a site filter
+would change), `post_locked` (another user is editing the post),
+`unsupported_status` (`data.current_status` names the status), `invalid`,
+`not_found`, `unsupported_storage` and `db_error`. After a refusal, nothing
 is written, and a refusal never contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call
