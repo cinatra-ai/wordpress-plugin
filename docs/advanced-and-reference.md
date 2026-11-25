@@ -227,55 +227,67 @@ made in the transaction are rolled back with it.
   write (for example the slug, the author or a date), or adds or removes a
   column, the write is refused with `site_policy_conflict`. `data.changed`
   names those columns. Nothing is written, and no after-save hook runs.
-- The ability proves three times that it is still in its own transaction on
-  its own connection: after the row lock and before any site code runs (the
-  permission check's filters, the save filters, `wp_insert_post_data`,
-  `pre_post_update`), right before the update, and after the update, right
-  before the `COMMIT`. Right after `START TRANSACTION`, before the locked
-  read, it sets a savepoint with a random name
-  (`SAVEPOINT cinatra_lock_<random>`). Each proof needs the same database
-  connection and a successful `RELEASE SAVEPOINT` of that name (the savepoint
-  is then set again). Outside a transaction MySQL and MariaDB accept
-  `SAVEPOINT` but keep nothing, so the `RELEASE` fails with error 1305; a
-  `COMMIT`, a statement that commits implicitly (also when a new transaction
-  is started afterwards) and a reconnect all remove the savepoint. This works
-  on MySQL and MariaDB without any privilege (`@@in_transaction` exists only
-  in MariaDB, and `information_schema.INNODB_TRX` needs the `PROCESS`
-  privilege).
-  - The first proof fails: no site code has run, so the write is refused
-    with `transaction_conflict` (`data.cause` `transaction_lost` or
-    `connection_replaced`) and nothing was written.
-  - The second proof fails: site code has run, and what it stored itself may
-    have been committed outside the transaction. The refusal says that the
-    post was not changed by this save and sets `data.site_changes_possible`
-    `true`.
-  - The third proof is the one that decides. WordPress runs the site's
-    `query` filters on every statement that the ability sends, so site code
-    can run between any two of them, also between the second proof and the
-    update (a filter that commits there makes the update run with
-    autocommit, where it is durable at once). No condition inside the
-    update can tell, on both MySQL and MariaDB, whether it runs inside the
-    transaction, and WordPress offers no supported way to send a statement
-    without the `query` filters. So the write is proven after it ran. If the
-    proof fails, the update cannot be undone: the ability reads the row and
-    answers `write_outcome_unknown` (`data.cause` `matches`, `differs` or
-    `unreadable`) with `data.site_changes_possible` `true`, never a success
-    and never "nothing was written", and no after-save hook runs. A refusal
-    that was decided after the update is checked the same way: if the
-    transaction was lost and the update changed no row, the refusal stands
-    with `data.site_changes_possible` `true`; otherwise the row is read as
-    above.
-  - What remains: a filter that commits at the ability's own `COMMIT` (after
-    the third proof) commits the same proven work, so the answer stays
-    correct. Site code that reads the savepoint name from the statement and
-    sets it again in a new transaction after committing can defeat the
-    proof; that is deliberate interference, which no check on the same
-    connection can rule out.
+- The ability owns exactly one transaction, and it claims an outcome only
+  while it can show that this transaction is intact:
+  - At the start, it reads this session's statement counters
+    (`SHOW SESSION STATUS`: `Questions`, `Com_commit`, `Com_rollback`; no
+    privilege needed), sends `START TRANSACTION` and three savepoints with a
+    random name (`cinatra_lock_<random>_1` to `_3`), and reads the counters
+    again. They must show exactly these statements: no site code (a `query`
+    filter) ran a statement in between.
+  - After the row lock, before any site code runs (the permission check's
+    filters, the save filters, `wp_insert_post_data`, `pre_post_update`),
+    and again right before the update, it releases one savepoint
+    (`RELEASE SAVEPOINT`, the last one first; none is set again). Outside a
+    transaction MySQL and MariaDB accept `SAVEPOINT` but keep nothing, and a
+    `COMMIT`, a `ROLLBACK`, a statement that commits implicitly, a new
+    transaction and a reconnect remove all savepoints, so the release fails.
+    The connection object must also be the same one.
+  - It ends with `COMMIT` or `ROLLBACK` in a second counted window: counters,
+    the session settings, the release of the first savepoint, the `COMMIT`
+    or `ROLLBACK`, counters. The counters must show exactly these statements
+    and one `COMMIT` or one `ROLLBACK`, and every statement must succeed on
+    the same connection object.
+  - If any of this cannot be shown (site code committed, rolled back or
+    began a transaction, a savepoint is gone, the connection was replaced, or
+    an update, `COMMIT` or `ROLLBACK` was not acknowledged), the ability
+    sends nothing more on the connection: no `ROLLBACK`, no `COMMIT`, no
+    retry, because a transaction that is open now is not its own. It runs no
+    after-save hook. It reads the row and answers `write_outcome_unknown`
+    with `data.site_changes_possible` `true`: `data.cause` is `matches` only
+    if the row is exactly the intended row, otherwise `differs` (also when
+    the row is the row before the save: that does not prove that nothing was
+    written) or `unreadable`. The answer is never a success and never says
+    that nothing was written.
+  - So "refused, nothing written" and "saved" are answered only when the
+    transaction was shown intact up to and including its own acknowledged
+    `COMMIT` or `ROLLBACK`. After a shown `COMMIT` no transaction is open:
+    `completion_type` `NO_CHAIN` starts none, and with `autocommit` 1 the
+    last counter read starts none. Only then do the after-save and revision
+    hooks run.
+  - The proof depends on `autocommit` 1 and `completion_type` `NO_CHAIN`
+    (read before the start and again in the last window) and on readable
+    session counters. A session with `completion_type` `CHAIN` or `RELEASE`
+    is refused with `transaction_conflict` (`data.cause`
+    `completion_type`); unreadable counters with `unsupported_storage`.
+    Both are refused before anything is written.
+  - What remains: site code that reads the savepoint names from the
+    statements, ends the transaction, begins a new one and sets the same
+    names again before the next release, or that rewrites the ability's own
+    statements in its `query` filter, is deliberate interference that no
+    check on the same connection can rule out. No portable statement can
+    tell inside the update itself whether it runs in this transaction
+    (`@@in_transaction` exists only in MariaDB, and
+    `information_schema.INNODB_TRX` needs the `PROCESS` privilege), and
+    WordPress offers no supported way to send a statement without the
+    `query` filters.
 - A failed database read is a database error, never `not_found`: the locked
   read, the engine check and the read of `cinatra/post-read` answer
   `db_error` with `data.cause` `lock_wait_timeout` (error 1205, another save
-  holds the row lock), `deadlock` (error 1213) or `read_failed`, after a
-  `ROLLBACK`. A row that does not exist stays `not_found`.
+  holds the row lock) or `read_failed`, after a `ROLLBACK`. A row that does
+  not exist stays `not_found`. A deadlock (error 1213) makes InnoDB roll the
+  whole transaction back, which removes the savepoints, so the write then
+  answers `write_outcome_unknown`; `deadlock` remains a cause of the read.
 - The update itself is conditional: `WHERE ID = <id>` and, for every column
   of the locked row (the columns that the row token covers), `col IS NULL`
   when the column was NULL, otherwise
@@ -312,12 +324,13 @@ made in the transaction are rolled back with it.
   outside the database (the object cache, files, emails, HTTP requests) are
   not rolled back. A callback that ends the transaction itself (`COMMIT`, or
   a statement that commits implicitly, such as `CREATE TABLE`) also commits
-  the changes made up to that point, so a later refusal cannot roll them
-  back.
+  the changes made up to that point; the answer is then
+  `write_outcome_unknown` (see above).
 - If a callback throws an exception or an error inside the transaction, the
-  transaction is rolled back, and the exception continues to the caller
-  unchanged. If a callback ends the request inside the transaction (`exit`
-  or `wp_die()`), the ability rolls back on WordPress's `shutdown` action,
+  transaction is rolled back (only while it is shown intact, as above), and
+  the exception continues to the caller unchanged. If a callback ends the
+  request inside the transaction (`exit` or `wp_die()`), the ability rolls
+  back the same way on WordPress's `shutdown` action,
   before the other shutdown callbacks, on the same database connection.
   This cannot cover a PHP shutdown function that a site registered before
   WordPress loaded (it runs earlier, inside the open transaction), a process
@@ -334,6 +347,8 @@ made in the transaction are rolled back with it.
     unchanged. A call from a hook after the commit is not nested.
   - `autocommit_off`: the connection has `autocommit` set to 0. Then a
     transaction is always open, so the write cannot own one.
+  - `completion_type`: the session's `completion_type` is not `NO_CHAIN`, so
+    the end of the write's transaction would start a new one or disconnect.
   - `open_transaction`: another transaction is open on the connection, also
     one that has not written anything yet.
 
@@ -346,26 +361,10 @@ made in the transaction are rolled back with it.
   removes its savepoint with `RELEASE SAVEPOINT`. None of these statements
   commits a transaction. The name has a random part for each call, because a
   `SAVEPOINT` replaces a savepoint of the same name. The expected error is
-  kept out of the database error output. Reading `autocommit` must work, and
+  kept out of the database error output. Reading the session settings must work, and
   the probe must give one of these two answers: any other result (another
   error, or a connection that reports no error number) refuses the write
   with `unsupported_storage`, without starting a transaction.
-- A `COMMIT` counts only when it succeeds on the connection that started the
-  transaction. If it fails (the server may have committed and only the
-  answer was lost), or WordPress reconnected during the save (it repeats a
-  statement on a new connection after "server has gone away"; the server
-  then rolled the transaction back, and later statements ran outside it), the
-  outcome is unknown until the ability reads the row again, after a
-  `ROLLBACK` and a connection check (`wpdb::check_connection()`). The answer
-  is then never a success, and no after-save hook runs: after the `ROLLBACK`
-  the row is no longer locked, so another save can store the very values and
-  times that this save intended, and a row equal to the intended one does not
-  prove that this save stored it. If the row is the row before the save,
-  nothing was written (`db_error`, or the refusal that was decided).
-  Otherwise the answer is `write_outcome_unknown`: `data.cause` is `matches`
-  (the row holds exactly the intended change), `differs` (it holds something
-  else) or `unreadable`, and the caller must read the post before it tries
-  again.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines
@@ -408,16 +407,13 @@ the current post; this shows that the post exists), `transaction_conflict`
 (`data.cause` names the reason), `empty_content`,
 `invalid`, `not_found`, `unsupported_storage`, `db_error` and
 `write_outcome_unknown` (`data.cause` is `matches`, `differs` or
-`unreadable`: the database did not confirm the save, or the transaction was
-found lost after the write, and it is not known whether this save stored the
-change; with `data.site_changes_possible` `true`, site code may also have
-stored changes). `db_error` carries `data.cause` `lock_wait_timeout`,
-`deadlock` or `read_failed` when a read failed. A refusal with
-`data.site_changes_possible` `true` (`transaction_conflict`, or another code
-whose transaction was found lost after the write changed no row) means that
-this save did not change the post, but site code that ran during the save may
-have stored changes of its own. After any other refusal, nothing is written. A refusal never
-contains post content.
+`unreadable`, always with `data.site_changes_possible` `true`: the ability
+could not show that its transaction stayed its own through the end of the
+save, so it is not known what this save or site code stored; read the post
+before trying again). `db_error` carries `data.cause` `lock_wait_timeout`,
+`deadlock` or `read_failed` when a read failed. After any refusal other than
+`write_outcome_unknown`, nothing is written. A refusal never contains post
+content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call
 by a user who is not logged in, before the ability runs. An MCP client then

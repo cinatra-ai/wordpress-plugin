@@ -715,7 +715,7 @@ try {
 	);
 
 	cinatra_it_case(
-		'pre_post_update callback COMMITs, a second connection saves the content -> transaction_conflict ( transaction_lost ), the other save intact',
+		'pre_post_update callback COMMITs and begins, a second connection saves the content -> write_outcome_unknown ( differs ), the other save intact',
 		function () {
 			global $wpdb;
 			$id     = cinatra_it_post( 'publish', 'body' );
@@ -737,15 +737,17 @@ try {
 			} finally {
 				remove_action( 'pre_post_update', $commit );
 				mysqli_close( $other );
+				// The callback's transaction is the callback's: the ability left it open.
+				$wpdb->query( 'COMMIT' );
 			}
-			cinatra_it_assert( cinatra_it_refused( $result, 'transaction_conflict', 'transaction_lost' ), 'the write was not refused as transaction_lost', $result );
+			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'differs' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'the lost transaction was not answered write_outcome_unknown ( differs )', $result );
 			cinatra_it_assert( 'cinatra-it saved by another connection' === cinatra_it_row( $id )['post_content'], 'the other connection\'s save was overwritten', cinatra_it_row( $id )['post_content'] );
-			return 'cause=transaction_lost, other save intact';
+			return 'cause=differs, other save intact';
 		}
 	);
 
 	cinatra_it_case(
-		'a query filter ends the transaction before the locked read -> transaction_conflict ( transaction_lost ); no permission filter, save filter or pre_post_update runs, no UPDATE is sent',
+		'a query filter ends the transaction before the locked read -> write_outcome_unknown ( differs ); no permission filter, save filter or pre_post_update runs, no UPDATE is sent',
 		function () {
 			global $wpdb;
 			$id      = cinatra_it_post( 'publish', 'body' );
@@ -792,12 +794,145 @@ try {
 					return 0 === strpos( ltrim( $sql ), 'UPDATE `' . $wpdb->posts . '`' );
 				}
 			);
-			cinatra_it_assert( cinatra_it_refused( $result, 'transaction_conflict', 'transaction_lost' ) && ! isset( $result['data']['site_changes_possible'] ), 'the lost transaction was not refused before any callback', $result );
+			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'differs' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'the lost transaction was not answered write_outcome_unknown ( differs )', $result );
 			cinatra_it_assert( 0 === $ran, 'a save filter or pre_post_update ran although the transaction was lost', $ran );
 			cinatra_it_assert( 0 === $caps, 'the permission check ran although the transaction was lost', $caps );
 			cinatra_it_assert( array() === $updates, 'an UPDATE of the posts table was sent', array_values( $updates ) );
 			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
 			return 'refused before any callback';
+		}
+	);
+
+	cinatra_it_case(
+		'SET completion_type = CHAIN -> transaction_conflict ( completion_type ) before anything is written',
+		function () {
+			global $wpdb;
+			$id     = cinatra_it_post( 'publish', 'body' );
+			$read   = cinatra_it_read( $id );
+			$before = cinatra_it_row( $id );
+			$wpdb->query( "SET SESSION completion_type = 'CHAIN'" );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
+			} finally {
+				$wpdb->query( "SET SESSION completion_type = 'NO_CHAIN'" );
+			}
+			cinatra_it_assert( cinatra_it_refused( $result, 'transaction_conflict', 'completion_type' ), 'CHAIN was not refused up front', $result );
+			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
+			return 'refused before START TRANSACTION';
+		}
+	);
+
+	cinatra_it_case(
+		'pre_post_update commits, begins and writes its own row -> write_outcome_unknown; the ability sends no ROLLBACK, so the independent write survives',
+		function () {
+			global $wpdb;
+			$id     = cinatra_it_post( 'publish', 'body' );
+			$read   = cinatra_it_read( $id );
+			$before = cinatra_it_row( $id );
+			$own    = function ( $post_id ) use ( $id ) {
+				global $wpdb;
+				if ( (int) $post_id === $id ) {
+					$wpdb->query( 'COMMIT' );
+					$wpdb->query( 'START TRANSACTION' );
+					$wpdb->insert(
+						$wpdb->postmeta,
+						array(
+							'post_id'    => $id,
+							'meta_key'   => 'cinatra_it_independent',
+							'meta_value' => 'kept',
+						)
+					);
+				}
+			};
+			add_action( 'pre_post_update', $own );
+			cinatra_it_record();
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
+			} finally {
+				$GLOBALS['cinatra_it_recording'] = false;
+				remove_action( 'pre_post_update', $own );
+			}
+			$sent  = $GLOBALS['cinatra_it_sql'];
+			$start = array_search( 'START TRANSACTION', array_reverse( $sent, true ), true );
+			$after = false === $start ? array() : array_slice( $sent, $start + 1 );
+			// The callback's own transaction: it commits it.
+			$wpdb->query( 'COMMIT' );
+			$kept = $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = 'cinatra_it_independent'", $id ) );
+			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'differs' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'not answered write_outcome_unknown ( differs )', $result );
+			cinatra_it_assert( array() === array_intersect( array( 'ROLLBACK', 'COMMIT' ), $after ), 'the ability sent COMMIT or ROLLBACK into the callback\'s transaction', $after );
+			cinatra_it_assert( 'kept' === $kept, 'the callback\'s independent write was discarded', $kept );
+			cinatra_it_assert( cinatra_it_row( $id )['post_content'] === $before['post_content'], 'the ability wrote the content' );
+			return 'independent write kept';
+		}
+	);
+
+	cinatra_it_case(
+		'a query filter ROLLs BACK right before the COMMIT -> write_outcome_unknown ( differs ), never success, no after-save hook',
+		function () {
+			global $wpdb;
+			$id      = cinatra_it_post( 'publish', 'body' );
+			$read    = cinatra_it_read( $id );
+			$before  = cinatra_it_row( $id );
+			$updated = 0;
+			$after   = function ( $post_id ) use ( &$updated, $id ) {
+				if ( (int) $post_id === $id ) {
+					++$updated;
+				}
+			};
+			$undo    = function ( $query ) use ( &$undo ) {
+				global $wpdb;
+				if ( 'COMMIT' === trim( (string) $query ) ) {
+					remove_filter( 'query', $undo );
+					$wpdb->query( 'ROLLBACK' );
+				}
+				return $query;
+			};
+			add_action( 'post_updated', $after );
+			add_filter( 'query', $undo );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it rolled back by a filter' ) ) );
+			} finally {
+				remove_filter( 'query', $undo );
+				remove_action( 'post_updated', $after );
+			}
+			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'differs' ), 'the rolled-back write was not answered write_outcome_unknown ( differs )', $result );
+			cinatra_it_assert( 0 === $updated, 'after-save hooks ran for an absent write' );
+			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'the row changed (setup)' );
+			return 'cause=differs, no hook';
+		}
+	);
+
+	cinatra_it_case(
+		'a query filter COMMITs right before the ROLLBACK of a refusal -> write_outcome_unknown, never "nothing written"',
+		function () {
+			global $wpdb;
+			$id    = cinatra_it_post( 'publish', 'body' );
+			$read  = cinatra_it_read( $id );
+			$slug  = function ( $post_id ) use ( $id ) {
+				global $wpdb;
+				if ( (int) $post_id === $id ) {
+					$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->posts} SET post_name = 'cinatra-it-by-a-callback' WHERE ID = %d", $id ) );
+				}
+			};
+			$keep  = function ( $query ) use ( &$keep ) {
+				global $wpdb;
+				if ( 'ROLLBACK' === trim( (string) $query ) ) {
+					remove_filter( 'query', $keep );
+					$wpdb->query( 'COMMIT' );
+				}
+				return $query;
+			};
+			add_action( 'pre_post_update', $slug );
+			add_filter( 'query', $keep );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it refused write' ) ) );
+			} finally {
+				remove_filter( 'query', $keep );
+				remove_action( 'pre_post_update', $slug );
+			}
+			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'the refusal claimed nothing was written although its transaction was committed', $result );
+			cinatra_it_assert( 'cinatra-it-by-a-callback' === cinatra_it_row( $id )['post_name'], 'the committed change is missing (setup)' );
+			return 'cause=' . ( $result['data']['cause'] ?? '?' );
 		}
 	);
 
