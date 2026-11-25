@@ -68,6 +68,63 @@ The plugin registers one admin-gated REST endpoint under `wp-json/cinatra/v1/`:
 The earlier session-token and sign-in endpoints are removed. They existed to
 fetch a credential for the browser, and the browser no longer takes one.
 
+## Content abilities
+
+When the WordPress Abilities API (WordPress 6.9 or later) is present, the
+plugin registers two abilities in the `cinatra` category. The MCP Adapter
+exposes them as the MCP tools `cinatra-post-read` and
+`cinatra-post-update-if-unchanged`. Without the Abilities API, the plugin
+registers nothing and works as before. The abilities do nothing until a caller
+invokes them.
+
+**`cinatra/post-read`** (read-only). Input: `post_id`. Output: the raw stored
+`post_title`, `post_content`, `post_excerpt`, `post_status`, `post_type`,
+`post_modified_gmt` and `permalink` of a post or page. The values come directly
+from the database, not from a cache.
+
+**`cinatra/post-update-if-unchanged`**. Input: `post_id`,
+`if_unmodified_since` (the `post_modified_gmt` of the read that the change is
+based on), `expected` (the before-value of each field that is written), and one
+or more of `title`, `content`, `excerpt` and `status`. In one database
+transaction, the ability locks the post row, compares `post_modified_gmt` and
+each `expected` value byte for byte, and writes only when all of them are
+equal. If another save occurs between the read and the write, the write is
+refused and nothing is written. The byte comparison also finds a second save in
+the same second.
+
+- Each written field must have an `expected` entry. An `expected` entry for a
+  field that is not written is refused.
+- `status` may only be `"draft"`. It moves the post to draft in the same save,
+  for example when a review says to unpublish a published page. If `status` is
+  not given, the status does not change. Thus an edit to a published page is
+  live immediately. The ability never publishes.
+- The ability applies the same filters that a normal save by that user
+  applies. For users without the `unfiltered_html` capability, WordPress
+  removes disallowed HTML. Thus the stored value can be different from the sent
+  value. The answer contains the stored values, the new `post_modified_gmt`,
+  and `sanitized_fields`, which names each field that a filter changed.
+- The posts table must use the InnoDB storage engine, because other engines
+  cannot lock a row. On other engines, the write is refused.
+- `wp_update_post()` runs other plugins' save hooks inside the transaction. A
+  plugin that writes through a different database connection is not part of
+  the transaction.
+
+Both abilities require the `edit_post` capability for the specific post. An
+unknown post, a post that is not a post or a page, and a post that the user
+cannot edit give the same `not_found` answer.
+
+A refusal is a normal result, not an error:
+`{ "success": false, "code": "...", "message": "...", "data": { "current_modified_gmt": ... } }`.
+The codes are `post_changed` (`data.changed` names the fields that differ),
+`post_locked` (another user is editing the post), `invalid`, `not_found`,
+`unsupported_storage`, `update_failed` and `db_error`. After a refusal, nothing
+is written, and a refusal never contains post content.
+`current_modified_gmt` is `null` when the caller may not see it. The Abilities
+API itself refuses an input that does not match the input schema, and a call
+without the `edit_post` capability, before the ability runs. An MCP client then
+receives an error result that contains only a message. Nothing is written in
+those cases either.
+
 ## Compatibility
 
 - **WordPress:** 5.9 or later (tested up to 7.1).

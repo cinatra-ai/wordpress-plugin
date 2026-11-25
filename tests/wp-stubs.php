@@ -304,6 +304,11 @@ function get_the_title($post) {
     return $post instanceof WP_Post ? (string) $post->post_title : '';
 }
 function get_permalink($post) {
+    if (is_int($post)) {
+        // Real WordPress accepts a post ID too; resolve it via the fixture map
+        // of permalinks (tests that never set it get '' as before).
+        return (string) ($GLOBALS['cinatra_test']['permalinks'][$post] ?? '');
+    }
     return $post instanceof WP_Post ? (string) $post->permalink : '';
 }
 function get_post_type_object($post_type) {
@@ -358,10 +363,15 @@ function delete_option($name) {
 // ---------------------------------------------------------------------------
 // Auth / nonces / user
 // ---------------------------------------------------------------------------
-function current_user_can($cap) {
+function current_user_can($cap, ...$args) {
     // Cap-aware when a per-capability map is provided (e.g. edit_post vs
     // publish_posts differ); otherwise the single boolean drives every check.
     // Backward compatible: tests that never set ['caps'] behave as before.
+    // A test that needs a per-object answer (edit_post on ONE post id) sets
+    // ['caps_fn'] => callable($cap, ...$args); it wins over everything else.
+    if (isset($GLOBALS['cinatra_test']['caps_fn']) && is_callable($GLOBALS['cinatra_test']['caps_fn'])) {
+        return (bool) call_user_func($GLOBALS['cinatra_test']['caps_fn'], $cap, ...$args);
+    }
     $caps = $GLOBALS['cinatra_test']['caps'] ?? null;
     if (is_array($caps) && array_key_exists($cap, $caps)) {
         return (bool) $caps[$cap];
@@ -472,9 +482,11 @@ function wp_remote_retrieve_body($resp) { return $resp['body'] ?? ''; }
 class WP_Error {
     private $code;
     private $message;
-    public function __construct($code = '', $message = '') { $this->code = $code; $this->message = $message; }
+    private $data;
+    public function __construct($code = '', $message = '', $data = '') { $this->code = $code; $this->message = $message; $this->data = $data; }
     public function get_error_code() { return $this->code; }
     public function get_error_message() { return $this->message; }
+    public function get_error_data() { return $this->data; }
 }
 
 class WP_REST_Response {
