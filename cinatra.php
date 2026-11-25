@@ -4262,13 +4262,18 @@ add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );
 //
 // - cinatra/post-read reads the RAW stored values straight from the posts
 // table (no object cache), so the review is based on a fresh site value.
-// - cinatra/post-update-if-unchanged writes only when the post is still as
-// reviewed: in ONE database transaction it locks the post row
-// (SELECT ... FOR UPDATE), compares post_modified_gmt and the before-values of
-// the whole reviewed post (title, content, excerpt, status) byte for byte,
-// calls wp_update_post() with the full row read under the lock, and rolls
-// back if any column the caller did not ask to change was changed.
-// An edit saved in between makes the write refuse, and nothing is written.
+// - cinatra/post-update-if-unchanged is a NARROW WRITER. In ONE database
+// transaction it locks the post row (SELECT ... FOR UPDATE), re-checks the
+// capability against that fresh row, compares post_modified_gmt and the
+// before-values of the whole reviewed post (title, content, excerpt, status)
+// byte for byte, runs WordPress's per-field save filters over the WRITTEN
+// fields only, and writes exactly those columns ( plus post_status "draft"
+// when asked, and the two modification times ) with one $wpdb->update(). It
+// does not go through wp_update_post(): that would merge the cached post, run
+// the save filters over every field, rewrite terms and fire hooks inside the
+// transaction. The hooks WordPress fires after an update run only after the
+// COMMIT. An edit saved in between makes the write refuse, nothing is
+// written, and no hook fires.
 //
 // Both register on the Abilities API hooks only; the plugin loads unchanged
 // when the Abilities API is absent, and nothing runs until a caller invokes an
@@ -4356,6 +4361,25 @@ function cinatra_content_can_edit( $input = array() ): bool {
 	if ( 1 > $id ) {
 		return false;
 	}
+	return (bool) current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
+}
+
+/**
+ * Capability check against a FRESH row: the row is put into the object cache
+ * exactly as WP_Post::get_instance() caches a raw row, so current_user_can()
+ * ( map_meta_cap reads the post through get_post() ) decides on the author,
+ * type and status of this row and not on an older cached copy. The write
+ * calls it while it holds the row lock, so the cached value is the current
+ * row until the commit.
+ *
+ * @param array<string,string> $row Posts-table row ( every column ).
+ * @return bool True when the current user may edit the post as it is in the row.
+ */
+function cinatra_content_can_edit_row( array $row ): bool {
+	$id             = (int) $row['ID'];
+	$cached         = (object) $row;
+	$cached->filter = 'raw';
+	wp_cache_set( $id, $cached, 'posts' );
 	return (bool) current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
 }
 
@@ -4458,8 +4482,16 @@ function cinatra_ability_post_read( $input = array() ): array {
 	if ( ! cinatra_content_can_edit( $input ) ) {
 		return cinatra_content_not_found();
 	}
-	$row = cinatra_content_select_row( cinatra_content_post_id( $input ), false );
+	$id  = cinatra_content_post_id( $input );
+	$row = cinatra_content_select_row( $id, false );
 	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
+		return cinatra_content_not_found();
+	}
+	// Re-check against the row just read; then drop the primed cache entry,
+	// so the read leaves the object cache as WordPress would fill it.
+	$allowed = cinatra_content_can_edit_row( $row );
+	wp_cache_delete( $id, 'posts' );
+	if ( ! $allowed ) {
 		return cinatra_content_not_found();
 	}
 	return cinatra_content_shape_row( $row );
@@ -4584,17 +4616,18 @@ function cinatra_content_rollback( int $touched_id = 0 ): void {
 }
 
 /**
- * Execute callback for cinatra/post-update-if-unchanged.
+ * Execute callback for cinatra/post-update-if-unchanged: the narrow writer.
  *
- * In one transaction: lock the post row, verify the InnoDB engine, refuse a
- * post that is not published or a draft, refuse when another user holds the
- * edit lock, compare post_modified_gmt and the before-values of title,
- * content, excerpt and status byte for byte, then wp_update_post() with the
- * full locked row, refuse when any untouched column changed, and COMMIT. Any refusal or error rolls
- * back, so nothing is written. Content passes through the same filters a
- * normal save by this user applies ( kses for users without unfiltered_html ),
- * so the stored value can differ from the sent one: the answer returns what is
- * stored.
+ * Inside one transaction, with the post row locked: verify InnoDB, re-check
+ * edit_post against the fresh row, refuse a post that is not published or a
+ * draft, refuse when another user holds the edit lock, compare
+ * post_modified_gmt and title, content, excerpt and status byte for byte, run
+ * the per-field save filters over the written fields, fire pre_post_update,
+ * and write only the written columns, post_status "draft" when asked and the
+ * two modification times. COMMIT; then clean the cache and fire the hooks
+ * core's wp_insert_post() fires on an update, in core's order with core's
+ * arguments ( post_updated also makes core store the revision ). Any refusal
+ * or error rolls back, writes nothing and fires no update hook.
  *
  * @param mixed $input Ability input.
  * @return array<string,mixed> The stored values after the save, or a refusal result.
@@ -4608,6 +4641,8 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 	}
 	$id = (int) $parsed['id'];
 
+	// Early check ( the object cache may be older ); the authoritative check
+	// follows under the lock.
 	if ( ! cinatra_content_can_edit( $input ) ) {
 		return cinatra_content_not_found();
 	}
@@ -4628,7 +4663,7 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		);
 	}
 
-	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
+	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) || ! cinatra_content_can_edit_row( $row ) ) {
 		cinatra_content_rollback();
 		return cinatra_content_not_found();
 	}
@@ -4675,32 +4710,42 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		);
 	}
 
-	// wp_update_post() starts from get_post( $id, ARRAY_A ), which can come
-	// from the object cache, and merges the given fields over it; a partial
-	// update would write any stale cached column back. So the save is built
-	// from the FULL row read under the lock ( every column ), with the written
-	// fields on top: the cached copy cannot contribute a column. The cache is
-	// also cleared now, so wp_update_post() and the save hooks re-read the
-	// post from the database inside this transaction.
-	clean_post_cache( $id );
-	$postarr = array_merge( $row, $parsed['fields'] );
-	if ( null !== $parsed['status'] ) {
-		$postarr['post_status'] = $parsed['status'];
+	// The values to write. Each written field runs through exactly the chain
+	// wp_insert_post() runs for it ( sanitize_post_field( ..., 'db' ):
+	// pre_post_<field> and <field>_save_pre, which carry kses for a user
+	// without unfiltered_html and the site's own save filters ). Those filters
+	// expect slashed data, as on a normal save. Untouched fields run through
+	// nothing and are not written.
+	$data = array();
+	foreach ( $parsed['fields'] as $column => $value ) {
+		$data[ $column ] = wp_unslash( sanitize_post_field( $column, wp_slash( $value ), $id, 'db' ) );
+		if ( 'utf8' === $wpdb->get_col_charset( $wpdb->posts, $column ) ) {
+			// As wp_insert_post(): a utf8 ( not utf8mb4 ) column stores emoji as entities.
+			$data[ $column ] = wp_encode_emoji( $data[ $column ] );
+		}
 	}
-	// wp_update_post() expects slashed data ( it unslashes, as for $_POST ), so
-	// the raw values are slashed here; without it backslashes would be lost.
-	$postarr       = wp_slash( $postarr );
-	$postarr['ID'] = $id;
+	$after = array_merge( $row, $data );
+	if ( '' === (string) $after['post_title'] && '' === (string) $after['post_content'] && '' === (string) $after['post_excerpt'] ) {
+		cinatra_content_rollback();
+		return cinatra_content_refusal( 'invalid', __( 'Title, content and excerpt cannot all be empty.', 'cinatra' ), $current_modified );
+	}
+	if ( null !== $parsed['status'] ) {
+		$data['post_status'] = 'draft'; // The literal value: never a filtered one.
+	}
+	$data['post_modified']     = current_time( 'mysql' );
+	$data['post_modified_gmt'] = current_time( 'mysql', 1 );
 
-	$result = wp_update_post( $postarr, true );
-	if ( is_wp_error( $result ) || 1 > (int) $result ) {
+	$post_before = get_post( $id ); // The locked row ( primed in the object cache above ).
+
+	/** This action is documented in wp-includes/post.php ( fired by core right before the update ). */
+	do_action( 'pre_post_update', $id, $data ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook, fired where wp_insert_post() fires it.
+
+	$updated = $wpdb->update( $wpdb->posts, $data, array( 'ID' => $id ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The narrow write itself; the cache is cleaned after the commit.
+	// MySQL reports CHANGED rows: 0 means the locked row already held these
+	// values; more than one is impossible for WHERE ID and is refused.
+	if ( false === $updated || 1 < (int) $updated ) {
 		cinatra_content_rollback( $id );
-		return cinatra_content_refusal(
-			'update_failed',
-			__( 'WordPress refused the update. Nothing was written.', 'cinatra' ),
-			$current_modified,
-			is_wp_error( $result ) ? array( 'wp_error_code' => (string) $result->get_error_code() ) : array()
-		);
+		return cinatra_content_refusal( 'db_error', __( 'The database update failed. Nothing was written.', 'cinatra' ), $current_modified );
 	}
 
 	$stored = cinatra_content_select_row( $id, false );
@@ -4709,50 +4754,25 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		return cinatra_content_refusal( 'db_error', __( 'The post could not be read back after the update. Nothing was written.', 'cinatra' ), $current_modified );
 	}
 
-	// Nothing the caller did not ask to change may change silently. Core's
-	// wp_insert_post() runs the save filters ( kses for a user without
-	// unfiltered_html ) over EVERY content field of the merged post, also the
-	// untouched ones, and other plugins' hooks may rewrite columns. So every
-	// untouched column of the stored row is compared byte for byte with the
-	// row read under the lock; a difference rolls the whole save back.
-	// Excluded: the written columns, post_status when written, and the
-	// modification times. One documented core behaviour is allowed and
-	// reported in also_changed: a draft whose date was never set ( floating,
-	// post_date_gmt zero ) gets post_date = now on every save.
-	$skip = array_merge( array_keys( $parsed['fields'] ), array( 'ID', 'post_modified', 'post_modified_gmt' ) );
-	if ( null !== $parsed['status'] ) {
-		$skip[] = 'post_status';
-	}
-	$floating     = ( '0000-00-00 00:00:00' === (string) $row['post_date_gmt'] && 'draft' === (string) $stored['post_status'] );
-	$also_changed = array();
-	$untouched    = array();
-	foreach ( $row as $column => $before ) {
-		if ( in_array( $column, $skip, true ) || (string) ( $stored[ $column ] ?? '' ) === (string) $before ) {
-			continue;
-		}
-		if ( $floating && 'post_date' === $column ) {
-			$also_changed[] = $column;
-			continue;
-		}
-		$untouched[] = (string) $column;
-	}
-	if ( array() !== $untouched ) {
-		cinatra_content_rollback( $id );
-		return cinatra_content_refusal(
-			'untouched_field_changed',
-			__( 'The save would also change fields that were not asked to change (for example the save filters for this user, or another plugin). Nothing was written.', 'cinatra' ),
-			$current_modified,
-			array( 'changed' => $untouched )
-		);
-	}
-
 	if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
 		cinatra_content_rollback( $id );
 		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be committed. Nothing was written.', 'cinatra' ), $current_modified );
 	}
-	// wp_update_post() cleaned the cache before COMMIT; a concurrent request
-	// may have cached the pre-commit row since. Clean once more.
+
+	// Committed. Now what wp_insert_post() does after its update, in its
+	// order and with its arguments. A hook that changes the post now makes an
+	// ordinary later save; the answer reports what THIS save stored.
 	clean_post_cache( $id );
+	$post = get_post( $id );
+	wp_transition_post_status( (string) $stored['post_status'], (string) $post_before->post_status, $post );
+	do_action( "edit_post_{$post->post_type}", $id, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	do_action( 'edit_post', $id, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	$post_after = get_post( $id );
+	do_action( 'post_updated', $id, $post_after, $post_before ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook ( core stores the revision on it ).
+	do_action( "save_post_{$post->post_type}", $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	do_action( 'save_post', $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	do_action( 'wp_insert_post', $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	wp_after_insert_post( $post, true, $post_before );
 
 	$answer    = cinatra_content_shape_row( $stored );
 	$sanitized = array();
@@ -4762,7 +4782,6 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		}
 	}
 	$answer['sanitized_fields'] = $sanitized;
-	$answer['also_changed']     = $also_changed;
 	return $answer;
 }
 
@@ -4807,11 +4826,6 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 			'type'        => 'array',
 			'items'       => array( 'type' => 'string' ),
 			'description' => __( 'Written fields whose stored value differs from the sent value because the save filters changed it.', 'cinatra' ),
-		);
-		$properties['also_changed']     = array(
-			'type'        => 'array',
-			'items'       => array( 'type' => 'string' ),
-			'description' => __( 'Columns WordPress changed beyond the written fields; only post_date of a draft without a set date.', 'cinatra' ),
 		);
 	}
 	return array(
@@ -4899,7 +4913,7 @@ function cinatra_register_content_abilities(): void {
 		CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED,
 		array(
 			'label'               => __( 'Write a reviewed change to a post', 'cinatra' ),
-			'description'         => __( 'Write title, content and/or excerpt of a published post or draft (and optionally move it to draft) only if the post is unchanged since the read the review was based on. Refuses with a code (for example post_changed, post_locked, unsupported_status, untouched_field_changed or invalid) and then writes nothing.', 'cinatra' ),
+			'description'         => __( 'Write title, content and/or excerpt of a published post or draft (and optionally move it to draft) only if the post is unchanged since the read the review was based on. Writes only those columns. Refuses with a code (for example post_changed, post_locked, unsupported_status or invalid) and then writes nothing.', 'cinatra' ),
 			'category'            => CINATRA_ABILITY_CATEGORY,
 			'input_schema'        => array(
 				'type'                 => 'object',

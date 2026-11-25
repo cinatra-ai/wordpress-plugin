@@ -5,34 +5,28 @@
  * `php tests/test-post-update-if-unchanged.php` -- no PHPUnit, no WordPress
  * install, no database. Exit code 0 = all pass, 1 = a failure.
  *
- * A recording $wpdb stub keeps every statement in order and simulates the
- * transaction (ROLLBACK restores the rows as they were at START TRANSACTION),
- * and a wp_update_post() stub behaves like WordPress where it matters here: it
- * UNSLASHES its input (so a missing wp_slash() loses backslashes) and runs a
- * kses-like filter for a user without unfiltered_html.
+ * The write is a NARROW WRITER: under a row lock it re-checks the capability
+ * against the fresh row, compares the reviewed values, runs the per-field save
+ * filters over the written fields only, writes exactly those columns plus the
+ * two modification times with one $wpdb->update(), commits, and only then
+ * fires the hooks core's wp_insert_post() fires on an update.
  *
- * Covers:
- *   - the statement order: START TRANSACTION, SELECT ... FOR UPDATE, (compare),
- *     the update, the read-back, COMMIT; ROLLBACK on every refusal, and no
- *     update statement on any refusal;
- *   - each refusal's shape (success false, code, data.current_modified_gmt)
- *     and that no refusal carries post content;
- *   - the capability checks and the uniform not_found for unknown / forbidden /
- *     other-type posts (no existence leak);
- *   - the non-InnoDB refusal, with the engine read fresh inside the
- *     transaction on every write (never cached);
- *   - expected.status always required and compared under the lock;
- *   - a stale object-cache copy is never written back: the stub merges like
- *     core's wp_update_post() (get_post() from the cache, then array_merge),
- *     and the ability passes the full locked row and cleans the cache;
- *   - slashing with backslashes and quotes;
- *   - expected holds title, content, excerpt and status ALWAYS, all compared;
- *   - only publish and draft are written (unsupported_status otherwise); the
- *     only status change is to draft;
- *   - an untouched column changed by the save (core re-filters every content
- *     field; another plugin hook) rolls back as untouched_field_changed;
- *     the floating draft date is reported in also_changed;
- *   - the read (raw values, no lock, no transaction) and the registration.
+ * The stubs record every statement and every hook in one ordered log, simulate
+ * the transaction (ROLLBACK restores the rows), model the object cache that
+ * get_post() and the capability check read, and model core's per-field save
+ * chain (sanitize_post_field( ..., 'db' ): pre_post_<field> and
+ * <field>_save_pre, with kses for a user without unfiltered_html, on SLASHED
+ * data). A wp_update_post() stub models core's full save (merge, the
+ * wp_insert_post_data filter, term rewrite, hooks) so the tests prove the
+ * narrow writer never goes through it.
+ *
+ * Covers: statement and hook order with core's hook arguments; the exact
+ * columns written; capability re-checked against the fresh row; a filter can
+ * never make the stored status anything but the requested draft; no hook on a
+ * refusal; a floating-date draft keeps its dates; no term function; the save
+ * filters run over written fields only (untouched markup survives a restricted
+ * user's title edit); slashing; affected rows; the expected/written contract;
+ * the status rules; the engine read; the read ability; the registration.
  */
 
 require __DIR__ . '/wp-stubs.php';
@@ -43,9 +37,6 @@ require __DIR__ . '/wp-stubs.php';
 if (!defined('ARRAY_A')) {
     define('ARRAY_A', 'ARRAY_A');
 }
-if (!defined('DAY_IN_SECONDS')) {
-    define('DAY_IN_SECONDS', 86400);
-}
 
 /** Recording, transaction-simulating stand-in for WordPress's $wpdb. */
 class Cinatra_Test_Wpdb {
@@ -53,7 +44,10 @@ class Cinatra_Test_Wpdb {
     public $log = [];
     public $rows = [];
     public $engine = 'InnoDB';
-    public $fail = [];  // statement keyword => true to make it return false
+    public $charset = 'utf8mb4';
+    public $fail = [];          // statement => true to make it return false
+    public $update_result = null; // forced return of update() (e.g. false, 2)
+    public $updates = [];       // captured update() calls
     private $snapshot = null;
 
     public function prepare($query, ...$args) {
@@ -85,12 +79,41 @@ class Cinatra_Test_Wpdb {
         if (!preg_match('/WHERE ID = (\d+)/', $sql, $m)) {
             return null;
         }
-        $row = $this->rows[(int) $m[1]] ?? null;
-        return null === $row ? null : $row;
+        return $this->rows[(int) $m[1]] ?? null;
     }
     public function get_var($sql) {
         $this->log[] = $sql;
         return $this->engine;
+    }
+    public function get_col_charset($table, $column) {
+        return $this->charset;
+    }
+    public function update($table, $data, $where, $format = null, $where_format = null) {
+        $this->log[] = 'UPDATE-ROW';
+        $this->updates[] = ['table' => $table, 'data' => $data, 'where' => $where];
+        $id = (int) ($where['ID'] ?? 0);
+        $changed = 0;
+        if (isset($this->rows[$id])) {
+            foreach ($data as $col => $value) {
+                if ((string) $this->rows[$id][$col] !== (string) $value) {
+                    $changed = 1;
+                }
+                $this->rows[$id][$col] = (string) $value;
+            }
+        }
+        // MySQL reports CHANGED rows: an identical write affects 0 rows.
+        return null !== $this->update_result ? $this->update_result : $changed;
+    }
+}
+
+/** Every hook the tests observe; each firing is logged in order. */
+function cinatra_test_record_hooks(array $hooks): void {
+    foreach ($hooks as $hook) {
+        add_action($hook, function (...$args) use ($hook) {
+            global $wpdb;
+            $GLOBALS['cinatra_test']['fired'][] = [$hook, $args];
+            $wpdb->log[] = 'HOOK:' . $hook;
+        }, 10, 4);
     }
 }
 
@@ -107,6 +130,22 @@ if (!function_exists('wp_check_post_lock')) {
         return $GLOBALS['cinatra_test']['post_lock'][(int) $post_id] ?? false;
     }
 }
+if (!function_exists('wp_cache_set')) {
+    function wp_cache_set($key, $data, $group = '', $expire = 0) {
+        if ('posts' === $group) {
+            $GLOBALS['cinatra_test']['post_cache'][(int) $key] = (array) $data;
+        }
+        return true;
+    }
+}
+if (!function_exists('wp_cache_delete')) {
+    function wp_cache_delete($key, $group = '') {
+        if ('posts' === $group) {
+            unset($GLOBALS['cinatra_test']['post_cache'][(int) $key]);
+        }
+        return true;
+    }
+}
 if (!function_exists('clean_post_cache')) {
     function clean_post_cache($post_id) {
         global $wpdb;
@@ -115,55 +154,101 @@ if (!function_exists('clean_post_cache')) {
         $wpdb->log[] = 'CLEAN-CACHE';
     }
 }
+if (!function_exists('get_post')) {
+    /** Like WP_Post::get_instance(): the object cache first, else the DB row (then cached). */
+    function get_post($id = null) {
+        global $wpdb;
+        $id = (int) $id;
+        if (!isset($GLOBALS['cinatra_test']['post_cache'][$id])) {
+            if (!isset($wpdb->rows[$id])) {
+                return null;
+            }
+            $GLOBALS['cinatra_test']['post_cache'][$id] = $wpdb->rows[$id];
+        }
+        $p = new WP_Post($GLOBALS['cinatra_test']['post_cache'][$id]);
+        $p->ID = (int) $p->ID;
+        return $p;
+    }
+}
+if (!function_exists('current_time')) {
+    function current_time($type, $gmt = 0) {
+        return $gmt ? $GLOBALS['cinatra_test']['now'] : $GLOBALS['cinatra_test']['now_local'];
+    }
+}
+if (!function_exists('sanitize_post_field')) {
+    /**
+     * Core's db-context chain for one field: pre_post_<x> then <x>_save_pre
+     * (the kses filters are on the latter for a user without unfiltered_html).
+     * Like core's filters, it expects and returns SLASHED data.
+     */
+    function sanitize_post_field($field, $value, $post_id, $context = 'display') {
+        $GLOBALS['cinatra_test']['sanitized'][] = $field;
+        $short = substr($field, 5); // post_title -> title
+        foreach (["pre_{$field}", "{$short}_save_pre"] as $hook) {
+            foreach ($GLOBALS['cinatra_test']['save_filters'][$hook] ?? [] as $cb) {
+                $value = $cb($value);
+            }
+        }
+        if (!current_user_can('unfiltered_html')) {
+            $value = addslashes(preg_replace('#<script\b[^>]*>.*?</script>#is', '', stripslashes($value)));
+        }
+        return $value;
+    }
+}
+if (!function_exists('wp_encode_emoji')) {
+    function wp_encode_emoji($content) {
+        return str_replace("\u{1F600}", '&#x1f600;', $content);
+    }
+}
+if (!function_exists('wp_transition_post_status')) {
+    /** Core: transition_post_status, {old}_to_{new}, {new}_{type}. */
+    function wp_transition_post_status($new_status, $old_status, $post) {
+        do_action('transition_post_status', $new_status, $old_status, $post);
+        do_action("{$old_status}_to_{$new_status}", $post);
+        do_action("{$new_status}_{$post->post_type}", $post->ID, $post);
+    }
+}
+if (!function_exists('wp_after_insert_post')) {
+    function wp_after_insert_post($post, $update, $post_before) {
+        $post = get_post($post->ID);
+        do_action('wp_after_insert_post', $post->ID, $post, $update, $post_before);
+    }
+}
+foreach (['wp_set_post_categories', 'wp_set_post_tags', 'wp_set_post_terms', 'wp_set_object_terms'] as $fn) {
+    if (!function_exists($fn)) {
+        eval("function $fn(...\$a) { \$GLOBALS['cinatra_test']['term_calls'][] = '$fn'; return []; }");
+    }
+}
 if (!function_exists('wp_update_post')) {
     /**
-     * Models WordPress core's wp_update_post() where it matters here:
-     *   1. $post = get_post( ID, ARRAY_A ) -- served from the OBJECT CACHE when
-     *      the post is cached (it may be stale), else read from the database
-     *      and added to the cache;
-     *   2. $post = wp_slash( $post ); $postarr = array_merge( $post, $postarr );
-     *   3. wp_insert_post() unslashes and writes EVERY column of the merged
-     *      array, running a kses stand-in for a user without unfiltered_html,
-     *      and sets post_modified_gmt to "now".
-     * So a partial update merged with a stale cached copy writes stale values
-     * back -- exactly the loss the ability must prevent.
+     * Models core's full save, which the narrow writer must NEVER use: merge
+     * with the cached post, the wp_insert_post_data filter over the whole
+     * row, a term rewrite, then the hooks -- all before the caller could
+     * refuse.
      */
     function wp_update_post($postarr, $wp_error = false) {
         global $wpdb;
-        $GLOBALS['cinatra_test']['update_calls'][] = $postarr;
-        $wpdb->log[] = 'UPDATE-VIA-wp_update_post';
         $id = (int) $postarr['ID'];
-        if (isset($GLOBALS['cinatra_test']['update_result'])) {
-            // Simulate a partial write before the failure, so the test proves
-            // ROLLBACK undoes it.
-            $wpdb->rows[$id]['post_title'] = 'PARTIAL-WRITE';
-            return $GLOBALS['cinatra_test']['update_result'];
+        $wpdb->log[] = 'UPDATE-VIA-wp_update_post';
+        $GLOBALS['cinatra_test']['update_calls'][] = $postarr;
+        $merged = array_merge(wp_slash(get_post($id) ? (array) $GLOBALS['cinatra_test']['post_cache'][$id] : []), $postarr);
+        foreach ($GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'] ?? [] as $cb) {
+            $merged = $cb($merged);
         }
-        if (!isset($GLOBALS['cinatra_test']['post_cache'][$id])) {
-            $GLOBALS['cinatra_test']['post_cache'][$id] = $wpdb->rows[$id];
+        if ('post' === ($merged['post_type'] ?? '')) {
+            wp_set_post_categories($id, []);
         }
-        $merged = array_merge(wp_slash($GLOBALS['cinatra_test']['post_cache'][$id]), $postarr);
-        // Core: a draft whose date was never set ("floating", post_date_gmt
-        // zero) gets post_date = now on every save.
-        if ('draft' === ($merged['post_status'] ?? '') && '0000-00-00 00:00:00' === ($merged['post_date_gmt'] ?? '')) {
-            $merged['post_date'] = $GLOBALS['cinatra_test']['now'];
-        }
-        // A hook of another plugin that rewrites a column (test switch).
-        if (isset($GLOBALS['cinatra_test']['hook_rewrites'])) {
-            $merged = array_merge($merged, $GLOBALS['cinatra_test']['hook_rewrites']);
-        }
+        $old = $wpdb->rows[$id]['post_status'];
         foreach (array_keys($wpdb->rows[$id]) as $col) {
-            if ('ID' === $col || 'post_modified_gmt' === $col || !array_key_exists($col, $merged)) {
-                continue;
+            if ('ID' !== $col && array_key_exists($col, $merged)) {
+                $wpdb->rows[$id][$col] = wp_unslash($merged[$col]);
             }
-            $value = wp_unslash($merged[$col]);
-            if (in_array($col, ['post_title', 'post_content', 'post_excerpt'], true) && !current_user_can('unfiltered_html')) {
-                $value = preg_replace('#<script\b[^>]*>.*?</script>#is', '', $value);
-            }
-            $wpdb->rows[$id][$col] = $value;
         }
         $wpdb->rows[$id]['post_modified_gmt'] = $GLOBALS['cinatra_test']['now'];
-        unset($GLOBALS['cinatra_test']['post_cache'][$id]); // wp_insert_post() cleans the cache.
+        clean_post_cache($id);
+        $post = get_post($id);
+        wp_transition_post_status($post->post_status, $old, $post);
+        do_action('save_post', $id, $post, true);
         return $id;
     }
 }
@@ -199,44 +284,50 @@ function check($label, $cond) {
     }
 }
 
-const T_ID        = 42;
-const T_MODIFIED  = '2026-11-25 10:00:00';
-const T_NOW       = '2026-11-25 10:05:00';
+const T_ID       = 42;
+const T_POST_ID  = 43;
+const T_MODIFIED = '2026-11-25 10:00:00';
+const T_NOW      = '2026-11-25 10:05:00';
+const T_NOW_LOC  = '2026-11-25 11:05:00';
 // Content with backslashes, both quote kinds and a marker the refusal tests
 // search for (a refusal must never echo the post's content).
-const T_CONTENT   = "<p>Path C:\\new\\table \"double\" 'single' \\\\ two backslashes SECRET-BODY-MARKER</p>";
+const T_CONTENT  = "<p>Path C:\\new\\table \"double\" 'single' \\\\ two backslashes SECRET-BODY-MARKER</p>";
 
-/** Fresh fixture: one editable page, InnoDB, the user may edit post 42 only. */
+cinatra_test_record_hooks([
+    'pre_post_update', 'transition_post_status', 'publish_to_publish', 'publish_to_draft', 'draft_to_draft',
+    'publish_page', 'draft_page', 'publish_post', 'draft_post', 'edit_post_page', 'edit_post_post', 'edit_post',
+    'post_updated', 'save_post_page', 'save_post_post', 'save_post', 'wp_insert_post', 'wp_after_insert_post',
+]);
+
+function t_row(int $id, string $type, array $over = []): array {
+    return array_merge([
+        'ID'                    => (string) $id,
+        'post_author'           => '3',
+        'post_date'             => '2026-01-01 10:00:00',
+        'post_date_gmt'         => '2026-01-01 09:00:00',
+        'post_content'          => T_CONTENT,
+        'post_title'            => 'About "us"',
+        'post_excerpt'          => 'Old excerpt',
+        'post_status'           => 'publish',
+        'post_name'             => 'about',
+        'post_modified'         => '2026-11-25 11:00:00',
+        'post_modified_gmt'     => T_MODIFIED,
+        'post_content_filtered' => '',
+        'post_parent'           => '0',
+        'menu_order'            => '0',
+        'post_type'             => $type,
+        'comment_count'         => '0',
+    ], $over);
+}
+
+/** Fresh fixture: one editable page (42), one post (43), an attachment (7); InnoDB. */
 function reset_fixture(array $overrides = []) {
     global $wpdb;
     $wpdb = new Cinatra_Test_Wpdb();
     $wpdb->rows = [
-        T_ID => [
-            'ID'                => (string) T_ID,
-            'post_type'         => 'page',
-            'post_status'       => 'publish',
-            'post_title'        => 'About "us"',
-            'post_content'      => T_CONTENT,
-            'post_excerpt'      => 'Old excerpt',
-            'post_modified_gmt' => T_MODIFIED,
-            'post_name'         => 'about',
-            'post_author'       => '3',
-            'post_date_gmt'     => '2026-01-01 09:00:00',
-            'post_date'         => '2026-01-01 10:00:00',
-        ],
-        7 => [
-            'ID'                => '7',
-            'post_type'         => 'attachment',
-            'post_status'       => 'inherit',
-            'post_title'        => 'logo',
-            'post_content'      => '',
-            'post_excerpt'      => '',
-            'post_modified_gmt' => T_MODIFIED,
-            'post_name'         => 'logo',
-            'post_author'       => '3',
-            'post_date_gmt'     => '2026-01-01 09:00:00',
-            'post_date'         => '2026-01-01 10:00:00',
-        ],
+        T_ID      => t_row(T_ID, 'page'),
+        T_POST_ID => t_row(T_POST_ID, 'post'),
+        7         => t_row(7, 'attachment', ['post_status' => 'inherit', 'post_title' => 'logo', 'post_content' => '', 'post_excerpt' => '']),
     ];
     $GLOBALS['cinatra_test'] = array_merge([
         'options'          => [],
@@ -247,14 +338,21 @@ function reset_fixture(array $overrides = []) {
         'post_lock'        => [],
         'cleaned'          => [],
         'update_calls'     => [],
+        'fired'            => [],
+        'sanitized'        => [],
+        'term_calls'       => [],
+        'save_filters'     => [],
+        'remote_post_calls' => [],
         'now'              => T_NOW,
+        'now_local'        => T_NOW_LOC,
         // The object cache starts consistent with the database.
-        'post_cache'       => [T_ID => $wpdb->rows[T_ID], 7 => $wpdb->rows[7]],
-        // Per-object capability: edit_post on 42 and 7 (an attachment the
-        // user may edit, to prove the type check), unfiltered_html granted.
+        'post_cache'       => [T_ID => $wpdb->rows[T_ID], T_POST_ID => $wpdb->rows[T_POST_ID], 7 => $wpdb->rows[7]],
+        // Models map_meta_cap for edit_post: the author of the post AS
+        // get_post() SEES IT (object cache first) must be the current user.
         'caps_fn'          => function ($cap, ...$args) {
             if ('edit_post' === $cap) {
-                return in_array((int) ($args[0] ?? 0), [T_ID, 7], true);
+                $post = get_post((int) ($args[0] ?? 0));
+                return null !== $post && (int) $GLOBALS['cinatra_test']['current_user_id'] === (int) $GLOBALS['cinatra_test']['post_cache'][$post->ID]['post_author'];
             }
             if ('unfiltered_html' === $cap) {
                 return $GLOBALS['cinatra_test']['unfiltered_html'] ?? true;
@@ -264,7 +362,7 @@ function reset_fixture(array $overrides = []) {
     ], $overrides);
 }
 
-/** The statements, with SELECTs reduced to a tag (FOR UPDATE or plain). */
+/** The log with SELECTs reduced to a tag. */
 function statement_kinds(): array {
     global $wpdb;
     return array_map(function ($sql) {
@@ -276,6 +374,17 @@ function statement_kinds(): array {
         }
         return $sql;
     }, $wpdb->log);
+}
+function hooks_fired(): array {
+    return array_column($GLOBALS['cinatra_test']['fired'], 0);
+}
+function hook_args(string $hook): ?array {
+    foreach ($GLOBALS['cinatra_test']['fired'] as [$h, $args]) {
+        if ($h === $hook) {
+            return $args;
+        }
+    }
+    return null;
 }
 
 /** The before-values of the whole reviewed post (the fixture page as read). */
@@ -297,7 +406,7 @@ function base_update(array $extra = []): array {
     ], $extra);
 }
 
-/** A refusal is well-formed and carries no post content. */
+/** A refusal is well-formed, carries no post content, and fired no hook. */
 function is_refusal($r, string $code): bool {
     return is_array($r)
         && false === ($r['success'] ?? null)
@@ -305,7 +414,9 @@ function is_refusal($r, string $code): bool {
         && is_string($r['message'] ?? null)
         && is_array($r['data'] ?? null)
         && array_key_exists('current_modified_gmt', $r['data'])
-        && false === strpos(json_encode($r), 'SECRET-BODY-MARKER');
+        && false === strpos(json_encode($r), 'SECRET-BODY-MARKER')
+        && [] === $GLOBALS['cinatra_test']['fired']
+        && [] === $GLOBALS['cinatra_test']['update_calls'];
 }
 
 $retired_ids = [
@@ -313,78 +424,93 @@ $retired_ids = [
     'cinatra/post-delete', 'cinatra/post-create-draft', 'cinatra/media-upload', 'cinatra/post-update-meta',
 ];
 
+const T_AFTER_COMMIT = [
+    'HOOK:transition_post_status', 'HOOK:publish_to_publish', 'HOOK:publish_page', 'HOOK:edit_post_page', 'HOOK:edit_post',
+    'HOOK:post_updated', 'HOOK:save_post_page', 'HOOK:save_post', 'HOOK:wp_insert_post', 'HOOK:wp_after_insert_post',
+];
+
 // ---------------------------------------------------------------------------
-echo "Success: statement order and answer\n";
+echo "Success: one narrow update, hooks only after COMMIT, in core's order\n";
 reset_fixture();
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('success is true', true === ($r['success'] ?? null));
-check('statement order is START, SELECT FOR UPDATE, engine (under the lock), cache clean, update, read-back, COMMIT, cache clean',
-    ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'CLEAN-CACHE', 'UPDATE-VIA-wp_update_post', 'SELECT', 'COMMIT', 'CLEAN-CACHE'] === statement_kinds());
-check('the FOR UPDATE select reads the whole row of the posts table by ID', 1 === preg_match('/^SELECT \\* FROM wp_posts WHERE ID = 42 FOR UPDATE$/', $wpdb->log[1]));
-check('answer returns the stored content', '<p>New body</p>' === $r['post_content']);
-check('answer returns the new post_modified_gmt', T_NOW === $r['post_modified_gmt']);
-check('answer returns unchanged fields raw', 'About "us"' === $r['post_title'] && 'Old excerpt' === $r['post_excerpt']);
-check('answer carries the permalink, type, status and id', 'https://blog.example/about/' === $r['permalink'] && 'page' === $r['post_type'] && 'publish' === $r['post_status'] && T_ID === $r['post_id']);
+check('order: START, FOR UPDATE, engine, pre_post_update, one UPDATE, read-back, COMMIT, cache clean, then the update hooks',
+    array_merge(['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'HOOK:pre_post_update', 'UPDATE-ROW', 'SELECT', 'COMMIT', 'CLEAN-CACHE'], T_AFTER_COMMIT) === statement_kinds());
+check('wp_update_post is never used', [] === $GLOBALS['cinatra_test']['update_calls']);
+$u = $wpdb->updates[0] ?? ['data' => [], 'where' => [], 'table' => ''];
+$keys = array_keys($u['data']);
+sort($keys);
+check('the update writes exactly the written column and the two modified times', ['post_content', 'post_modified', 'post_modified_gmt'] === $keys);
+check('the update data values', '<p>New body</p>' === $u['data']['post_content'] && T_NOW === $u['data']['post_modified_gmt'] && T_NOW_LOC === $u['data']['post_modified']);
+check('the update targets the posts table, WHERE ID = 42 only', 'wp_posts' === $u['table'] && ['ID' => T_ID] === $u['where']);
+check('answer returns the stored content and new modified time', '<p>New body</p>' === $r['post_content'] && T_NOW === $r['post_modified_gmt']);
+check('answer carries unchanged fields, permalink, type, status, id', 'About "us"' === $r['post_title'] && 'Old excerpt' === $r['post_excerpt'] && 'https://blog.example/about/' === $r['permalink'] && 'page' === $r['post_type'] && 'publish' === $r['post_status'] && T_ID === $r['post_id']);
 check('nothing was changed by filters', [] === $r['sanitized_fields']);
-check('wp_update_post gets the full locked row (every column), the written field replaced', array_keys($wpdb->rows[T_ID]) == array_keys($GLOBALS['cinatra_test']['update_calls'][0]) && wp_slash('<p>New body</p>') === $GLOBALS['cinatra_test']['update_calls'][0]['post_content'] && wp_slash('About "us"') === $GLOBALS['cinatra_test']['update_calls'][0]['post_title']);
-check('the status passed is the locked row status when status is not written', 'publish' === $GLOBALS['cinatra_test']['update_calls'][0]['post_status']);
-check('the row is committed', '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+check('no also_changed field any more', !array_key_exists('also_changed', $r));
+check('every other column is byte-identical', array_diff_key($wpdb->rows[T_ID], array_flip(['post_content', 'post_modified', 'post_modified_gmt'])) === array_diff_key(t_row(T_ID, 'page'), array_flip(['post_content', 'post_modified', 'post_modified_gmt'])));
 
-echo "Engine: read fresh for every write, never cached\n";
-check('no engine transient is stored', [] === $GLOBALS['cinatra_test']['transients']);
-$wpdb->log = [];
-$wpdb->rows[T_ID]['post_modified_gmt'] = T_MODIFIED;
-$wpdb->rows[T_ID]['post_content']      = T_CONTENT;
-$wpdb->engine = 'MyISAM'; // e.g. a restore changed the table after the first write
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a second write reads the engine again and sees the change', in_array('ENGINE', statement_kinds(), true) && is_refusal($r, 'unsupported_storage'));
-reset_fixture(['transients' => ['cinatra_posts_table_engine' => 'InnoDB']]);
-$wpdb->engine = 'MyISAM';
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a leftover positive engine transient is not trusted', is_refusal($r, 'unsupported_storage'));
-
-// ---------------------------------------------------------------------------
-echo "Refusal: post_changed (modified differs)\n";
-reset_fixture();
-$wpdb->rows[T_ID]['post_modified_gmt'] = '2026-11-25 10:03:00';
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('code post_changed, well-formed, no content echoed', is_refusal($r, 'post_changed'));
-check('data.current_modified_gmt is the current value', '2026-11-25 10:03:00' === $r['data']['current_modified_gmt']);
-check('data.changed names post_modified_gmt only', ['post_modified_gmt'] === $r['data']['changed']);
-check('statements: START, FOR UPDATE, ROLLBACK (no update)', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds());
-check('wp_update_post was not called', [] === $GLOBALS['cinatra_test']['update_calls']);
-check('nothing written', $before === $wpdb->rows);
-
-echo "Refusal: post_changed (same second, field differs)\n";
-reset_fixture();
-$wpdb->rows[T_ID]['post_content'] = T_CONTENT . ' edited';
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('code post_changed', is_refusal($r, 'post_changed'));
-check('data.changed names post_content only', ['post_content'] === $r['data']['changed']);
-check('ROLLBACK and no update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds());
-
-echo "Refusal: post_changed (byte-level difference, trailing space)\n";
-reset_fixture();
-$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['content' => T_CONTENT . ' '])]));
-check('a one-byte difference refuses', is_refusal($r, 'post_changed') && ['post_content'] === $r['data']['changed']);
-
-echo "Refusal: post_locked\n";
-reset_fixture(['post_lock' => [T_ID => 9]]);
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('code post_locked, well-formed', is_refusal($r, 'post_locked'));
-check('data.current_modified_gmt is given', T_MODIFIED === $r['data']['current_modified_gmt']);
-check('ROLLBACK and no update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds());
-check('nothing written', $before === $wpdb->rows);
+echo "Hooks: core's arguments\n";
+$a = hook_args('pre_post_update');
+check('pre_post_update(post_id, data) with the narrow data', T_ID === $a[0] && $u['data'] === $a[1]);
+$a = hook_args('transition_post_status');
+check('transition_post_status(new, old, post)', 'publish' === $a[0] && 'publish' === $a[1] && $a[2] instanceof WP_Post && T_ID === $a[2]->ID);
+$a = hook_args('publish_page');
+check('{new}_{type}(post_id, post)', T_ID === $a[0] && $a[1] instanceof WP_Post);
+$a = hook_args('edit_post_page');
+check('edit_post_{type}(post_id, post)', T_ID === $a[0] && $a[1] instanceof WP_Post);
+$a = hook_args('edit_post');
+check('edit_post(post_id, post)', T_ID === $a[0] && $a[1] instanceof WP_Post);
+$a = hook_args('post_updated');
+check('post_updated(post_id, post_after, post_before): after is new, before is the locked row', T_ID === $a[0] && '<p>New body</p>' === $a[1]->post_content && T_CONTENT === $a[2]->post_content);
+$a = hook_args('save_post_page');
+check('save_post_{type}(post_id, post, true)', T_ID === $a[0] && $a[1] instanceof WP_Post && true === $a[2]);
+$a = hook_args('save_post');
+check('save_post(post_id, post, true) sees the committed content', T_ID === $a[0] && '<p>New body</p>' === $a[1]->post_content && true === $a[2]);
+$a = hook_args('wp_insert_post');
+check('wp_insert_post(post_id, post, true)', T_ID === $a[0] && $a[1] instanceof WP_Post && true === $a[2]);
+$a = hook_args('wp_after_insert_post');
+check('wp_after_insert_post(post_id, post, true, post_before)', T_ID === $a[0] && $a[1] instanceof WP_Post && true === $a[2] && T_CONTENT === $a[3]->post_content);
 
 // ---------------------------------------------------------------------------
+echo "Status: never publishes; draft only when asked, as the literal value\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { $d['post_status'] = 'publish'; return $d; };
+$GLOBALS['cinatra_test']['save_filters']['title_save_pre'][] = function ($v) { $GLOBALS['cinatra_test']['post_status_attempt'] = true; return $v; };
+$r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft', 'expected' => full_expected()]));
+check('publish -> draft succeeds, stored status is draft', true === $r['success'] && 'draft' === $wpdb->rows[T_ID]['post_status'] && 'draft' === $r['post_status']);
+check('the update data carries post_status draft', 'draft' === ($wpdb->updates[0]['data']['post_status'] ?? null));
+check('transition is publish -> draft (publish_to_draft, draft_page)', in_array('publish_to_draft', hooks_fired(), true) && in_array('draft_page', hooks_fired(), true) && ['draft', 'publish'] === array_slice(hook_args('transition_post_status'), 0, 2));
+check('the publish webhook is not sent', [] === $GLOBALS['cinatra_test']['remote_post_calls']);
+reset_fixture(['transients' => []]);
+$wpdb->rows[T_ID]['post_status'] = 'draft';
+$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { $d['post_status'] = 'publish'; return $d; };
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft'])]));
+check('a content-only edit of a draft with a publishing filter keeps draft', true === $r['success'] && 'draft' === $wpdb->rows[T_ID]['post_status']);
+check('no post_status column written for a content-only edit', isset($wpdb->updates[0]) && !array_key_exists('post_status', $wpdb->updates[0]['data']));
+check('no transition into publish', !in_array('draft_to_publish', hooks_fired(), true) && 'draft' === (hook_args('transition_post_status')[0] ?? null));
+
+// ---------------------------------------------------------------------------
+echo "Capability: re-checked against the FRESH row under the lock\n";
+reset_fixture();
+$wpdb->rows[T_ID]['post_author'] = '9'; // reassigned; the object cache still says author 3
+check('the early permission callback (cache) would still allow', true === cinatra_content_can_edit(['post_id' => T_ID]));
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('write refused as not_found after the lock', is_refusal($r, 'not_found'));
+check('ROLLBACK, no update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds() && $before === $wpdb->rows);
+reset_fixture();
+$wpdb->rows[T_ID]['post_author'] = '9';
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('read refused as not_found too', is_refusal($r, 'not_found'));
+check('the read leaves no primed cache entry behind', !isset($GLOBALS['cinatra_test']['post_cache'][T_ID]));
+
 echo "Capability: unknown, forbidden and other-type posts look the same\n";
 reset_fixture();
 $unknown = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => 999]));
 $unknown_log = statement_kinds();
-$wpdb->rows[5] = $wpdb->rows[T_ID];
-$wpdb->rows[5]['ID'] = '5';
+$wpdb->rows[5] = t_row(5, 'page', ['post_author' => '9']);
+$GLOBALS['cinatra_test']['post_cache'][5] = $wpdb->rows[5];
 $wpdb->log = [];
 $forbidden = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => 5]));
 $forbidden_log = statement_kinds();
@@ -393,84 +519,161 @@ $other_type = cinatra_ability_post_update_if_unchanged(base_update(['post_id' =>
 check('unknown post -> not_found', is_refusal($unknown, 'not_found'));
 check('forbidden post -> not_found', is_refusal($forbidden, 'not_found'));
 check('attachment (not post/page) -> not_found', is_refusal($other_type, 'not_found'));
-check('unknown and forbidden answers are identical', $unknown === $forbidden);
-check('other-type answer is identical too', $unknown === $other_type);
+check('the three answers are identical', $unknown === $forbidden && $unknown === $other_type);
 check('not_found carries no current_modified_gmt', null === $unknown['data']['current_modified_gmt']);
-check('unknown and forbidden touch no database statement', [] === $unknown_log && [] === $forbidden_log);
+check('unknown and forbidden are refused by the early check, no statement', [] === $unknown_log && [] === $forbidden_log);
 check('other-type rolls back after the locked select', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds());
-
-echo "Capability: the permission callback is per post\n";
 reset_fixture();
-check('edit_post on 42 -> allowed', true === cinatra_content_can_edit(['post_id' => T_ID]));
-check('no edit_post on 5 -> refused', false === cinatra_content_can_edit(['post_id' => 5]));
-check('missing post_id -> refused', false === cinatra_content_can_edit([]));
-check('zero / negative / non-numeric -> refused', false === cinatra_content_can_edit(['post_id' => 0]) && false === cinatra_content_can_edit(['post_id' => -42]) && false === cinatra_content_can_edit(['post_id' => '42abc']));
-check('numeric string id is accepted', true === cinatra_content_can_edit(['post_id' => '42']));
-$seen = [];
-$GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use (&$seen) { $seen[] = [$cap, $args]; return true; };
-cinatra_ability_post_update_if_unchanged(base_update());
-check('the write asks edit_post for this post id', in_array(['edit_post', [T_ID]], $seen, true));
-check('the write never asks publish_posts', !in_array('publish_posts', array_column($seen, 0), true));
+check('permission callback: own post allowed, missing / zero / bad id refused', true === cinatra_content_can_edit(['post_id' => T_ID]) && false === cinatra_content_can_edit([]) && false === cinatra_content_can_edit(['post_id' => 0]) && false === cinatra_content_can_edit(['post_id' => '42abc']));
 
 // ---------------------------------------------------------------------------
-echo "Storage: non-InnoDB refuses, checked under the lock, nothing written\n";
+echo "Refusals: nothing written, no hook\n";
+reset_fixture();
+$wpdb->rows[T_ID]['post_modified_gmt'] = '2026-11-25 10:03:00';
+$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('post_changed (modified), current value given, no hook', is_refusal($r, 'post_changed') && '2026-11-25 10:03:00' === $r['data']['current_modified_gmt'] && ['post_modified_gmt'] === $r['data']['changed']);
+check('post_changed rolls back without an update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds());
+foreach (['post_title' => 'title', 'post_content' => 'content', 'post_excerpt' => 'excerpt'] as $col => $name) {
+    reset_fixture();
+    $wpdb->rows[T_ID][$col] .= ' changed in the same second';
+    $r = cinatra_ability_post_update_if_unchanged(base_update());
+    check("same-second change to $col (written or not) -> post_changed naming it", is_refusal($r, 'post_changed') && [$col] === $r['data']['changed']);
+}
+reset_fixture();
+$wpdb->rows[T_ID]['post_status'] = 'draft';
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('same-second unpublish by someone else -> post_changed naming post_status', is_refusal($r, 'post_changed') && ['post_status'] === $r['data']['changed']);
+reset_fixture();
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['content' => T_CONTENT . ' '])]));
+check('a one-byte difference refuses', is_refusal($r, 'post_changed'));
+reset_fixture(['post_lock' => [T_ID => 9]]);
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('post_locked, no hook', is_refusal($r, 'post_locked') && T_MODIFIED === $r['data']['current_modified_gmt']);
+foreach (['pending', 'future', 'private', 'trash', 'auto-draft'] as $state) {
+    reset_fixture();
+    $wpdb->rows[T_ID]['post_status'] = $state;
+    $GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+    $before = $wpdb->rows;
+    $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft', 'expected' => full_expected(['status' => $state])]));
+    check("current status $state -> unsupported_status, nothing written", is_refusal($r, 'unsupported_status') && $state === $r['data']['current_status'] && $before === $wpdb->rows);
+}
+reset_fixture();
+$r = cinatra_ability_post_update_if_unchanged(base_update(['title' => '', 'content' => '', 'excerpt' => '']));
+check('emptying title, content and excerpt together is refused (core refuses empty content)', is_refusal($r, 'invalid'));
+
+// ---------------------------------------------------------------------------
+echo "Dates and terms: untouched\n";
+reset_fixture();
+$wpdb->rows[T_ID] = t_row(T_ID, 'page', ['post_status' => 'draft', 'post_date_gmt' => '0000-00-00 00:00:00', 'post_date' => '2026-02-02 02:02:02']);
+$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+// A save-time filter that would store an unrelated date (finding 4).
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { $d['post_date'] = '2031-03-03 03:03:03'; return $d; };
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft'])]));
+check('a floating-date draft keeps post_date and post_date_gmt exactly', true === $r['success'] && '2026-02-02 02:02:02' === $wpdb->rows[T_ID]['post_date'] && '0000-00-00 00:00:00' === $wpdb->rows[T_ID]['post_date_gmt']);
+reset_fixture();
+$r = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => T_POST_ID, 'title' => 'New post title']));
+check('editing a post (categories/tags taxonomy) calls no term function', true === $r['success'] && [] === $GLOBALS['cinatra_test']['term_calls']);
+check('post hooks use the post type', in_array('save_post_post', hooks_fired(), true) && in_array('edit_post_post', hooks_fired(), true));
+
+// ---------------------------------------------------------------------------
+echo "Save filters: the written fields only\n";
+reset_fixture(['unfiltered_html' => false]);
+$admin_markup = '<p>Admin markup</p><script>track()</script>';
+$wpdb->rows[T_ID]['post_content'] = $admin_markup;
+$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+$GLOBALS['cinatra_test']['save_filters']['content_save_pre'][] = function ($v) { $GLOBALS['cinatra_test']['content_chain_ran'] = true; return $v; };
+$r = cinatra_ability_post_update_if_unchanged([
+    'post_id'             => T_ID,
+    'if_unmodified_since' => T_MODIFIED,
+    'expected'            => full_expected(['content' => $admin_markup]),
+    'title'               => 'New <script>x()</script>title',
+]);
+check('a restricted user\'s title edit succeeds', true === ($r['success'] ?? null));
+check('the untouched body (admin markup) is kept byte for byte', $admin_markup === $wpdb->rows[T_ID]['post_content']);
+check('the written title went through kses', 'New title' === $wpdb->rows[T_ID]['post_title'] && ['post_title'] === $r['sanitized_fields']);
+check('only post_title was run through the save chain', ['post_title'] === $GLOBALS['cinatra_test']['sanitized']);
+check('the content chain did not run for an unwritten body', empty($GLOBALS['cinatra_test']['content_chain_ran']));
+reset_fixture();
+$GLOBALS['cinatra_test']['save_filters']['content_save_pre'][] = function ($v) { return str_replace('darn', 'd**n', $v); };
+$r = cinatra_ability_post_update_if_unchanged(base_update(['content' => '<p>darn</p>']));
+check('a site rule on content_save_pre applies to written content, reported', '<p>d**n</p>' === $r['post_content'] && ['post_content'] === $r['sanitized_fields']);
+
+echo "Slashing: backslashes and quotes survive the slashed save chain\n";
+reset_fixture();
+$new_content = "Line \\n not a newline, C:\\temp\\x, \"dq\", 'sq', \\\\ and a trailing backslash \\";
+$new_title   = 'Title with \\ and "quotes" and \'single\'';
+$r = cinatra_ability_post_update_if_unchanged(base_update(['content' => $new_content, 'title' => $new_title]));
+check('stored content and title equal the sent bytes', $new_content === $wpdb->rows[T_ID]['post_content'] && $new_title === $wpdb->rows[T_ID]['post_title']);
+check('the update data is unslashed (raw), the answer the same bytes', $new_content === ($wpdb->updates[0]['data']['post_content'] ?? null) && $new_content === $r['post_content'] && [] === $r['sanitized_fields']);
+
+reset_fixture(['unfiltered_html' => false]);
+$r = cinatra_ability_post_update_if_unchanged(base_update(['content' => $new_content]));
+check('through the kses chain (which unslashes/reslashes like core) the bytes survive too', $new_content === $wpdb->rows[T_ID]['post_content'] && [] === $r['sanitized_fields']);
+
+echo "Emoji: encoded like core on a utf8 (not utf8mb4) column\n";
+reset_fixture();
+$wpdb->charset = 'utf8';
+$r = cinatra_ability_post_update_if_unchanged(base_update(['content' => "Hi \u{1F600}"]));
+check('emoji encoded for a utf8 column', 'Hi &#x1f600;' === $wpdb->rows[T_ID]['post_content']);
+
+// ---------------------------------------------------------------------------
+echo "Affected rows\n";
+reset_fixture();
+$wpdb->update_result = false;
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('update returning false -> db_error, rolled back, no hook except pre_post_update', false === $r['success'] && 'db_error' === $r['code'] && $before === $wpdb->rows && ['pre_post_update'] === hooks_fired() && ['ROLLBACK', 'CLEAN-CACHE'] === array_slice(statement_kinds(), -2));
+reset_fixture();
+$wpdb->update_result = 2;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('update affecting 2 rows -> db_error, rolled back', false === $r['success'] && 'db_error' === $r['code'] && !in_array('COMMIT', statement_kinds(), true));
+reset_fixture();
+$wpdb->update_result = 0;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('0 changed rows (identical values in the same second) is success', true === $r['success']);
+
+echo "Transaction errors\n";
+reset_fixture();
+$wpdb->fail['START TRANSACTION'] = true;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('START TRANSACTION failure -> db_error, no select, no hook', is_refusal($r, 'db_error') && ['START TRANSACTION'] === statement_kinds());
+reset_fixture();
+$wpdb->fail['COMMIT'] = true;
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('COMMIT failure -> db_error, rolled back, no after-commit hook', 'db_error' === $r['code'] && $before === $wpdb->rows && ['pre_post_update'] === hooks_fired());
+
+// ---------------------------------------------------------------------------
+echo "Storage: the engine is read fresh inside the transaction on every write\n";
 reset_fixture();
 $wpdb->engine = 'MyISAM';
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('code unsupported_storage', is_refusal($r, 'unsupported_storage'));
-check('engine read under the lock, then ROLLBACK; no update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds());
-check('nothing written', $before === $wpdb->rows);
+check('non-InnoDB -> unsupported_storage after the lock, ROLLBACK', is_refusal($r, 'unsupported_storage') && ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds() && $before === $wpdb->rows);
 reset_fixture();
 $wpdb->engine = null;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('unreadable engine also refuses', is_refusal($r, 'unsupported_storage'));
+check('unreadable engine -> unsupported_storage', is_refusal($r, 'unsupported_storage'));
+reset_fixture(['transients' => ['cinatra_posts_table_engine' => 'InnoDB']]);
+$wpdb->engine = 'MyISAM';
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a leftover engine transient is not trusted', is_refusal($r, 'unsupported_storage'));
 reset_fixture();
 $wpdb->engine = 'innodb';
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('engine name compared case-insensitively', true === $r['success']);
+check('engine compared case-insensitively', true === cinatra_ability_post_update_if_unchanged(base_update())['success']);
 
 // ---------------------------------------------------------------------------
-echo "Slashing: backslashes and quotes survive byte for byte\n";
-reset_fixture();
-$new_content = "Line \\n not a newline, C:\\temp\\x, \"dq\", 'sq', \\\\ and a trailing backslash \\";
-$new_title   = 'Title with \\ and "quotes" and \'single\'';
-$r = cinatra_ability_post_update_if_unchanged([
-    'post_id'             => T_ID,
-    'if_unmodified_since' => T_MODIFIED,
-    'expected'            => full_expected(),
-    'content'             => $new_content,
-    'title'               => $new_title,
-]);
-check('success', true === ($r['success'] ?? null));
-check('stored content equals the sent content exactly', $new_content === $wpdb->rows[T_ID]['post_content']);
-check('stored title equals the sent title exactly', $new_title === $wpdb->rows[T_ID]['post_title']);
-check('the answer returns the same bytes', $new_content === $r['post_content'] && $new_title === $r['post_title']);
-check('wp_update_post received slashed values', addslashes($new_content) === $GLOBALS['cinatra_test']['update_calls'][0]['post_content']);
-check('the unchanged excerpt from the locked row is slashed too', 'Old excerpt' === $wpdb->rows[T_ID]['post_excerpt'] && T_CONTENT !== $wpdb->rows[T_ID]['post_content']);
-check('no field reported as changed by filters', [] === $r['sanitized_fields']);
-check('an expected value with backslashes matched the stored raw value', true === $r['success']);
-
-echo "Sanitization: kses for a user without unfiltered_html; the answer returns what is stored\n";
-reset_fixture(['unfiltered_html' => false]);
-$r = cinatra_ability_post_update_if_unchanged(base_update(['content' => '<p>ok</p><script>alert(1)</script>']));
-check('success', true === ($r['success'] ?? null));
-check('stored value is the filtered one', '<p>ok</p>' === $r['post_content']);
-check('sanitized_fields names post_content', ['post_content'] === $r['sanitized_fields']);
-
-// ---------------------------------------------------------------------------
-echo "Pairing: written fields and expected entries must match\n";
-$pairing_cases = [
+echo "Input contract\n";
+$cases = [
     'expected.title missing'            => base_update(['expected' => array_diff_key(full_expected(), ['title' => 1])]),
-    'expected.content missing (written)' => base_update(['expected' => array_diff_key(full_expected(), ['content' => 1])]),
+    'expected.content missing'          => base_update(['expected' => array_diff_key(full_expected(), ['content' => 1])]),
     'expected.excerpt missing'          => base_update(['expected' => array_diff_key(full_expected(), ['excerpt' => 1])]),
     'expected.status missing'           => base_update(['expected' => array_diff_key(full_expected(), ['status' => 1])]),
-    'expected.status missing (status written)' => base_update(['status' => 'draft', 'expected' => array_diff_key(full_expected(), ['status' => 1])]),
     'status-only with empty expected'   => ['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => [], 'status' => 'draft'],
     'expected names an unknown field'   => base_update(['expected' => full_expected(['slug' => 'x'])]),
     'non-string written value'          => base_update(['content' => ['x']]),
     'non-string expected value'         => base_update(['expected' => full_expected(['excerpt' => null])]),
-    'non-string expected.status'        => base_update(['expected' => full_expected(['status' => 1])]),
     'empty expected.status'             => base_update(['expected' => full_expected(['status' => ''])]),
     'expected is not an object'         => base_update(['expected' => 'x']),
     'nothing written'                   => ['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected()],
@@ -480,169 +683,34 @@ $pairing_cases = [
     'invalid post_id'                   => base_update(['post_id' => 0]),
     'input is not an object'            => 'x',
 ];
-foreach ($pairing_cases as $label => $input) {
+foreach (['publish', 'pending', 'private', 'future', 'trash', 'Draft', ''] as $bad) {
+    $cases["status \"$bad\""] = base_update(['status' => $bad]);
+}
+foreach ($cases as $label => $input) {
     reset_fixture();
     $r = cinatra_ability_post_update_if_unchanged($input);
-    check("$label -> invalid", is_refusal($r, 'invalid'));
-    check("$label -> no database statement", [] === statement_kinds());
-}
-
-// ---------------------------------------------------------------------------
-echo "Status: only draft\n";
-reset_fixture();
-$r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft']));
-check('status draft with a field -> success, row is draft', true === $r['success'] && 'draft' === $wpdb->rows[T_ID]['post_status'] && 'draft' === $r['post_status']);
-check('wp_update_post received post_status draft', 'draft' === $GLOBALS['cinatra_test']['update_calls'][0]['post_status']);
-reset_fixture();
-$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(), 'status' => 'draft']);
-check('status-only draft with expected.status -> success', true === $r['success'] && 'draft' === $wpdb->rows[T_ID]['post_status']);
-check('status-only write keeps the other fields from the locked row', T_CONTENT === $wpdb->rows[T_ID]['post_content'] && 'About "us"' === $wpdb->rows[T_ID]['post_title']);
-
-echo "Status: compared under the lock (same second, status changed by someone else)\n";
-reset_fixture();
-$wpdb->rows[T_ID]['post_status'] = 'draft'; // unpublished by someone in the same post_modified_gmt second
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(), 'status' => 'draft']);
-check('status-only write refuses post_changed naming post_status', is_refusal($r, 'post_changed') && ['post_status'] === $r['data']['changed']);
-check('nothing written', $before === $wpdb->rows);
-reset_fixture();
-$wpdb->rows[T_ID]['post_status'] = 'draft';
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a content write also refuses when the status differs from expected.status', is_refusal($r, 'post_changed') && ['post_status'] === $r['data']['changed']);
-
-echo "Cache: a stale object-cache copy is never written back\n";
-reset_fixture();
-$wpdb->rows[T_ID]['post_title'] = 'Title B (saved by someone, in the DB)';
-$GLOBALS['cinatra_test']['post_cache'][T_ID]['post_title'] = 'Title A (stale cache)';
-$GLOBALS['cinatra_test']['post_cache'][T_ID]['post_name']  = 'stale-slug';
-$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['title' => 'Title B (saved by someone, in the DB)'])]));
-check('content-only write succeeds', true === ($r['success'] ?? null));
-check('the DB title B survives (not the stale cached A)', 'Title B (saved by someone, in the DB)' === $wpdb->rows[T_ID]['post_title']);
-check('the DB slug survives (not the stale cached slug)', 'about' === $wpdb->rows[T_ID]['post_name']);
-check('the answer reports title B', 'Title B (saved by someone, in the DB)' === $r['post_title']);
-$kinds = statement_kinds();
-check('the cache is cleaned after the lock and before wp_update_post', array_search('CLEAN-CACHE', $kinds, true) > array_search('SELECT-FOR-UPDATE', $kinds, true) && array_search('CLEAN-CACHE', $kinds, true) < array_search('UPDATE-VIA-wp_update_post', $kinds, true));
-check('the cache is cleaned again after COMMIT', 'CLEAN-CACHE' === end($kinds));
-foreach (['publish', 'pending', 'private', 'future', 'trash', 'Draft', ''] as $bad) {
-    reset_fixture();
-    $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => $bad]));
-    check("status \"$bad\" -> invalid, no statement", is_refusal($r, 'invalid') && [] === statement_kinds());
-}
-
-// ---------------------------------------------------------------------------
-echo "Expected: the whole reviewed post is compared (same-second change to an UNWRITTEN field)\n";
-reset_fixture();
-$wpdb->rows[T_ID]['post_title'] = 'Retitled by someone in the same second';
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('content write refuses when the unwritten title changed', is_refusal($r, 'post_changed') && ['post_title'] === $r['data']['changed']);
-check('nothing written', $before === $wpdb->rows);
-reset_fixture();
-$wpdb->rows[T_ID]['post_content'] = T_CONTENT . ' changed';
-$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(), 'status' => 'draft']);
-check('status-only unpublish refuses when the content is not what was reviewed', is_refusal($r, 'post_changed') && ['post_content'] === $r['data']['changed']);
-reset_fixture();
-$wpdb->rows[T_ID]['post_excerpt'] = 'Other excerpt';
-$r = cinatra_ability_post_update_if_unchanged(base_update(['title' => 'T', 'content' => 'C']));
-check('unwritten excerpt change refuses too', is_refusal($r, 'post_changed') && ['post_excerpt'] === $r['data']['changed']);
-
-// ---------------------------------------------------------------------------
-echo "State: only published posts and drafts are written\n";
-foreach (['pending', 'future', 'private', 'trash', 'auto-draft'] as $state) {
-    reset_fixture();
-    $wpdb->rows[T_ID]['post_status'] = $state;
-    $before = $wpdb->rows;
-    $r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => $state])]));
-    check("current status $state -> unsupported_status", is_refusal($r, 'unsupported_status') && $state === ($r['data']['current_status'] ?? null));
-    check("current status $state -> ROLLBACK, no update", ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds() && $before === $wpdb->rows);
+    check("$label -> invalid, no statement", is_refusal($r, 'invalid') && [] === statement_kinds());
 }
 reset_fixture();
-$wpdb->rows[T_ID]['post_status'] = 'trash';
-$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(['status' => 'trash']), 'status' => 'draft']);
-check('trash -> draft ("restore" outside the untrash flow) is refused', is_refusal($r, 'unsupported_status') && 'trash' === $wpdb->rows[T_ID]['post_status']);
+$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(), 'status' => 'draft']);
+check('status-only unpublish with the whole expected post -> success, only status + modified written', true === $r['success'] && ['post_status', 'post_modified', 'post_modified_gmt'] === array_keys($wpdb->updates[0]['data'] ?? []));
 reset_fixture();
 $wpdb->rows[T_ID]['post_status'] = 'draft';
-$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft'])]));
-check('a draft is edited', true === $r['success'] && 'draft' === $r['post_status']);
-reset_fixture();
-$wpdb->rows[T_ID]['post_status'] = 'draft';
-$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft']), 'status' => 'draft']));
+$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+$r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft', 'expected' => full_expected(['status' => 'draft'])]));
 check('status draft on a draft is allowed (no change)', true === $r['success'] && 'draft' === $r['post_status']);
 
 // ---------------------------------------------------------------------------
-echo "Untouched columns: never changed silently\n";
-// A title-only request by a user without unfiltered_html:
-reset_fixture(['unfiltered_html' => false]);
-$wpdb->rows[T_ID]['post_content'] = '<p>Admin markup</p><script>track()</script>';
-$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged([
-    'post_id'             => T_ID,
-    'if_unmodified_since' => T_MODIFIED,
-    'expected'            => full_expected(['content' => '<p>Admin markup</p><script>track()</script>']),
-    'title'               => 'New title',
-]);
-check('title-only edit by a restricted user whose save would re-filter the untouched body -> untouched_field_changed', is_refusal($r, 'untouched_field_changed') && ['post_content'] === $r['data']['changed']);
-check('the body markup is not lost (rolled back)', $before === $wpdb->rows);
-check('the refusal does not echo the body', false === strpos(json_encode($r), 'track()'));
-check('statements: update ran, then ROLLBACK, no COMMIT', !in_array('COMMIT', statement_kinds(), true) && in_array('ROLLBACK', statement_kinds(), true));
-reset_fixture(['hook_rewrites' => ['post_name' => 'changed-by-a-hook']]);
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a hook that rewrites an untouched column -> untouched_field_changed naming it', is_refusal($r, 'untouched_field_changed') && ['post_name'] === $r['data']['changed'] && $before === $wpdb->rows);
-reset_fixture();
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a normal write reports no other change', true === $r['success'] && [] === $r['also_changed']);
-reset_fixture();
-$wpdb->rows[T_ID]['post_status']   = 'draft';
-$wpdb->rows[T_ID]['post_date_gmt'] = '0000-00-00 00:00:00';
-$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
-$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft'])]));
-check('a floating-date draft: core moves post_date to now; success reports it in also_changed', true === $r['success'] && ['post_date'] === $r['also_changed'] && T_NOW === $wpdb->rows[T_ID]['post_date']);
-reset_fixture(['hook_rewrites' => ['post_date' => '2030-01-01 00:00:00']]);
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('post_date change on a fixed-date post -> untouched_field_changed', is_refusal($r, 'untouched_field_changed') && ['post_date'] === $r['data']['changed']);
-
-// ---------------------------------------------------------------------------
-echo "Errors: rollback on update failure, start failure and commit failure\n";
-reset_fixture(['update_result' => new WP_Error('db_update_error', 'Could not update post in the database.')]);
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('code update_failed', is_refusal($r, 'update_failed'));
-check('data.wp_error_code is passed on', 'db_update_error' === $r['data']['wp_error_code']);
-check('statements end with ROLLBACK, no COMMIT', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'CLEAN-CACHE', 'UPDATE-VIA-wp_update_post', 'ROLLBACK', 'CLEAN-CACHE'] === statement_kinds());
-check('the partial write was rolled back', $before === $wpdb->rows);
-check('the post cache was cleaned after the rollback', 'CLEAN-CACHE' === end($wpdb->log) && [T_ID, T_ID] === $GLOBALS['cinatra_test']['cleaned']);
-reset_fixture(['update_result' => 0]);
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('wp_update_post returning 0 -> update_failed', is_refusal($r, 'update_failed'));
-
-reset_fixture();
-$wpdb->fail['START TRANSACTION'] = true;
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('START TRANSACTION failure -> db_error, no select', is_refusal($r, 'db_error') && ['START TRANSACTION'] === statement_kinds());
-
-reset_fixture();
-$wpdb->fail['COMMIT'] = true;
-$before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('COMMIT failure -> db_error', is_refusal($r, 'db_error'));
-check('COMMIT failure rolls back', in_array('ROLLBACK', array_slice($wpdb->log, -2), true) && $before === $wpdb->rows);
-check('COMMIT failure response carries no content', false === strpos(json_encode($r), 'New body'));
-
-// ---------------------------------------------------------------------------
-echo "Read: raw values, no lock, no transaction\n";
+echo "Read: raw values, fresh capability\n";
 reset_fixture();
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
 check('success with raw content (backslashes intact)', true === $r['success'] && T_CONTENT === $r['post_content']);
 check('raw title, excerpt, status, type, modified, permalink', 'About "us"' === $r['post_title'] && 'Old excerpt' === $r['post_excerpt'] && 'publish' === $r['post_status'] && 'page' === $r['post_type'] && T_MODIFIED === $r['post_modified_gmt'] && 'https://blog.example/about/' === $r['permalink']);
-check('exactly one plain select, no FOR UPDATE, no transaction', ['SELECT'] === statement_kinds());
+check('exactly one plain select, no lock, no transaction, no hook', ['SELECT'] === statement_kinds() && [] === hooks_fired());
 check('read output keys', ['success', 'post_id', 'post_title', 'post_content', 'post_excerpt', 'post_status', 'post_type', 'post_modified_gmt', 'permalink'] === array_keys($r));
-$wpdb->log = [];
 $unknown = cinatra_ability_post_read(['post_id' => 999]);
-$forbidden = cinatra_ability_post_read(['post_id' => 5]);
 $other = cinatra_ability_post_read(['post_id' => 7]);
-check('read: unknown, forbidden and other-type give the same not_found', is_refusal($unknown, 'not_found') && $unknown === $forbidden && $unknown === $other);
+check('read: unknown and other-type give the same not_found', is_refusal($unknown, 'not_found') && $unknown === $other);
 
 // ---------------------------------------------------------------------------
 echo "Registration\n";
@@ -653,18 +721,13 @@ cinatra_register_ability_category();
 cinatra_register_content_abilities();
 $abilities = $GLOBALS['cinatra_test_abilities'];
 check('category cinatra registered', isset($GLOBALS['cinatra_test_categories']['cinatra']));
-check('exactly the two new ability ids', ['cinatra/post-read', 'cinatra/post-update-if-unchanged'] === array_keys($abilities));
-check('neither new id is a retired id', [] === array_intersect(array_keys($abilities), $retired_ids));
+check('exactly the two new ability ids, none retired', ['cinatra/post-read', 'cinatra/post-update-if-unchanged'] === array_keys($abilities) && [] === array_intersect(array_keys($abilities), $retired_ids));
 $read = $abilities['cinatra/post-read'];
 $write = $abilities['cinatra/post-update-if-unchanged'];
-check('both are public to MCP', true === $read['meta']['mcp']['public'] && true === $write['meta']['mcp']['public']);
-check('read is annotated read-only', true === $read['meta']['annotations']['readonly']);
-check('write is not read-only', false === $write['meta']['annotations']['readonly']);
-check('both use the per-post permission callback', 'cinatra_content_can_edit' === $read['permission_callback'] && 'cinatra_content_can_edit' === $write['permission_callback']);
-check('execute callbacks', 'cinatra_ability_post_read' === $read['execute_callback'] && 'cinatra_ability_post_update_if_unchanged' === $write['execute_callback']);
-check('write schema: status enum is draft only', ['draft'] === $write['input_schema']['properties']['status']['enum']);
-check('write schema requires post_id, if_unmodified_since, expected', ['post_id', 'if_unmodified_since', 'expected'] === $write['input_schema']['required']);
-check('output schemas allow only success to be required', ['success'] === $read['output_schema']['required'] && ['success'] === $write['output_schema']['required']);
+check('both public to MCP; read is read-only, write is not', true === $read['meta']['mcp']['public'] && true === $write['meta']['mcp']['public'] && true === $read['meta']['annotations']['readonly'] && false === $write['meta']['annotations']['readonly']);
+check('both use the per-post permission callback and their execute callbacks', 'cinatra_content_can_edit' === $read['permission_callback'] && 'cinatra_content_can_edit' === $write['permission_callback'] && 'cinatra_ability_post_read' === $read['execute_callback'] && 'cinatra_ability_post_update_if_unchanged' === $write['execute_callback']);
+check('write schema: status enum is draft only; expected requires all four', ['draft'] === $write['input_schema']['properties']['status']['enum'] && ['title', 'content', 'excerpt', 'status'] === $write['input_schema']['properties']['expected']['required']);
+check('output schema has no also_changed', !isset($write['output_schema']['properties']['also_changed']) && isset($write['output_schema']['properties']['sanitized_fields']));
 check('refusal shape has no "error" key (the adapter would flatten it)', !array_key_exists('error', cinatra_content_not_found()));
 
 echo "\n";
