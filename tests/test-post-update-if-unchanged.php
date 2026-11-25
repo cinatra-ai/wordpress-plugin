@@ -227,6 +227,16 @@ if (!function_exists('sanitize_post_field')) {
         return $value;
     }
 }
+if (!function_exists('is_user_logged_in')) {
+    function is_user_logged_in() { return 0 < (int) $GLOBALS['cinatra_test']['current_user_id']; }
+}
+if (!function_exists('post_type_supports')) {
+    /** Core's default supports: post has title, editor, excerpt; page has title and editor, no excerpt. */
+    function post_type_supports($type, $feature) {
+        $supports = $GLOBALS['cinatra_test']['supports'] ?? ['post' => ['title', 'editor', 'excerpt'], 'page' => ['title', 'editor']];
+        return in_array($feature, $supports[$type] ?? [], true);
+    }
+}
 if (!function_exists('absint')) {
     function absint($v) { return abs((int) $v); }
 }
@@ -682,7 +692,6 @@ check('a site filter that would publish a draft -> site_policy_conflict naming p
 echo "Capability: re-checked against the FRESH row under the lock\n";
 reset_fixture();
 $wpdb->rows[T_ID]['post_author'] = '9'; // reassigned; the object cache still says author 3
-check('the early permission callback (cache) would still allow', true === cinatra_content_can_edit(['post_id' => T_ID]));
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('write refused as not_found after the lock', is_refusal($r, 'not_found'));
@@ -709,10 +718,13 @@ check('forbidden post -> not_found', is_refusal($forbidden, 'not_found'));
 check('attachment (not post/page) -> not_found', is_refusal($other_type, 'not_found'));
 check('the three answers are identical', $unknown === $forbidden && $unknown === $other_type);
 check('not_found carries no current_modified_gmt', null === $unknown['data']['current_modified_gmt']);
-check('unknown and forbidden are refused by the early check, no statement', [] === $unknown_log && [] === $forbidden_log);
+check('unknown and forbidden take the same road ( no early cache check ): locked select, ROLLBACK', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === $unknown_log && $unknown_log === $forbidden_log);
 check('other-type rolls back after the locked select', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds());
 reset_fixture();
-check('permission callback: own post allowed, missing / zero / bad id refused', true === cinatra_content_can_edit(['post_id' => T_ID]) && false === cinatra_content_can_edit([]) && false === cinatra_content_can_edit(['post_id' => 0]) && false === cinatra_content_can_edit(['post_id' => '42abc']));
+check('permission callback: needs no post, only a logged-in caller ( it can never refuse a user the fresh-row check would allow )', true === cinatra_content_precheck(['post_id' => T_ID]) && true === cinatra_content_precheck(['post_id' => 999]) && true === cinatra_content_precheck([]));
+$GLOBALS['cinatra_test']['current_user_id'] = 0;
+check('permission callback: a logged-out caller is refused', false === cinatra_content_precheck(['post_id' => T_ID]));
+$GLOBALS['cinatra_test']['current_user_id'] = 3;
 
 // ---------------------------------------------------------------------------
 echo "Refusals: nothing written, no hook\n";
@@ -747,8 +759,22 @@ foreach (['pending', 'future', 'private', 'trash', 'auto-draft'] as $state) {
     check("current status $state -> unsupported_status, nothing written", is_refusal($r, 'unsupported_status') && $state === $r['data']['current_status'] && $before === $wpdb->rows);
 }
 reset_fixture();
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => T_POST_ID, 'title' => '', 'content' => '', 'excerpt' => '']));
+check('a post emptied ( title, content and excerpt ) -> empty_content, nothing written', is_refusal($r, 'empty_content') && $before === $wpdb->rows);
+reset_fixture();
+$r = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => T_POST_ID, 'title' => '', 'content' => '0', 'excerpt' => '']));
+check('content "0" with empty title and excerpt is empty for core ( ! "0" ) -> empty_content', is_refusal($r, 'empty_content'));
+reset_fixture();
 $r = cinatra_ability_post_update_if_unchanged(base_update(['title' => '', 'content' => '', 'excerpt' => '']));
-check('emptying title, content and excerpt together is refused (core refuses empty content)', is_refusal($r, 'invalid'));
+check('a page ( no excerpt support by default ) may be emptied, as core allows', true === ($r['success'] ?? null));
+reset_fixture();
+$seen = null;
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_empty_content'][] = function ($maybe_empty, $postarr) use (&$seen) { $seen = [$maybe_empty, $postarr]; return true; };
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a site filter vetoing a non-empty save is honoured -> empty_content, nothing written, no hook', is_refusal($r, 'empty_content') && $before === $wpdb->rows);
+check('the veto filter got core\'s arguments: false and the sanitized postarr', is_array($seen) && false === $seen[0] && T_ID === ($seen[1]['ID'] ?? null) && 'db' === ($seen[1]['filter'] ?? null) && '<p>New body</p>' === ($seen[1]['post_content'] ?? null));
 
 // ---------------------------------------------------------------------------
 echo "Dates and terms: untouched\n";
@@ -921,6 +947,75 @@ $GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; 
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('a callback writing the same values as this save is no conflict', true === ($r['success'] ?? null));
 
+// ---------------------------------------------------------------------------
+echo "Permission: a stale cache that wrongly DENIES does not refuse\n";
+reset_fixture();
+$GLOBALS['cinatra_test']['post_cache'][T_ID]['post_author'] = '9'; // stale: someone else's; the database row ( author 3 ) grants
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('read: the fresh row grants -> success with the content', true === ($r['success'] ?? null) && T_CONTENT === $r['post_content']);
+reset_fixture();
+$GLOBALS['cinatra_test']['post_cache'][T_ID]['post_author'] = '9';
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('write: the fresh row grants -> success', true === ($r['success'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+reset_fixture();
+$wpdb->rows[T_ID]['post_author'] = '9';
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('a caller the fresh row denies still gets not_found', is_refusal($r, 'not_found'));
+
+// ---------------------------------------------------------------------------
+echo "Exceptions: the transaction never stays open\n";
+$throwers = [
+    'sanitisation ( content_save_pre )' => function () { $GLOBALS['cinatra_test']['save_filters']['content_save_pre'][] = function ($v) { throw new RuntimeException('site filter failed'); }; },
+    'wp_insert_post_data'               => function () { $GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { throw new RuntimeException('site filter failed'); }; },
+    'pre_post_update'                   => function () { $GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->rows[T_ID]['post_name'] = 'half-done'; throw new RuntimeException('site filter failed'); }; },
+];
+foreach ($throwers as $stage => $install) {
+    reset_fixture();
+    $install();
+    $before = $wpdb->rows;
+    $caught = null;
+    try {
+        cinatra_ability_post_update_if_unchanged(base_update());
+    } catch (Throwable $e) {
+        $caught = $e;
+    }
+    check("a throw in $stage propagates unchanged", $caught instanceof RuntimeException && 'site filter failed' === $caught->getMessage());
+    check("a throw in $stage rolls back: nothing written, no COMMIT, ROLLBACK issued, transaction closed", $before === $wpdb->rows && !in_array('COMMIT', statement_kinds(), true) && in_array('ROLLBACK', statement_kinds(), true) && false === cinatra_content_transaction()['open']);
+    check("a throw in $stage fires no after-save hook", [] === array_diff(hooks_fired(), ['pre_post_update']));
+}
+reset_fixture();
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { throw new Error('fatal in a site plugin'); };
+$caught = null;
+try { cinatra_ability_post_update_if_unchanged(base_update()); } catch (Throwable $e) { $caught = $e; }
+check('an Error ( not only an Exception ) is rolled back and rethrown', $caught instanceof Error && false === cinatra_content_transaction()['open'] && in_array('ROLLBACK', statement_kinds(), true));
+reset_fixture();
+add_action('save_post', function () { if (!empty($GLOBALS['cinatra_test']['throw_after_commit'])) { throw new RuntimeException('after commit'); } }, 10, 3);
+$GLOBALS['cinatra_test']['throw_after_commit'] = true;
+$caught = null;
+try { cinatra_ability_post_update_if_unchanged(base_update()); } catch (Throwable $e) { $caught = $e; }
+$GLOBALS['cinatra_test']['throw_after_commit'] = false;
+check('a throw in an after-save hook propagates; the save stays committed ( no ROLLBACK after COMMIT )', $caught instanceof RuntimeException && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content'] && !in_array('ROLLBACK', statement_kinds(), true) && false === cinatra_content_transaction()['open']);
+// exit / wp_die inside a callback: the guard on the shutdown action rolls back.
+check('a shutdown guard is registered on the shutdown action', in_array('cinatra_content_shutdown_guard', $GLOBALS['cinatra_test_actions']['shutdown'] ?? [], true));
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () {
+    global $wpdb;
+    $wpdb->rows[T_ID]['post_status'] = 'publish-by-exit';
+    // What exit/wp_die leads to: PHP runs the shutdown functions, WordPress fires "shutdown".
+    cinatra_content_shutdown_guard();
+    // Observed at the moment the guard returns: an exit ends the request here.
+    $GLOBALS['cinatra_test']['after_guard'] = [cinatra_content_transaction()['open'], $wpdb->rows, statement_kinds()];
+    throw new RuntimeException('simulated exit'); // the harness cannot exit; stop here
+};
+$before = $wpdb->rows;
+try { cinatra_ability_post_update_if_unchanged(base_update()); } catch (Throwable $e) { }
+[$open_after_guard, $rows_after_guard, $log_after_guard] = $GLOBALS['cinatra_test']['after_guard'] ?? [true, null, []];
+check('the shutdown guard itself rolls back the open transaction ( exit / wp_die inside a callback )', false === $open_after_guard && $before === $rows_after_guard && 'ROLLBACK' === ($log_after_guard[count($log_after_guard) - 2] ?? null) && 'CLEAN-CACHE' === end($log_after_guard));
+reset_fixture();
+$wpdb->log = [];
+cinatra_content_shutdown_guard();
+check('the shutdown guard does nothing when no transaction is open', [] === statement_kinds());
+
 echo "Affected rows\n";
 reset_fixture();
 $wpdb->update_result = false;
@@ -1053,8 +1148,7 @@ $GLOBALS['cinatra_test']['early_done'] = false;
 $GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use ($decide_by_get_post) {
     if ('edit_post' !== $cap) { return 'unfiltered_html' === $cap; }
     $allowed = $decide_by_get_post((int) $args[0]);
-    if ($GLOBALS['cinatra_test']['early_done']) { unset($GLOBALS['cinatra_test']['post_cache'][(int) $args[0]]); } // evicted after the authoritative decision
-    $GLOBALS['cinatra_test']['early_done'] = true;
+    unset($GLOBALS['cinatra_test']['post_cache'][(int) $args[0]]); // evicted after the decision
     return $allowed;
 };
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
@@ -1065,7 +1159,6 @@ $GLOBALS['cinatra_test']['post_cache'][T_ID]['post_author'] = '9';
 $GLOBALS['cinatra_test']['early_done'] = false;
 $GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use ($decide_by_get_post) {
     if ('edit_post' !== $cap) { return 'unfiltered_html' === $cap; }
-    if (!$GLOBALS['cinatra_test']['early_done']) { $GLOBALS['cinatra_test']['early_done'] = true; return true; }
     $GLOBALS['cinatra_test']['post_cache'][(int) $args[0]]['post_author'] = '3'; // stale, allowing
     return $decide_by_get_post((int) $args[0]);
 };
@@ -1138,7 +1231,7 @@ check('exactly the two new ability ids, none retired', ['cinatra/post-read', 'ci
 $read = $abilities['cinatra/post-read'];
 $write = $abilities['cinatra/post-update-if-unchanged'];
 check('both public to MCP; read is read-only, write is not', true === $read['meta']['mcp']['public'] && true === $write['meta']['mcp']['public'] && true === $read['meta']['annotations']['readonly'] && false === $write['meta']['annotations']['readonly']);
-check('both use the per-post permission callback and their execute callbacks', 'cinatra_content_can_edit' === $read['permission_callback'] && 'cinatra_content_can_edit' === $write['permission_callback'] && 'cinatra_ability_post_read' === $read['execute_callback'] && 'cinatra_ability_post_update_if_unchanged' === $write['execute_callback']);
+check('both use the post-free pre-check as permission callback and their execute callbacks', 'cinatra_content_precheck' === $read['permission_callback'] && 'cinatra_content_precheck' === $write['permission_callback'] && 'cinatra_ability_post_read' === $read['execute_callback'] && 'cinatra_ability_post_update_if_unchanged' === $write['execute_callback']);
 check('write schema: status enum is draft only; expected requires the four values and row_token', ['draft'] === $write['input_schema']['properties']['status']['enum'] && ['title', 'content', 'excerpt', 'status', 'row_token'] === $write['input_schema']['properties']['expected']['required']);
 check('read output schema declares row_token', isset($read['output_schema']['properties']['row_token']));
 check('output schema has no also_changed', !isset($write['output_schema']['properties']['also_changed']) && isset($write['output_schema']['properties']['sanitized_fields']));

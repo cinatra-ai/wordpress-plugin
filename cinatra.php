@@ -4348,20 +4348,25 @@ function cinatra_content_post_id( $input ): int {
 }
 
 /**
- * Permission callback shared by both content abilities: the calling user can
- * edit this specific post. An unknown post and a post the user cannot edit
- * give the same answer (false), so the check does not reveal whether a post
- * exists.
+ * Permission callback shared by both content abilities: only what needs no
+ * post. The caller must be logged in. Every edit_post decision is made by
+ * the execute callback against the fresh database row; a check here would
+ * read the post through the object cache, which may be stale, and could
+ * refuse a caller the fresh row allows. No capability is checked here on
+ * purpose: core maps edit_post to edit_posts, edit_published_posts,
+ * edit_others_posts, edit_private_posts or their page counterparts, depending
+ * on the post, and a site's map_meta_cap or user_has_cap filter may grant
+ * edit_post to a user without any of them, so any primitive capability
+ * required here could refuse a user the fresh check would allow. A caller
+ * the fresh check denies gets the same not_found answer as for an unknown
+ * post.
  *
- * @param mixed $input Ability input ( expects 'post_id' ).
- * @return bool True when the current user may edit the target post.
+ * @param mixed $input Ability input ( unused: the post is checked later ).
+ * @return bool True when a user is logged in.
  */
-function cinatra_content_can_edit( $input = array() ): bool {
-	$id = cinatra_content_post_id( $input );
-	if ( 1 > $id ) {
-		return false;
-	}
-	return (bool) current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
+function cinatra_content_precheck( $input = array() ): bool {
+	unset( $input );
+	return is_user_logged_in();
 }
 
 /**
@@ -4561,10 +4566,10 @@ function cinatra_posts_table_engine(): string {
  * @return array<string,mixed> The post payload, or a refusal result.
  */
 function cinatra_ability_post_read( $input = array() ): array {
-	if ( ! cinatra_content_can_edit( $input ) ) {
+	$id = cinatra_content_post_id( $input );
+	if ( 1 > $id ) {
 		return cinatra_content_not_found();
 	}
-	$id = cinatra_content_post_id( $input );
 	// Re-check against the row just read. Another request may commit between
 	// the read and the check ( the read holds no lock ): then read again,
 	// once, before refusing.
@@ -4793,6 +4798,52 @@ function cinatra_content_widened_columns( array $locked, array $data, array $sto
 }
 
 /**
+ * The write's transaction state for this request: whether a transaction this
+ * plugin started is still open, and for which post. Pass true with an ID when
+ * starting, false when it ends ( COMMIT or ROLLBACK ); no argument reads it.
+ *
+ * @param bool|null $open True to mark it open, false to mark it closed, null to read.
+ * @param int       $id   The post ID ( with true ).
+ * @return array{open:bool,id:int} The state after the call.
+ */
+function cinatra_content_transaction( ?bool $open = null, int $id = 0 ): array {
+	static $state = array(
+		'open' => false,
+		'id'   => 0,
+	);
+	if ( true === $open ) {
+		$state = array(
+			'open' => true,
+			'id'   => $id,
+		);
+	} elseif ( false === $open ) {
+		$state = array(
+			'open' => false,
+			'id'   => 0,
+		);
+	}
+	return $state;
+}
+
+/**
+ * Shutdown guard for exit() or wp_die() inside a site callback while the
+ * write's transaction is open: PHP then runs its shutdown functions and
+ * WordPress fires the shutdown action, where this runs first ( lowest
+ * priority ), on the same database connection, before other shutdown
+ * callbacks can issue statements inside the open transaction. It rolls back
+ * and cleans the post's cache. With no open transaction it does nothing.
+ *
+ * @return void
+ */
+function cinatra_content_shutdown_guard(): void {
+	$state = cinatra_content_transaction();
+	if ( $state['open'] ) {
+		cinatra_content_rollback( (int) $state['id'] );
+	}
+}
+add_action( 'shutdown', 'cinatra_content_shutdown_guard', PHP_INT_MIN );
+
+/**
  * Roll back the open transaction and, when a write may have run, drop the
  * post's object cache so no request serves the rolled-back value.
  *
@@ -4801,6 +4852,7 @@ function cinatra_content_widened_columns( array $locked, array $data, array $sto
  */
 function cinatra_content_rollback( int $touched_id = 0 ): void {
 	global $wpdb;
+	cinatra_content_transaction( false );
 	$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
 	if ( 0 < $touched_id ) {
 		clean_post_cache( $touched_id );
@@ -4839,16 +4891,34 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 	}
 	$id = (int) $parsed['id'];
 
-	// Early check ( the object cache may be older ); the authoritative check
-	// follows under the lock.
-	if ( ! cinatra_content_can_edit( $input ) ) {
-		return cinatra_content_not_found();
-	}
-
 	if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
 		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be started. Nothing was written.', 'cinatra' ) );
 	}
+	cinatra_content_transaction( true, $id );
 
+	// Site callbacks run inside the transaction ( save filters,
+	// wp_insert_post_data, pre_post_update ). Whatever they throw, the
+	// transaction does not stay open: finally rolls it back if no COMMIT or
+	// ROLLBACK closed it, and the Throwable propagates unchanged.
+	try {
+		return cinatra_content_update_in_transaction( $parsed );
+	} finally {
+		if ( cinatra_content_transaction()['open'] ) {
+			cinatra_content_rollback( $id );
+		}
+	}
+}
+
+/**
+ * The write, run inside the open transaction ( see the caller ): every return
+ * path ends the transaction with COMMIT or ROLLBACK.
+ *
+ * @param array<string,mixed> $parsed The validated input.
+ * @return array<string,mixed> The stored values after the save, or a refusal result.
+ */
+function cinatra_content_update_in_transaction( array $parsed ): array {
+	global $wpdb;
+	$id  = (int) $parsed['id'];
 	$row = cinatra_content_select_row( $id, true );
 
 	// Verified in this transaction, after the lock ( see the engine helper ):
@@ -4964,10 +5034,28 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 			$written[ $column ] = wp_encode_emoji( $written[ $column ] );
 		}
 	}
-	$after = array_merge( $row, $written );
-	if ( '' === (string) $after['post_title'] && '' === (string) $after['post_content'] && '' === (string) $after['post_excerpt'] ) {
+
+	/*
+	 * Core's empty-content decision, exactly as wp_insert_post() makes it
+	 * ( wp-includes/post.php ), on the same $postarr:
+	 *
+	 *     $maybe_empty = 'attachment' !== $post_type
+	 *         && ! $post_content && ! $post_title && ! $post_excerpt
+	 *         && post_type_supports( $post_type, 'editor' )
+	 *         && post_type_supports( $post_type, 'title' )
+	 *         && post_type_supports( $post_type, 'excerpt' );
+	 *     if ( apply_filters( 'wp_insert_post_empty_content', $maybe_empty, $postarr ) ) { // Refuse.
+	 */
+	$post_type   = (string) $postarr['post_type'];
+	$maybe_empty = 'attachment' !== $post_type
+		&& ! $postarr['post_content'] && ! $postarr['post_title'] && ! $postarr['post_excerpt']
+		&& post_type_supports( $post_type, 'editor' )
+		&& post_type_supports( $post_type, 'title' )
+		&& post_type_supports( $post_type, 'excerpt' );
+	/** This filter is documented in wp-includes/post.php. */
+	if ( apply_filters( 'wp_insert_post_empty_content', $maybe_empty, $postarr ) ) { // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own save filter, run as wp_insert_post() runs it.
 		cinatra_content_rollback();
-		return cinatra_content_refusal( 'invalid', __( 'Title, content and excerpt cannot all be empty.', 'cinatra' ), $current_modified );
+		return cinatra_content_refusal( 'empty_content', __( 'The post would be empty ( content, title and excerpt ), or a site policy considers it empty. Nothing was written.', 'cinatra' ), $current_modified );
 	}
 	// The status went through core's status chain above ( pre_post_status and
 	// status_save_pre ): "draft" when asked, otherwise the current status,
@@ -5056,7 +5144,11 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		);
 	}
 
-	if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
+	$committed = $wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
+	if ( false !== $committed ) {
+		cinatra_content_transaction( false );
+	}
+	if ( false === $committed ) {
 		cinatra_content_rollback( $id );
 		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be committed. Nothing was written.', 'cinatra' ), $current_modified );
 	}
@@ -5201,7 +5293,7 @@ function cinatra_register_content_abilities(): void {
 			),
 			'output_schema'       => cinatra_content_output_schema( false ),
 			'execute_callback'    => 'cinatra_ability_post_read',
-			'permission_callback' => 'cinatra_content_can_edit',
+			'permission_callback' => 'cinatra_content_precheck',
 			'meta'                => array(
 				'mcp'          => array( 'public' => true ),
 				'annotations'  => array(
@@ -5262,7 +5354,7 @@ function cinatra_register_content_abilities(): void {
 			),
 			'output_schema'       => cinatra_content_output_schema( true ),
 			'execute_callback'    => 'cinatra_ability_post_update_if_unchanged',
-			'permission_callback' => 'cinatra_content_can_edit',
+			'permission_callback' => 'cinatra_content_precheck',
 			'meta'                => array(
 				'mcp'          => array( 'public' => true ),
 				'annotations'  => array(

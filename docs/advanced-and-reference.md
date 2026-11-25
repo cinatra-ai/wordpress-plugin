@@ -158,7 +158,13 @@ made in the transaction are rolled back with it.
   menu order, the comment settings, the categories, the tags or other terms.
   A title change does not change the slug of a published page. A draft without
   a set date keeps its date.
-- Title, content and excerpt cannot all become empty, as in WordPress.
+- Empty content is decided as in WordPress: the post counts as empty when
+  its content, title and excerpt are all empty for PHP (for example the
+  content `"0"` counts as empty) and its post type supports the editor, the
+  title and the excerpt (by default posts do, pages do not support the
+  excerpt). The site's `wp_insert_post_empty_content` filters then decide,
+  with the same arguments as in WordPress, and can also refuse a save that
+  is not empty. A refused save gives `empty_content`.
 - After the commit, the ability clears the post's cache and runs the hooks that
   WordPress runs after an update, in the same order and with the same
   arguments: `transition_post_status` (with `{old}_to_{new}` and
@@ -209,16 +215,30 @@ made in the transaction are rolled back with it.
   a statement that commits implicitly, such as `CREATE TABLE`) also commits
   the changes made up to that point, so a later refusal cannot roll them
   back.
+- If a callback throws an exception or an error inside the transaction, the
+  transaction is rolled back, and the exception continues to the caller
+  unchanged. If a callback ends the request inside the transaction (`exit`
+  or `wp_die()`), the ability rolls back on WordPress's `shutdown` action,
+  before the other shutdown callbacks, on the same database connection.
+  This cannot cover a PHP shutdown function that a site registered before
+  WordPress loaded (it runs earlier, inside the open transaction), a process
+  that is killed or a PHP error that stops the request before shutdown runs;
+  in those cases the database rolls the transaction back when the connection
+  closes, unless the site uses a persistent database connection.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines
   cannot lock a row. Each write reads the engine again inside its transaction,
   after the row lock. On other engines, the write is refused.
 
-Both abilities require the `edit_post` capability for the specific post, and
-check it against the row that they read. An unknown post, a post that is not a
-post or a page, and a post that the user cannot edit give the same `not_found`
-answer.
+Both abilities require the `edit_post` capability for the specific post. They
+check it only against the row that they read, not against a cached copy, so a
+stale cache can neither allow nor refuse the caller. Before the ability runs,
+the Abilities API checks only that the caller is logged in. A capability
+check there would read the post from the object cache, and a site can grant
+`edit_post` without any of the general editing capabilities. An unknown
+post, a post that is not a post or a page, and a post that the user cannot
+edit give the same `not_found` answer.
 
 WordPress decides `edit_post` on the post that `get_post()` returns, which can
 come from the object cache. The abilities never write the object cache
@@ -243,12 +263,12 @@ The codes are `post_changed` (`data.changed` names the fields that differ),
 or site code would change), `post_locked` (another user is editing the post),
 `unsupported_status` (`data.current_status` names the status),
 `permission_unverified` (the permission decision could not be verified against
-the current post), `invalid`, `not_found`, `unsupported_storage` and
-`db_error`. After a refusal, nothing
+the current post; this shows that the post exists), `empty_content`,
+`invalid`, `not_found`, `unsupported_storage` and `db_error`. After a refusal, nothing
 is written, and a refusal never contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call
-without the `edit_post` capability, before the ability runs. An MCP client then
+by a user who is not logged in, before the ability runs. An MCP client then
 receives an error result that contains only a message. Nothing is written in
 those cases either.
 
