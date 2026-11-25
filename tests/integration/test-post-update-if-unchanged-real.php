@@ -804,7 +804,10 @@ try {
 			cinatra_it_assert( true === ( $result['success'] ?? null ), 'the save did not succeed', $result );
 			cinatra_it_assert( array() === $acted, 'a site query filter ran for a control statement', $acted );
 			cinatra_it_assert( in_array( 'START TRANSACTION', $sent, true ) && in_array( 'COMMIT', $sent, true ) && ! in_array( 'COMMIT', $filtered, true ), 'the statement log and the filter view do not show the suspension', array( $sent, $filtered ) );
-			cinatra_it_assert( 1 === count( preg_grep( '/^UPDATE `/', $filtered ) ), 'the site filter did not see the UPDATE', $filtered );
+			// The ability's conditional UPDATE ( WHERE `ID` = n AND the row condition );
+			// the after-save hooks send further UPDATEs of their own ( the revision ).
+			$conditional = preg_grep( '/^UPDATE `' . preg_quote( $wpdb->posts, '/' ) . '` SET .* WHERE `ID` = ' . (int) $id . ' AND SHA2\(/s', $filtered );
+			cinatra_it_assert( 1 === count( $conditional ), 'the site filter did not see the conditional UPDATE exactly once', $filtered );
 			cinatra_it_assert( $hook === $back && 10 === has_filter( 'query', 'cinatra_it_record_query' ), 'the query hook object or its callbacks were not restored' );
 			cinatra_it_assert( '' === cinatra_content_open_transaction_state() && false === cinatra_content_transaction()['open'], 'a transaction stayed open after the save', cinatra_it_diag() );
 			return 'filter calls on control statements: 0';

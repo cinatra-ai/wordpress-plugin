@@ -1761,7 +1761,7 @@ reset_fixture();
 set_query_filter(function ($sql) {});
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 $saw = $GLOBALS['cinatra_test']['query_filter_saw'];
-check('success with a site query filter: the filter saw the plain permission read and the UPDATE, and none of the control statements', true === ($r['success'] ?? null) && [] === array_values(array_filter($saw, $is_control)) && 1 === count(array_filter($saw, $is_update)));
+check('success with a site query filter: the filter saw the plain permission read and the conditional UPDATE ( WHERE `ID` = n AND SHA2( ... ) ), and none of the control statements', true === ($r['success'] ?? null) && [] === array_values(array_filter($saw, $is_control)) && 1 === count(preg_grep('/^UPDATE `wp_posts` SET .* WHERE `ID` = ' . T_ID . ' AND SHA2\\(/s', $saw)));
 // The filter writes during the probe's ROLLBACK TO SAVEPOINT ( a foreign
 // transaction is open, so the probe's statements succeed ).
 reset_fixture();
