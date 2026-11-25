@@ -368,3 +368,13 @@ jobs:
             exit 1
           fi
           echo "Plugin Check passed: no blocking findings."
+      - name: Run content abilities integration test (real MySQL, cinatra#3745)
+        # The abilities against the real mysql:8.4 service: the transaction
+        # detection, the row lock, COMMIT/ROLLBACK and the hook order, which the
+        # stub tests cannot prove. The plugin copy above excludes tests/, so the
+        # file runs from the checkout; Plugin Check does not activate the plugin.
+        run: |
+          set -euo pipefail
+          WP="$GITHUB_WORKSPACE/wp"
+          wp plugin activate cinatra --path="$WP"
+          wp eval-file "$GITHUB_WORKSPACE/src/tests/integration/test-post-update-if-unchanged-real.php" --path="$WP"

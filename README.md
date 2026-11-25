@@ -136,6 +136,7 @@ node tools/generate-wordpress-org-assets.mjs   # regenerate .wordpress-org asset
 node tests/test-widget-negotiation.mjs         # widget bootstrap negotiation tests
 php tests/test-token-broker.php                # token-broker unit tests
 php tests/test-publish-emitter.php             # publish-emitter unit tests
+wp eval-file tests/integration/test-post-update-if-unchanged-real.php --path=<wp>  # content abilities against a real database (needs WordPress + MySQL; runs in CI plugin-check)
 ```
 
 ### Releasing
