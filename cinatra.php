@@ -4264,8 +4264,9 @@ add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );
 // table (no object cache), so the review is based on a fresh site value.
 // - cinatra/post-update-if-unchanged writes only when the post is still as
 // reviewed: in ONE database transaction it locks the post row
-// (SELECT ... FOR UPDATE), compares post_modified_gmt and the before-value of
-// every written field byte for byte, and only then calls wp_update_post().
+// (SELECT ... FOR UPDATE), compares post_modified_gmt, the post status and the
+// before-value of every written field byte for byte, and only then calls
+// wp_update_post() with the full row read under the lock.
 // An edit saved in between makes the write refuse, and nothing is written.
 //
 // Both register on the Abilities API hooks only; the plugin loads unchanged
@@ -4280,7 +4281,6 @@ add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );
 const CINATRA_ABILITY_CATEGORY                 = 'cinatra';
 const CINATRA_ABILITY_POST_READ                = 'cinatra/post-read';
 const CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED = 'cinatra/post-update-if-unchanged';
-const CINATRA_POSTS_ENGINE_TRANSIENT           = 'cinatra_posts_table_engine';
 
 /**
  * Invoke a function provided by an optional dependency (the Abilities API)
@@ -4390,8 +4390,9 @@ function cinatra_content_not_found(): array {
 }
 
 /**
- * Read one post row straight from the posts table ( bypassing the object
- * cache ), optionally locking it for the rest of the open transaction.
+ * Read one full post row ( every column ) straight from the posts table,
+ * bypassing the object cache, optionally locking it for the rest of the open
+ * transaction.
  *
  * @param int  $id         Post ID.
  * @param bool $for_update True to add FOR UPDATE ( row lock inside a transaction ).
@@ -4400,9 +4401,9 @@ function cinatra_content_not_found(): array {
 function cinatra_content_select_row( int $id, bool $for_update ): ?array {
 	global $wpdb;
 	if ( $for_update ) {
-		$row = $wpdb->get_row( $wpdb->prepare( "SELECT ID, post_type, post_status, post_title, post_content, post_excerpt, post_modified_gmt FROM {$wpdb->posts} WHERE ID = %d FOR UPDATE", $id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The row lock and the fresh value are the purpose; a cached value would defeat the check.
+		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->posts} WHERE ID = %d FOR UPDATE", $id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The row lock and the fresh value are the purpose; a cached value would defeat the check.
 	} else {
-		$row = $wpdb->get_row( $wpdb->prepare( "SELECT ID, post_type, post_status, post_title, post_content, post_excerpt, post_modified_gmt FROM {$wpdb->posts} WHERE ID = %d", $id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The fresh stored value is the purpose; a cached value could be stale.
+		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->posts} WHERE ID = %d", $id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The fresh stored value is the purpose; a cached value could be stale.
 	}
 	return is_array( $row ) ? $row : null;
 }
@@ -4430,25 +4431,19 @@ function cinatra_content_shape_row( array $row ): array {
 }
 
 /**
- * The storage engine of the posts table ( for example "InnoDB" ), read from
- * information_schema once and then cached in a transient for a day ( the
- * object cache when the site has one ). An empty string means it could not be
- * read; that is never cached.
+ * The storage engine of the posts table ( for example "InnoDB" ), read fresh
+ * from information_schema on every call and never cached. The write calls it
+ * inside its transaction, after the row lock: the lock holds a metadata lock
+ * on the table, so a change of engine ( ALTER TABLE ) cannot happen until the
+ * transaction ends, and the answer cannot be stale for the write that relies
+ * on it. The cost is one small information_schema query per write.
  *
  * @return string The engine name, or '' when unknown.
  */
 function cinatra_posts_table_engine(): string {
-	$cached = get_transient( CINATRA_POSTS_ENGINE_TRANSIENT );
-	if ( is_string( $cached ) && '' !== $cached ) {
-		return $cached;
-	}
 	global $wpdb;
-	$read = $wpdb->get_var( $wpdb->prepare( 'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s', $wpdb->posts ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Cached in a transient right below.
-	$read = is_string( $read ) ? $read : '';
-	if ( '' !== $read ) {
-		set_transient( CINATRA_POSTS_ENGINE_TRANSIENT, $read, DAY_IN_SECONDS );
-	}
-	return $read;
+	$read = $wpdb->get_var( $wpdb->prepare( 'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s', $wpdb->posts ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Deliberately uncached: the write must verify the engine in the same transaction that relies on it.
+	return is_string( $read ) ? $read : '';
 }
 
 /**
@@ -4473,7 +4468,14 @@ function cinatra_ability_post_read( $input = array() ): array {
  * Validate the input of cinatra/post-update-if-unchanged. Pure: no database.
  *
  * @param mixed $input Ability input.
- * @return array<string,mixed> On success: [ 'ok' => true, 'id', 'since', 'fields' ( column => new value ), 'expected' ( column => before-value ), 'status' ( 'draft' or null ) ]; otherwise an 'invalid' refusal result.
+ * Pairing rule: every written text field ( title, content, excerpt ) has its
+ * before-value in expected, and expected names no text field that is not
+ * written. expected.status ( the post status that was read ) is ALWAYS
+ * required, whether or not status is written, and is compared under the lock:
+ * the status is part of what the review saw ( an edit to a published page is
+ * live at once ), and a write of status needs its before-value like any field.
+ *
+ * @return array<string,mixed> On success: [ 'ok' => true, 'id', 'since', 'fields' ( column => new value ), 'expected' ( column => before-value, post_status included ), 'status' ( 'draft' or null ) ]; otherwise an 'invalid' refusal result.
  */
 function cinatra_content_parse_update_input( $input ): array {
 	if ( ! is_array( $input ) ) {
@@ -4500,8 +4502,11 @@ function cinatra_content_parse_update_input( $input ): array {
 	if ( ! is_array( $expected_in ) ) {
 		return cinatra_content_refusal( 'invalid', __( 'expected must be an object.', 'cinatra' ) );
 	}
-	if ( array() !== array_diff( array_keys( $expected_in ), array_keys( $writable ) ) ) {
-		return cinatra_content_refusal( 'invalid', __( 'expected may only name title, content or excerpt.', 'cinatra' ) );
+	if ( array() !== array_diff( array_keys( $expected_in ), array_merge( array_keys( $writable ), array( 'status' ) ) ) ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected may only name title, content, excerpt or status.', 'cinatra' ) );
+	}
+	if ( ! isset( $expected_in['status'] ) || ! is_string( $expected_in['status'] ) || '' === $expected_in['status'] ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected.status is required: the post status of the read the change is based on.', 'cinatra' ) );
 	}
 
 	$fields   = array();
@@ -4510,7 +4515,7 @@ function cinatra_content_parse_update_input( $input ): array {
 		$written    = array_key_exists( $name, $input );
 		$has_before = array_key_exists( $name, $expected_in );
 		if ( $written !== $has_before ) {
-			return cinatra_content_refusal( 'invalid', __( 'Every written field needs its before-value in expected, and expected may only name written fields.', 'cinatra' ) );
+			return cinatra_content_refusal( 'invalid', __( 'Every written title, content or excerpt needs its before-value in expected, and expected may only name written fields (and status).', 'cinatra' ) );
 		}
 		if ( ! $written ) {
 			continue;
@@ -4521,6 +4526,7 @@ function cinatra_content_parse_update_input( $input ): array {
 		$fields[ $column ]   = $input[ $name ];
 		$expected[ $column ] = $expected_in[ $name ];
 	}
+	$expected['post_status'] = $expected_in['status'];
 
 	$status = null;
 	if ( array_key_exists( 'status', $input ) ) {
@@ -4562,9 +4568,10 @@ function cinatra_content_rollback( int $touched_id = 0 ): void {
 /**
  * Execute callback for cinatra/post-update-if-unchanged.
  *
- * In one transaction: lock the post row, refuse when another user holds the
- * edit lock, compare post_modified_gmt and every written field's before-value
- * byte for byte, then wp_update_post() and COMMIT. Any refusal or error rolls
+ * In one transaction: lock the post row, verify the InnoDB engine, refuse
+ * when another user holds the edit lock, compare post_modified_gmt, the post
+ * status and every written field's before-value byte for byte, then
+ * wp_update_post() with the full locked row and COMMIT. Any refusal or error rolls
  * back, so nothing is written. Content passes through the same filters a
  * normal save by this user applies ( kses for users without unfiltered_html ),
  * so the stored value can differ from the sent one: the answer returns what is
@@ -4586,18 +4593,22 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		return cinatra_content_not_found();
 	}
 
+	if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
+		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be started. Nothing was written.', 'cinatra' ) );
+	}
+
+	$row = cinatra_content_select_row( $id, true );
+
+	// Verified in this transaction, after the lock ( see the engine helper ):
+	// without InnoDB the row lock and the rollback would not protect the write.
 	if ( 'innodb' !== strtolower( cinatra_posts_table_engine() ) ) {
+		cinatra_content_rollback();
 		return cinatra_content_refusal(
 			'unsupported_storage',
 			__( 'The posts table does not use the InnoDB storage engine, so the post cannot be locked during the check. Nothing was written.', 'cinatra' )
 		);
 	}
 
-	if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
-		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be started. Nothing was written.', 'cinatra' ) );
-	}
-
-	$row = cinatra_content_select_row( $id, true );
 	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
 		cinatra_content_rollback();
 		return cinatra_content_not_found();
@@ -4635,7 +4646,15 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		);
 	}
 
-	$postarr = $parsed['fields'];
+	// wp_update_post() starts from get_post( $id, ARRAY_A ), which can come
+	// from the object cache, and merges the given fields over it; a partial
+	// update would write any stale cached column back. So the save is built
+	// from the FULL row read under the lock ( every column ), with the written
+	// fields on top: the cached copy cannot contribute a column. The cache is
+	// also cleared now, so wp_update_post() and the save hooks re-read the
+	// post from the database inside this transaction.
+	clean_post_cache( $id );
+	$postarr = array_merge( $row, $parsed['fields'] );
 	if ( null !== $parsed['status'] ) {
 		$postarr['post_status'] = $parsed['status'];
 	}
@@ -4665,6 +4684,9 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		cinatra_content_rollback( $id );
 		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be committed. Nothing was written.', 'cinatra' ), $current_modified );
 	}
+	// wp_update_post() cleaned the cache before COMMIT; a concurrent request
+	// may have cached the pre-commit row since. Clean once more.
+	clean_post_cache( $id );
 
 	$answer    = cinatra_content_shape_row( $stored );
 	$sanitized = array();
@@ -4821,9 +4843,11 @@ function cinatra_register_content_abilities(): void {
 							'title'   => $text,
 							'content' => $text,
 							'excerpt' => $text,
+							'status'  => $text,
 						),
+						'required'             => array( 'status' ),
 						'additionalProperties' => false,
-						'description'          => __( 'The before-value of each written field, byte for byte as read.', 'cinatra' ),
+						'description'          => __( 'The before-value of each written field, byte for byte as read, and always the post status as read.', 'cinatra' ),
 					),
 					'title'               => $text,
 					'content'             => $text,
