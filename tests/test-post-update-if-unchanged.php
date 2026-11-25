@@ -95,6 +95,11 @@ class Cinatra_Test_Wpdb {
             if (is_object($this->dbh)) { $this->dbh->errno = 0; }
             return 0;
         }
+        // on_commit: the test decides what COMMIT does ( see apply_commit(),
+        // server_rollback(), lose_connection() ) and what it returns.
+        if ('COMMIT' === $sql && null !== $this->on_commit) {
+            return ($this->on_commit)($this);
+        }
         if (!empty($this->fail[$sql])) {
             return false;
         }
@@ -113,8 +118,43 @@ class Cinatra_Test_Wpdb {
         }
         return 0;
     }
+    public $on_commit = null;      // callable( $wpdb ): what COMMIT does and returns
+    public $select_fails = false;  // get_row() answers null ( a failed read )
+    public $connection_ok = true;  // what check_connection() answers
+    public $connection_checks = 0;
+    /** The server committed the transaction ( whatever COMMIT then returns ). */
+    public function apply_commit() {
+        $this->snapshot = null;
+        $this->savepoints = [];
+    }
+    /** The server rolled the transaction back ( e.g. its connection ended ). */
+    public function server_rollback() {
+        if (null !== $this->snapshot) {
+            $this->rows = $this->snapshot;
+        }
+        $this->snapshot = null;
+        $this->savepoints = [];
+    }
+    /**
+     * The connection is lost and wpdb reconnects, as wpdb::query() does after
+     * error 2006: the server rolls the open transaction back, $wpdb->dbh is a
+     * new connection object, and later statements run with autocommit.
+     */
+    public function lose_connection() {
+        $this->server_rollback();
+        $this->dbh = new stdClass();
+        $this->dbh->errno = 0;
+    }
+    /** wpdb::check_connection( $allow_bail ): ping, reconnect if needed. */
+    public function check_connection($allow_bail = true) {
+        $this->connection_checks++;
+        return $this->connection_ok;
+    }
     public function get_row($sql, $output = null) {
         $this->log[] = $sql;
+        if ($this->select_fails) {
+            return null;
+        }
         if (!preg_match('/WHERE ID = (\d+)/', $sql, $m)) {
             return null;
         }
@@ -209,15 +249,42 @@ if (!function_exists('wp_cache_delete')) {
         return true;
     }
 }
+if (!function_exists('wp_suspend_cache_invalidation')) {
+    /** Core ( wp-includes/functions.php ): sets the global, returns the previous value. */
+    function wp_suspend_cache_invalidation($suspend = true) {
+        $current = $GLOBALS['_wp_suspend_cache_invalidation'] ?? null;
+        $GLOBALS['_wp_suspend_cache_invalidation'] = $suspend;
+        $GLOBALS['cinatra_test']['suspend_calls'][] = $suspend;
+        return $current;
+    }
+}
+if (!function_exists('wp_cache_get')) {
+    /** The posts group of the modelled object cache: the cached row ( an object ) or false. */
+    function wp_cache_get($key, $group = '', $force = false, &$found = null) {
+        if ('posts' === $group && isset($GLOBALS['cinatra_test']['post_cache'][(int) $key])) {
+            $found = true;
+            return (object) $GLOBALS['cinatra_test']['post_cache'][(int) $key];
+        }
+        $found = false;
+        return false;
+    }
+}
 if (!function_exists('clean_post_cache')) {
     function clean_post_cache($post_id) {
         global $wpdb;
         $GLOBALS['cinatra_test']['cleaned'][] = (int) $post_id;
+        // Core returns at once while invalidation is suspended ( wp-includes/post.php, clean_post_cache() ).
+        if (!empty($GLOBALS['_wp_suspend_cache_invalidation'])) {
+            $wpdb->log[] = 'CLEAN-CACHE';
+            $GLOBALS['cinatra_test']['clean_suspended'][] = (int) $post_id;
+            return;
+        }
         // clean_ignored: a broken object-cache drop-in that keeps the entry.
         if (empty($GLOBALS['cinatra_test']['clean_ignored'])) {
             unset($GLOBALS['cinatra_test']['post_cache'][(int) $post_id]);
         }
         $wpdb->log[] = 'CLEAN-CACHE';
+        do_action('clean_post_cache', (int) $post_id); // core fires it after the deletes
     }
 }
 if (!function_exists('get_post')) {
@@ -481,6 +548,7 @@ function t_row(int $id, string $type, array $over = []): array {
 function reset_fixture(array $overrides = []) {
     global $wpdb;
     $wpdb = new Cinatra_Test_Wpdb();
+    $GLOBALS['_wp_suspend_cache_invalidation'] = false;
     $wpdb->rows = [
         T_ID      => t_row(T_ID, 'page'),
         T_POST_ID => t_row(T_POST_ID, 'post'),
@@ -749,6 +817,37 @@ check('a four-argument filter sees the caller\'s raw content in unsanitized_post
 check('postarr post_modified is what core gives it: the stored value, not the new time', '2026-11-25 11:00:00' === ($seen[2] ?? null) && T_MODIFIED === ($seen[3] ?? null));
 
 // ---------------------------------------------------------------------------
+echo "wp_insert_post_data and pre_post_update: each column has core's type\n";
+/*
+ * Core 7.1.5, wp-includes/post.php, wp_insert_post() on an update through
+ * wp_update_post(): post_parent and menu_order are cast with (int) ( lines
+ * 4834-4848 ); every other column of the compact() at line 4912 is a string
+ * ( post_author: $postarr['post_author'], line 4824, the numeric string
+ * WP_Post holds, class-wp-post.php line 68; guid: get_post_field(), line
+ * 4653; the dates, slug, status and texts are strings ). wp_slash() at the
+ * filter and wp_unslash() before pre_post_update ( line 4981 ) keep the types.
+ */
+$want_types = [];
+foreach ($core_cols as $col) { $want_types[$col] = in_array($col, ['post_parent', 'menu_order'], true) ? 'integer' : 'string'; }
+reset_fixture();
+$seen_types = [];
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) use (&$seen_types) { $seen_types = array_map('gettype', $d); return $d; };
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function ($id, $d) use (&$pre_types) { $pre_types = array_map('gettype', $d); };
+$pre_types = [];
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('wp_insert_post_data: post_parent and menu_order are integers, every other column a string', true === ($r['success'] ?? null) && $want_types === $seen_types);
+check('pre_post_update: the same types', $want_types === $pre_types);
+// A strict site policy ( === on an integer ) takes core's branch.
+reset_fixture();
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) {
+    if (0 !== $d['post_parent'] || 0 !== $d['menu_order']) {
+        $d['post_name'] = 'strict-policy-moved'; // the branch core's types never take
+    }
+    return $d;
+};
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a strict policy ( 0 === post_parent ) leaves the data alone, as on a core save: success', true === ($r['success'] ?? null) && 'about' === $wpdb->rows[T_ID]['post_name']);
+
 echo "Status: never publishes; draft only when asked, as the literal value\n";
 reset_fixture();
 $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft', 'expected' => full_expected()]));
@@ -1224,6 +1323,53 @@ reset_fixture();
 $r = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => 999, 'expected' => full_expected([], 999)]));
 check('not_found ( no row ) after the lock: ROLLBACK, then clean_post_cache( 999 )', is_refusal($r, 'not_found') && ['ROLLBACK', 'CLEAN-CACHE'] === array_slice(statement_kinds(), -2) && [999] === $GLOBALS['cinatra_test']['cleaned']);
 
+echo "Rollback with a poisoned cache: suspended invalidation and a drop-in that ignores deletes\n";
+// A wp_insert_post_data callback updates the post and caches the uncommitted
+// row, then its own change forces a refusal: the database rolls back.
+$poison_and_conflict = function ($data) use ($poison) { $poison(); $data['post_name'] = 'moved'; return $data; };
+// ( a ) invalidation suspended ( wp_suspend_cache_invalidation( true ) ): the
+// rollback lifts the suspension for its own clean only, then restores it.
+reset_fixture();
+$GLOBALS['_wp_suspend_cache_invalidation'] = true;
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'] = [$poison_and_conflict];
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('suspended: refused ( site_policy_conflict ), the database rolled back', 'site_policy_conflict' === ($r['code'] ?? null) && $before === $wpdb->rows);
+check('suspended: the rolled-back row is not served afterwards ( the clean ran with the suspension lifted )', !isset($GLOBALS['cinatra_test']['post_cache'][T_ID]) || 'UNCOMMITTED' !== get_post(T_ID)->post_content);
+check('suspended: the suspension is restored after the clean', true === $GLOBALS['_wp_suspend_cache_invalidation']);
+check('suspended: the refusal reports no stale cache ( the entry was removed )', !array_key_exists('cache_stale', $r['data']) && 0 === strpos($r['message'], 'A site save policy'));
+check('suspended: no cache write', [] === ($GLOBALS['cinatra_test']['cache_writes'] ?? []));
+// The suspension is restored also when the clean throws.
+reset_fixture();
+$GLOBALS['_wp_suspend_cache_invalidation'] = true;
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'] = [$poison_and_conflict];
+add_action('clean_post_cache', function () { if (!empty($GLOBALS['cinatra_test']['clean_throws'])) { throw new RuntimeException('clean failed'); } });
+$GLOBALS['cinatra_test']['clean_throws'] = true;
+$thrown = null;
+try { cinatra_ability_post_update_if_unchanged(base_update()); } catch (RuntimeException $e) { $thrown = $e->getMessage(); }
+$GLOBALS['cinatra_test']['clean_throws'] = false;
+check('suspended, the clean throws: the exception propagates and the suspension is still restored', 'clean failed' === $thrown && true === $GLOBALS['_wp_suspend_cache_invalidation']);
+// ( b ) a drop-in that ignores deletes: the entry stays and cannot be repaired
+// without a cache write; the refusal says so truthfully.
+reset_fixture(['clean_ignored' => true]);
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'] = [$poison_and_conflict];
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('ignored deletes: refused, the database rolled back', 'site_policy_conflict' === ($r['code'] ?? null) && $before === $wpdb->rows);
+check('ignored deletes: the refusal carries data.cache_stale true and says that the cache still serves another copy', true === ($r['data']['cache_stale'] ?? null) && false !== strpos($r['message'], 'object cache still serves'));
+check('ignored deletes: no cache write, the refusal carries no content', [] === ($GLOBALS['cinatra_test']['cache_writes'] ?? []) && false === strpos(json_encode($r), 'UNCOMMITTED') && false === strpos(json_encode($r), 'SECRET-BODY-MARKER'));
+// The flag is truthful: a cache entry equal to the database is not stale.
+reset_fixture(['clean_ignored' => true]);
+$GLOBALS['cinatra_test']['post_lock'][T_ID] = 5;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('ignored deletes, no poison ( entry equals the row ): post_locked without cache_stale', 'post_locked' === ($r['code'] ?? null) && !array_key_exists('cache_stale', $r['data']));
+// No existence oracle: a refusal decided before the permission is verified never carries the flag.
+reset_fixture(['clean_ignored' => true]);
+$GLOBALS['cinatra_test']['post_cache'][999] = t_row(999, 'page');
+$r = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => 999, 'expected' => full_expected([], 999)]));
+check('not_found with a lingering cache entry: the same not_found answer, no cache_stale', is_refusal($r, 'not_found') && $r === cinatra_content_not_found());
+check('every refusal data key the write can add is declared in the output schema', isset(cinatra_content_output_schema(true)['properties']['data']['properties']['cache_stale'], cinatra_content_output_schema(true)['properties']['data']['properties']['commit_unacknowledged']));
+
 echo "After COMMIT: get_post() must return the committed row\n";
 reset_fixture();
 $r = cinatra_ability_post_update_if_unchanged(base_update());
@@ -1265,6 +1411,62 @@ $wpdb->fail['COMMIT'] = true;
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('COMMIT failure -> db_error, rolled back, no after-commit hook', 'db_error' === $r['code'] && $before === $wpdb->rows && ['pre_post_update'] === hooks_fired());
+check('the failed COMMIT was followed by a read of the row before answering db_error', 'SELECT' === (statement_kinds()[count(statement_kinds()) - 1] ?? null) && 1 === $wpdb->connection_checks);
+
+echo "Unconfirmed COMMIT: the outcome is read, never assumed\n";
+// ( 1 ) The server committed, the acknowledgement was lost: COMMIT returns false.
+reset_fixture();
+$wpdb->on_commit = function ($db) { $db->apply_commit(); return false; };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('lost acknowledgement: the row is read back, holds the intended row -> success, data.commit_unacknowledged true', true === ($r['success'] ?? null) && true === ($r['data']['commit_unacknowledged'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content'] && '<p>New body</p>' === $r['post_content'] && T_NOW === $r['post_modified_gmt']);
+check('lost acknowledgement: the after-save hooks run, in core\'s order, after the read', T_AFTER_COMMIT === array_values(array_filter(statement_kinds(), function ($k) { return 0 === strpos($k, 'HOOK:') && 'HOOK:pre_post_update' !== $k; })));
+check('lost acknowledgement: post_updated gets the stored post and the post before the save', '<p>New body</p>' === hook_args('post_updated')[1]->post_content && T_CONTENT === hook_args('post_updated')[2]->post_content);
+reset_fixture();
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('an acknowledged COMMIT: data.commit_unacknowledged false', false === ($r['data']['commit_unacknowledged'] ?? null));
+// ( 2 ) The server did not commit.
+reset_fixture();
+$wpdb->on_commit = function ($db) { $db->server_rollback(); return false; };
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('COMMIT failed and the read shows the row before the save -> db_error, nothing written, no after-save hook', is_late_refusal($r, 'db_error', $before) === false && 'db_error' === ($r['code'] ?? null) && $before === $wpdb->rows && ['pre_post_update'] === hooks_fired());
+// ( 3 ) The connection is gone and cannot be re-established.
+reset_fixture();
+$wpdb->on_commit = function ($db) { $db->connection_ok = false; return false; };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('COMMIT failed, no connection to read -> write_outcome_unknown ( cause unreadable ), no after-save hook, never "Nothing was written"', 'write_outcome_unknown' === ($r['code'] ?? null) && false === ($r['success'] ?? null) && 'unreadable' === ($r['data']['cause'] ?? null) && ['pre_post_update'] === hooks_fired() && false === strpos($r['message'], 'Nothing was written') && false === strpos(json_encode($r), 'SECRET-BODY-MARKER'));
+// ( 4 ) The connection answers but the read fails.
+reset_fixture();
+$wpdb->on_commit = function ($db) { $db->apply_commit(); $db->select_fails = true; return false; };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('COMMIT unacknowledged, the read fails -> write_outcome_unknown ( unreadable ), although the row is stored', 'write_outcome_unknown' === ($r['code'] ?? null) && 'unreadable' === ($r['data']['cause'] ?? null) && ['pre_post_update'] === hooks_fired());
+// ( 5 ) Another request changed the row after the transaction ended.
+reset_fixture();
+$wpdb->on_commit = function ($db) { $db->apply_commit(); $db->rows[T_ID]['post_title'] = 'by another request'; return false; };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('COMMIT unacknowledged, the row is neither the old nor the intended one -> write_outcome_unknown ( differs )', 'write_outcome_unknown' === ($r['code'] ?? null) && 'differs' === ($r['data']['cause'] ?? null) && ['pre_post_update'] === hooks_fired());
+// ( 6 ) wpdb reconnected during COMMIT ( error 2006 ): the server rolled the
+// transaction back, and the repeated COMMIT on the new connection "succeeds".
+reset_fixture();
+$wpdb->on_commit = function ($db) { $db->lose_connection(); return 0; };
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('COMMIT "succeeds" on a new connection: not taken as a commit; the read shows the old row -> db_error, no after-save hook', 'db_error' === ($r['code'] ?? null) && $before === $wpdb->rows && ['pre_post_update'] === hooks_fired());
+// ( 7 ) The connection was replaced during the save: the UPDATE ran with
+// autocommit on the new connection, so a later refusal cannot roll it back.
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function ($id) {
+    global $wpdb;
+    $wpdb->lose_connection();
+    $wpdb->rows[T_ID]['post_name'] = 'by-a-callback'; // its own write, autocommitted
+};
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('connection replaced before a late refusal, the row is not the old one -> write_outcome_unknown ( differs ), not "Nothing was written"', 'write_outcome_unknown' === ($r['code'] ?? null) && 'differs' === ($r['data']['cause'] ?? null) && ['pre_post_update'] === hooks_fired() && false === strpos($r['message'], 'Nothing was written'));
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function ($id) { global $wpdb; $wpdb->lose_connection(); };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('connection replaced during the save, the row read back is the intended one -> success with data.commit_unacknowledged true', true === ($r['success'] ?? null) && true === ($r['data']['commit_unacknowledged'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+check('write_outcome_unknown and its causes are declared in the output schema', in_array('unreadable', cinatra_content_output_schema(true)['properties']['data']['properties']['cause']['enum'], true) && in_array('differs', cinatra_content_output_schema(true)['properties']['data']['properties']['cause']['enum'], true));
 
 // ---------------------------------------------------------------------------
 echo "Storage: the engine is read fresh inside the transaction on every write\n";

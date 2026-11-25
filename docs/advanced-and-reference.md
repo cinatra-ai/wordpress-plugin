@@ -120,7 +120,16 @@ If a step refuses, the transaction is rolled back, the post's object cache is
 cleared through WordPress (`clean_post_cache()`, so that no request gets a
 version of the post that a callback cached during the transaction), nothing
 is written, and no after-save hook runs (none of the hooks that WordPress runs after an update,
-from `transition_post_status` to `wp_after_insert_post`). A refusal before
+from `transition_post_status` to `wp_after_insert_post`). If the site
+suspended cache invalidation (`wp_suspend_cache_invalidation()`), the ability
+lifts the suspension for this one clear and then restores it, because a copy
+cached inside a rolled-back transaction never matched the database. Then it
+checks that the cache holds no copy of the post, or one equal to the stored
+row. If a copy that differs stays (an object-cache drop-in that ignores
+deletes), the ability cannot remove it without writing the cache, so the
+refusal adds `data.cache_stale` `true` and says so in its message (not for
+`not_found`, `permission_unverified` and `unsupported_storage`, which stay
+identical). A refusal before
 the write fires no hook at all. `pre_post_update` may have fired when the
 refusal happens at or after the write (`db_error`, or the check in step 6),
 because an action cannot be undone. The database changes that its callbacks
@@ -194,7 +203,10 @@ made in the transaction are rolled back with it.
   locked row with the requested fields, the status and the new modification
   times) and passes it, slashed, through `wp_insert_post_data` with the same
   arguments as WordPress: the data, the post array, the unsanitized post
-  array, and `true` for an update. The post array and the unsanitized post
+  array, and `true` for an update. Each column of the data has the type
+  WordPress gives it on an update: `post_parent` and `menu_order` are
+  integers, every other column is a string (`post_author` too, as WordPress
+  holds it). `pre_post_update` gets the same types. The post array and the unsanitized post
   array are built as `wp_update_post()` and `wp_insert_post()` build them:
   the existing post as `get_post()` returns it as an array (every column and
   `filter`, `ancestors`, `page_template`, `post_category` and `tags_input`),
@@ -269,6 +281,21 @@ made in the transaction are rolled back with it.
   the probe must give one of these two answers: any other result (another
   error, or a connection that reports no error number) refuses the write
   with `unsupported_storage`, without starting a transaction.
+- A `COMMIT` counts only when it succeeds on the connection that started the
+  transaction. If it fails (the server may have committed and only the
+  answer was lost), or WordPress reconnected during the save (it repeats a
+  statement on a new connection after "server has gone away"; the server
+  then rolled the transaction back, and later statements ran outside it), the
+  outcome is unknown until the ability reads the row again, after a
+  `ROLLBACK` and a connection check (`wpdb::check_connection()`). If the row
+  is the row that this save stores, the save is stored: the ability runs the
+  hooks that WordPress runs after an update, as after a normal commit, and the
+  answer is a success with `data.commit_unacknowledged` `true` (otherwise
+  `false`). If the row is the row before the save, nothing was written
+  (`db_error`, or the refusal that was decided). Otherwise, or if the row
+  cannot be read, the answer is `write_outcome_unknown`: `data.cause` is
+  `unreadable` or `differs`, no after-save hook runs, and the caller must read
+  the post before it tries again.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines
@@ -309,8 +336,11 @@ or site code would change), `post_locked` (another user is editing the post),
 `permission_unverified` (the permission decision could not be verified against
 the current post; this shows that the post exists), `transaction_conflict`
 (`data.cause` names the reason), `empty_content`,
-`invalid`, `not_found`, `unsupported_storage` and `db_error`. After a refusal, nothing
-is written, and a refusal never contains post content.
+`invalid`, `not_found`, `unsupported_storage`, `db_error` and
+`write_outcome_unknown` (`data.cause` is `unreadable` or `differs`: the
+database did not confirm the save, and it is not known whether the change
+was stored). After any other refusal, nothing is written. A refusal never
+contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call
 by a user who is not logged in, before the ability runs. An MCP client then

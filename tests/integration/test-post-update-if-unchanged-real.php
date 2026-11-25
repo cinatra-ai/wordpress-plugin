@@ -735,6 +735,81 @@ try {
 	);
 
 	cinatra_it_case(
+		'wp_insert_post_data and pre_post_update get the column types core\'s wp_update_post() gives them',
+		function () {
+			$core_id  = cinatra_it_post( 'publish', 'body' );
+			$id       = cinatra_it_post( 'publish', 'body' );
+			$types    = array();
+			$pre      = array();
+			$recorder = function ( $data, $postarr ) use ( &$types, $core_id, $id ) {
+				$post_id = (int) ( $postarr['ID'] ?? 0 );
+				if ( in_array( $post_id, array( $core_id, $id ), true ) ) {
+					$types[ $post_id ] = array_map( 'gettype', $data );
+				}
+				return $data;
+			};
+			$pre_rec  = function ( $post_id, $data ) use ( &$pre ) {
+				$pre[ (int) $post_id ] = array_map( 'gettype', $data );
+			};
+			add_filter( 'wp_insert_post_data', $recorder, 10, 2 );
+			add_action( 'pre_post_update', $pre_rec, 10, 2 );
+			try {
+				$core = wp_update_post(
+					array(
+						'ID'           => $core_id,
+						'post_content' => 'saved by core',
+					),
+					true
+				);
+				$read   = cinatra_it_read( $id );
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'saved by the ability' ) ) );
+			} finally {
+				remove_filter( 'wp_insert_post_data', $recorder, 10 );
+				remove_action( 'pre_post_update', $pre_rec, 10 );
+			}
+			cinatra_it_assert( ! is_wp_error( $core ), 'the core save failed (setup)' );
+			cinatra_it_assert( true === ( $result['success'] ?? null ), 'the ability save did not succeed', $result );
+			cinatra_it_assert( isset( $types[ $core_id ], $types[ $id ] ) && $types[ $core_id ] === $types[ $id ], 'wp_insert_post_data column types differ from core\'s', $types );
+			cinatra_it_assert( isset( $pre[ $core_id ], $pre[ $id ] ) && $pre[ $core_id ] === $pre[ $id ], 'pre_post_update column types differ from core\'s', $pre );
+			return 'types=' . wp_json_encode( $types[ $id ] );
+		}
+	);
+
+	cinatra_it_case(
+		'rollback with suspended cache invalidation: a copy cached during the save is not served afterwards',
+		function () {
+			$id     = cinatra_it_post( 'publish', 'body' );
+			$read   = cinatra_it_read( $id );
+			$before = cinatra_it_row( $id );
+			$poison = function ( $data, $postarr ) use ( $id ) {
+				if ( (int) ( $postarr['ID'] ?? 0 ) === $id ) {
+					$copy               = (object) cinatra_it_row( $id );
+					$copy->post_content = 'cinatra-it uncommitted copy';
+					wp_cache_set( $id, $copy, 'posts' );
+					$data['post_name'] = 'cinatra-it-moved';
+				}
+				return $data;
+			};
+			add_filter( 'wp_insert_post_data', $poison, 10, 2 );
+			$previous = wp_suspend_cache_invalidation( true );
+			try {
+				$result    = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
+				$suspended = ! empty( $GLOBALS['_wp_suspend_cache_invalidation'] );
+			} finally {
+				wp_suspend_cache_invalidation( $previous );
+				remove_filter( 'wp_insert_post_data', $poison, 10 );
+			}
+			cinatra_it_assert( cinatra_it_refused( $result, 'site_policy_conflict' ), 'the conflicting save was not refused', $result );
+			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
+			cinatra_it_assert( $suspended, 'the suspension was not restored after the rollback' );
+			$cached = wp_cache_get( $id, 'posts' );
+			cinatra_it_assert( false === $cached || 'cinatra-it uncommitted copy' !== $cached->post_content, 'the copy cached during the save is still served' );
+			cinatra_it_assert( ! isset( $result['data']['cache_stale'] ), 'the refusal reports a stale cache although the entry was removed', $result['data'] );
+			return 'cache entry removed, suspension restored';
+		}
+	);
+
+	cinatra_it_case(
 		'editor non-author without edit_others_posts -> not_found on read',
 		function () {
 			$id      = cinatra_it_post( 'publish', 'body' );
