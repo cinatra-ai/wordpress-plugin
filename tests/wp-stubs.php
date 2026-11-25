@@ -170,9 +170,22 @@ function register_rest_route($namespace = '', $route = '', $args = []) {
     ];
     return true;
 }
-function __($text, $domain = 'default') { return $text; }
-function esc_html__($text, $domain = 'default') { return $text; }
-function esc_attr__($text, $domain = 'default') { return $text; }
+// As core's translate(): the gettext and gettext_{domain} filters run on
+// every translated string, through the WP_Hook objects in $wp_filter ( a test
+// that installs one sees each call, so site code that a translation reaches
+// is testable ).
+function cinatra_stub_translate($text, $domain) {
+    $translation = $text;
+    foreach (['gettext', 'gettext_' . $domain] as $hook) {
+        if (isset($GLOBALS['wp_filter'][$hook]) && is_object($GLOBALS['wp_filter'][$hook]) && method_exists($GLOBALS['wp_filter'][$hook], 'apply_filters')) {
+            $translation = $GLOBALS['wp_filter'][$hook]->apply_filters($translation, [$translation, $text, $domain]);
+        }
+    }
+    return $translation;
+}
+function __($text, $domain = 'default') { return cinatra_stub_translate($text, $domain); }
+function esc_html__($text, $domain = 'default') { return cinatra_stub_translate($text, $domain); }
+function esc_attr__($text, $domain = 'default') { return cinatra_stub_translate($text, $domain); }
 function esc_html($t) { return $t; }
 function esc_url($url) { return $url; }
 function esc_url_raw($url, $protocols = null) { return $url; }
@@ -355,7 +368,17 @@ function get_permalink($post) {
         // of permalinks (tests that never set it get '' as before).
         return (string) ($GLOBALS['cinatra_test']['permalinks'][$post] ?? '');
     }
-    return $post instanceof WP_Post ? (string) $post->permalink : '';
+    if (!$post instanceof WP_Post) {
+        return '';
+    }
+    if ('' !== (string) $post->permalink) {
+        return (string) $post->permalink;
+    }
+    // A post object built from a row ( no fixture permalink ): core builds the
+    // link from the object's own fields; with permalink_base set the stub
+    // does the same from its slug.
+    $base = $GLOBALS['cinatra_test']['permalink_base'] ?? null;
+    return null !== $base && '' !== (string) $post->post_name ? $base . $post->post_name . '/' : '';
 }
 function get_post_type_object($post_type) {
     $registry = $GLOBALS['cinatra_test']['post_types'] ?? [

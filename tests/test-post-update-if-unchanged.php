@@ -60,6 +60,16 @@ if (!class_exists('WP_Hook')) {
         }
     }
 }
+/** Site code on WordPress's query filter that rewrites statements: the statement sent is $f( $sql ). */
+function set_query_rewrite(callable $f) {
+    $GLOBALS['wp_filter']['query'] = new WP_Hook();
+    $GLOBALS['wp_filter']['query']->add_filter('query', function ($sql) use ($f) { return $f($sql); }, 10, 1);
+}
+/** Site code on a translation filter ( gettext ): $f( $translation ) runs for each translated string. */
+function set_gettext_filter(callable $f) {
+    $GLOBALS['wp_filter']['gettext'] = new WP_Hook();
+    $GLOBALS['wp_filter']['gettext']->add_filter('gettext', function ($t) use ($f) { $f($t); return $t; }, 10, 1);
+}
 /** Site code on WordPress's query filter: $f( $sql ) runs before each statement that applies it. */
 function set_query_filter(callable $f) {
     $GLOBALS['wp_filter']['query'] = new WP_Hook();
@@ -109,18 +119,30 @@ class wpdb {
     public $deadlock_rolls_back = false; // errno 1213 ends the transaction, as InnoDB does
     public $completion_type = 'NO_CHAIN';
     public $chain_on_end = false; // what completion_type=CHAIN does: COMMIT/ROLLBACK start a new transaction
-    // As wpdb::query(): apply_filters( 'query' ) through $wp_filter, before the statement.
+    // As wpdb::query(): apply_filters( 'query' ) through $wp_filter, before
+    // the statement; the statement sent is what the filter returns ( a filter
+    // can rewrite it ).
     private function filter_query($sql) {
         $this->last_error = '';
         if (isset($GLOBALS['wp_filter']['query'])) {
             $GLOBALS['cinatra_test']['query_filter_saw'][] = $sql;
-            $GLOBALS['wp_filter']['query']->apply_filters($sql, [$sql]);
+            $sql = $GLOBALS['wp_filter']['query']->apply_filters($sql, [$sql]);
             $this->last_error = '';
         }
+        return $sql;
     }
+    // reconnect_on: statement => true; the connection is lost when it is sent
+    // and wpdb reconnects and repeats it on the new connection ( error 2006 ).
+    public $reconnect_on = [];
+    public $reconnect_when = null; // callable( $sql ): true to reconnect on that statement ( once )
     public function query($sql) {
-        $this->filter_query($sql);
+        $sql = $this->filter_query($sql);
         $this->log[] = $sql;
+        if (!empty($this->reconnect_on[$sql]) || (null !== $this->reconnect_when && ($this->reconnect_when)($sql))) {
+            unset($this->reconnect_on[$sql]);
+            $this->reconnect_when = null;
+            $this->lose_connection();
+        }
         if (preg_match('/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) (\S+)$/', $sql, $m)) {
             [, $kind, $name] = $m;
             if (0 === strpos($name, 'cinatra_probe_')) {
@@ -285,7 +307,7 @@ class wpdb {
         return $this->connection_ok;
     }
     public function get_row($sql, $output = null) {
-        $this->filter_query($sql);
+        $sql = $this->filter_query($sql);
         $this->log[] = $sql;
         if (false !== strpos($sql, '@@SESSION.autocommit')) {
             return null === $this->autocommit ? null : [$this->autocommit, $this->completion_type];
@@ -320,7 +342,7 @@ class wpdb {
         return $previous;
     }
     public function get_var($sql, $x = 0, $y = 0) {
-        $this->filter_query($sql);
+        $sql = $this->filter_query($sql);
         $this->log[] = $sql;
         if ($this->fail_engine && 0 === strpos($sql, 'SELECT ENGINE')) {
             $this->last_error = 'forced engine read failure';
@@ -702,7 +724,7 @@ function t_row(int $id, string $type, array $over = []): array {
 function reset_fixture(array $overrides = []) {
     global $wpdb;
     $wpdb = new wpdb();
-    unset($GLOBALS['wp_filter']['query']);
+    unset($GLOBALS['wp_filter']['query'], $GLOBALS['wp_filter']['gettext']);
     $GLOBALS['cinatra_test']['query_filter_saw'] = [];
     $GLOBALS['_wp_suspend_cache_invalidation'] = false;
     $wpdb->rows = [
@@ -716,6 +738,8 @@ function reset_fixture(array $overrides = []) {
         'current_user_id'  => 3,
         'transients'       => [],
         'permalinks'       => [T_ID => 'https://blog.example/about/'],
+        // get_permalink() of a post object built from a row: base + its slug.
+        'permalink_base'   => 'https://blog.example/',
         'post_lock'        => [],
         'cleaned'          => [],
         'update_calls'     => [],
@@ -1613,7 +1637,7 @@ echo "Transaction errors\n";
 reset_fixture();
 $wpdb->fail['START TRANSACTION'] = true;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('START TRANSACTION failure -> db_error, then its own ROLLBACK ( a failed START may have opened one; nothing else ran since the probe ), no locked read, no after-save hook', is_refusal($r, 'db_error') && ['SELECT', 'START TRANSACTION', 'ROLLBACK'] === statement_kinds());
+check('START TRANSACTION failure -> db_error, then its own ROLLBACK AND NO CHAIN ( a failed START may have opened one; nothing else ran since the probe ), no locked read, no after-save hook', is_refusal($r, 'db_error') && ['SELECT', 'START TRANSACTION', 'ROLLBACK AND NO CHAIN'] === statement_kinds());
 reset_fixture();
 $wpdb->fail['COMMIT'] = true;
 $before = $wpdb->rows;
@@ -1745,7 +1769,7 @@ $wpdb->before_update = function ($db) { $db->before_update = null; $db->lose_con
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('reconnect during the UPDATE, no other save -> the repeated UPDATE matches the locked row; settled by the read: write_outcome_unknown ( matches ), no after-save hook', 'write_outcome_unknown' === ($r['code'] ?? null) && 'matches' === ($r['data']['cause'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content'] && ['pre_post_update'] === hooks_fired());
 
-echo "Site query filters: suspended for the ability's control statements, kept for the UPDATE\n";
+echo "Site query filters: suspended for the ability's control statements, the conditional UPDATE included\n";
 // A query filter that COMMITs when it sees the statement $match, once.
 $commit_at = function (callable $match) {
     $done = false;
@@ -1761,7 +1785,20 @@ reset_fixture();
 set_query_filter(function ($sql) {});
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 $saw = $GLOBALS['cinatra_test']['query_filter_saw'];
-check('success with a site query filter: the filter saw the plain permission read and the conditional UPDATE ( WHERE `ID` = n AND SHA2( ... ) ), and none of the control statements', true === ($r['success'] ?? null) && [] === array_values(array_filter($saw, $is_control)) && 1 === count(preg_grep('/^UPDATE `wp_posts` SET .* WHERE `ID` = ' . T_ID . ' AND SHA2\\(/s', $saw)));
+check('success with a site query filter: the filter saw the plain permission read, and neither the conditional UPDATE nor any other control statement', true === ($r['success'] ?? null) && [] === array_values(array_filter($saw, $is_control)) && [] === preg_grep('/^UPDATE `/', $saw) && 1 === count(preg_grep('/^SELECT \\* FROM wp_posts WHERE ID = ' . T_ID . '$/', $saw)));
+// A filter that would rewrite the conditional UPDATE into a write of exactly
+// one OTHER row ( one affected row, as the real statement would report ).
+reset_fixture();
+$other = $wpdb->rows[T_POST_ID];
+$other_cond = cinatra_content_row_condition($other);
+$hijack = $wpdb->prepare("UPDATE `wp_posts` SET `post_title` = %s WHERE `ID` = %d AND " . $other_cond[0], array_merge(['hijacked'], [T_POST_ID], $other_cond[1]));
+set_query_rewrite(function ($sql) use ($hijack) { return 0 === strpos($sql, 'UPDATE `') ? $hijack : $sql; });
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a query filter that would rewrite the conditional UPDATE into a write of another row is not called for it: the save stores its own row, the other row is untouched', true === ($r['success'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content'] && $other === $wpdb->rows[T_POST_ID] && [] === preg_grep('/^UPDATE `/', $GLOBALS['cinatra_test']['query_filter_saw']));
+// The stub honours a rewrite ( the check above is not vacuous ): a site
+// statement through the same filter is rewritten.
+$wpdb->query('UPDATE `wp_posts` SET `post_title` = \'x\' WHERE `ID` = 0 AND `ID` IS NULL');
+check('the stub sends what a query filter returns ( a site statement is rewritten )', 'hijacked' === $wpdb->rows[T_POST_ID]['post_title']);
 // The filter writes during the probe's ROLLBACK TO SAVEPOINT ( a foreign
 // transaction is open, so the probe's statements succeed ).
 reset_fixture();
@@ -1797,21 +1834,27 @@ check('after a refusal the same hook objects are back', false === ($r['success']
 check('after an exception the same hook objects are back', $r instanceof RuntimeException && $ok);
 [$r, $ok] = $restored(function () { $GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->query('COMMIT'); $wpdb->query('START TRANSACTION'); }; });
 check('after the lost path the same hook objects are back', 'write_outcome_unknown' === ($r['code'] ?? null) && $ok);
-// The filter still runs for the UPDATE: a COMMIT there makes the UPDATE autocommit.
+// The filter does not run for the UPDATE: a COMMIT it would send there never happens.
 reset_fixture();
 $commit_at($is_update);
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a query filter still runs for the UPDATE: COMMIT right before it -> write_outcome_unknown ( matches ), site_changes_possible, no after-save hook', is_unknown($r, 'matches') && ['pre_post_update'] === hooks_fired() && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+check('a query filter that would COMMIT at the UPDATE is not called for it: the save commits as its own, the after-save hooks run', true === ($r['success'] ?? null) && in_array('save_post', hooks_fired(), true) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content'] && [] === preg_grep('/^UPDATE `/', $GLOBALS['cinatra_test']['query_filter_saw']));
 reset_fixture();
 $done_cs = false;
 set_query_filter(function ($sql) use ($is_update, &$done_cs) { global $wpdb; if (!$done_cs && $is_update($sql)) { $done_cs = true; $wpdb->query('COMMIT'); $wpdb->query('START TRANSACTION'); } });
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('query filter COMMITs and begins right before the UPDATE -> write_outcome_unknown ( matches ); the site transaction is left open ( no COMMIT or ROLLBACK by the ability after it ); the tracker says lost', is_unknown($r, 'matches') && only_reads_after('START TRANSACTION') && ['pre_post_update'] === hooks_fired() && true === (cinatra_content_transaction()['lost'] ?? null) && false === cinatra_content_transaction()['open']);
+check('a query filter that would COMMIT and begin at the UPDATE is not called for it: success, no transaction open after the save, the tracker not lost', true === ($r['success'] ?? null) && false === $done_cs && null === $wpdb->snapshot_for_test() && empty(cinatra_content_transaction()['lost']));
+// A callback that COMMITs and begins inside the save ( before the UPDATE ):
+// the transaction is lost; the site's transaction stays open.
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->query('COMMIT'); $wpdb->query('START TRANSACTION'); };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('pre_post_update COMMITs and begins -> write_outcome_unknown; the site transaction is left open ( no COMMIT or ROLLBACK by the ability after it ); the tracker says lost', 'write_outcome_unknown' === ($r['code'] ?? null) && only_reads_after('START TRANSACTION') && ['pre_post_update'] === hooks_fired() && true === (cinatra_content_transaction()['lost'] ?? null) && false === cinatra_content_transaction()['open']);
 $log_before_guard = count($wpdb->log);
 cinatra_content_shutdown_guard();
 check('in the lost state the shutdown guard sends nothing ( the open transaction is site code\'s )', count($wpdb->log) === $log_before_guard && null !== $wpdb->snapshot_for_test());
 reset_fixture();
-$commit_at($is_update);
+$wpdb->before_update = function ($db) { $db->lose_connection(); }; // wpdb reconnects during the UPDATE and repeats it with autocommit
 $wpdb->update_result = false;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('transaction lost, then the UPDATE answers false ( an autocommitted write whose acknowledgement was lost ) -> write_outcome_unknown ( matches ), never "changed nothing"', is_unknown($r, 'matches') && false === strpos($r['message'], 'did not change'));
@@ -1828,7 +1871,7 @@ check('the hook\'s write survives its own COMMIT', isset($wpdb->rows[777]));
 reset_fixture();
 $wpdb->probe_errno_after_start = ['SAVEPOINT' => 1064];
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('START acknowledged, the marker cannot be set -> its own ROLLBACK, db_error, the database transaction closed, the tracker not open', is_refusal($r, 'db_error') && 'ROLLBACK' === (statement_kinds()[count(statement_kinds()) - 1] ?? null) && null === $wpdb->snapshot_for_test() && false === cinatra_content_transaction()['open']);
+check('START acknowledged, the marker cannot be set -> its own ROLLBACK AND NO CHAIN, db_error, the database transaction closed, the tracker not open', is_refusal($r, 'db_error') && 'ROLLBACK AND NO CHAIN' === (statement_kinds()[count(statement_kinds()) - 1] ?? null) && null === $wpdb->snapshot_for_test() && false === cinatra_content_transaction()['open']);
 // COMMIT refused while the transaction is still this save's: rolled back by it.
 reset_fixture();
 $wpdb->fail['COMMIT'] = true;
@@ -2111,6 +2154,107 @@ check('write schema: status enum is draft only; expected requires the four value
 check('read output schema declares row_token', isset($read['output_schema']['properties']['row_token']));
 check('output schema has no also_changed', !isset($write['output_schema']['properties']['also_changed']) && isset($write['output_schema']['properties']['sanitized_fields']));
 check('refusal shape has no "error" key (the adapter would flatten it)', !array_key_exists('error', cinatra_content_not_found()));
+
+
+echo "No site callback inside a control window: translations, reconnects, the answer's permalink\n";
+// A gettext filter ( site code ) that records every call made while a control
+// window is open ( errors suppressed ) and logs each call in the statement log.
+$in_window_gettext = 0;
+$gettext_spy = function () use (&$in_window_gettext) {
+    set_gettext_filter(function ($t) use (&$in_window_gettext) {
+        global $wpdb;
+        if ($wpdb->suppress_calls_last()) { $in_window_gettext++; }
+        $wpdb->log[] = 'GETTEXT';
+    });
+};
+reset_fixture();
+$gettext_spy();
+$in_window_gettext = 0;
+$wpdb->probe_errno_after_start = ['SAVEPOINT' => 1064];
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+$kinds = $wpdb->log;
+$start_at = array_search('START TRANSACTION', $kinds, true);
+$end_at = array_search('ROLLBACK AND NO CHAIN', $kinds, true);
+check('the marker cannot be set: no translation runs between START TRANSACTION and its ROLLBACK ( the message is translated after the window ), db_error', is_refusal($r, 'db_error') && 0 === $in_window_gettext && false !== $start_at && false !== $end_at && !in_array('GETTEXT', array_slice($kinds, $start_at, $end_at - $start_at), true) && in_array('GETTEXT', array_slice($kinds, $end_at), true));
+// The same with a gettext filter that throws inside a window: the transaction is still closed.
+reset_fixture();
+set_gettext_filter(function ($t) { global $wpdb; if ($wpdb->suppress_calls_last()) { throw new RuntimeException('gettext inside a window'); } });
+$wpdb->probe_errno_after_start = ['SAVEPOINT' => 1064];
+try { $r = cinatra_ability_post_update_if_unchanged(base_update()); } catch (Throwable $e) { $r = $e; }
+check('a gettext filter that throws when called inside a window is never called there: db_error, the transaction closed, the tracker not open', is_array($r) && is_refusal($r, 'db_error') && null === $wpdb->snapshot_for_test() && false === cinatra_content_transaction()['open']);
+// A gettext filter that commits and begins its own transaction: it runs only
+// after the window, so the ability's ROLLBACK cannot end the site's transaction.
+reset_fixture();
+$gt_done = false;
+set_gettext_filter(function ($t) use (&$gt_done) { global $wpdb; if (!$gt_done && null === $wpdb->snapshot_for_test()) { $gt_done = true; $wpdb->query('START TRANSACTION'); $wpdb->rows[779] = ['ID' => '779']; } });
+$wpdb->probe_errno_after_start = ['SAVEPOINT' => 1064];
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a gettext filter that begins a transaction and writes runs after the window: the ability sends nothing after it, the site transaction and its write stay', is_refusal($r, 'db_error') && true === $gt_done && isset($wpdb->rows[779]) && null !== $wpdb->snapshot_for_test() && 'START TRANSACTION' === end($wpdb->log));
+// Every path: no gettext callback while a window is open.
+$paths = [
+    'success'             => function () {},
+    'post_changed'        => function () { global $wpdb; $wpdb->rows[T_ID]['post_title'] = 'changed meanwhile'; },
+    'lock read fails'     => function () { global $wpdb; $wpdb->fail_lock_read = 1205; },
+    'engine read fails'   => function () { global $wpdb; $wpdb->fail_engine = 2013; },
+    'START fails'         => function () { global $wpdb; $wpdb->fail['START TRANSACTION'] = true; },
+    'lost'                => function () { $GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->query('COMMIT'); }; },
+    'COMMIT fails'        => function () { global $wpdb; $wpdb->fail['COMMIT'] = true; },
+    'UPDATE fails'        => function () { global $wpdb; $wpdb->update_result = false; },
+    'site policy'         => function () { $GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->rows[T_ID]['post_name'] = 'by-a-callback'; }; },
+];
+foreach ($paths as $name => $prepare) {
+    reset_fixture();
+    $gettext_spy();
+    $in_window_gettext = 0;
+    $prepare();
+    $r = cinatra_ability_post_update_if_unchanged(base_update());
+    check("path $name: no translation filter runs inside a control window", 0 === $in_window_gettext);
+}
+// The control helper suspends the translation filters too ( wpdb translates
+// messages on rare error paths inside a statement ).
+reset_fixture();
+$gettext_spy();
+$in_window_gettext = 0;
+$log_before = count($wpdb->log);
+$out = cinatra_content_control(function () { return __('inside', 'default'); });
+check('inside cinatra_content_control() no gettext callback runs ( wpdb\'s own translated error messages )', 'inside' === $out && !in_array('GETTEXT', array_slice($wpdb->log, $log_before), true) && isset($GLOBALS['wp_filter']['gettext']));
+check('the stub runs gettext filters outside a window ( the checks above are not vacuous )', 'outside' === __('outside') && 'GETTEXT' === end($wpdb->log));
+
+// wpdb reconnects during START TRANSACTION and repeats it: the repeated
+// START opened a transaction on the NEW connection; the first SAVEPOINT sees
+// the replaced connection object. That transaction is the ability's own.
+reset_fixture();
+$wpdb->reconnect_on = ['START TRANSACTION' => true];
+$dbh_before = $wpdb->dbh;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('reconnect during START TRANSACTION, START repeated on the new connection -> its own ROLLBACK AND NO CHAIN on the current connection, db_error, no transaction left open, the tracker not open, no locked read', is_refusal($r, 'db_error') && $wpdb->dbh !== $dbh_before && 'ROLLBACK AND NO CHAIN' === end($wpdb->log) && null === $wpdb->snapshot_for_test() && false === cinatra_content_transaction()['open'] && !in_array('SELECT-FOR-UPDATE', statement_kinds(), true));
+// A later write in the same request is not caught in a leftover transaction.
+$wpdb->rows[780] = ['ID' => '780'];
+check('after it, a later write of the request is not inside any open transaction', null === $wpdb->snapshot_for_test());
+// wpdb reconnects during a SAVEPOINT: the transaction ended with the old
+// connection; the ROLLBACK on the new connection does nothing.
+reset_fixture();
+$wpdb->reconnect_when = function ($sql) { return 0 === strpos($sql, 'SAVEPOINT cinatra_lock_') && '_2' === substr($sql, -2); };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('reconnect during a SAVEPOINT -> ROLLBACK AND NO CHAIN on the new connection ( nothing open there ), db_error, no transaction open, the rows unchanged', is_refusal($r, 'db_error') && 'ROLLBACK AND NO CHAIN' === end($wpdb->log) && null === $wpdb->snapshot_for_test() && T_CONTENT === $wpdb->rows[T_ID]['post_content']);
+
+// The answer's permalink describes the stored row, not a later state.
+add_action('save_post', function () {
+    global $wpdb;
+    if (!empty($GLOBALS['cinatra_test']['slug_after_save'])) {
+        // An after-save hook changes the slug ( an ordinary later save ); a
+        // read by ID now gives the new link.
+        $wpdb->rows[T_ID]['post_name'] = 'renamed';
+        $GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+        $GLOBALS['cinatra_test']['permalinks'][T_ID] = 'https://blog.example/renamed/';
+    }
+}, 10, 3);
+reset_fixture(['slug_after_save' => true]);
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('an after-save hook changes the slug: the answer\'s permalink is the stored row\'s ( about ), with the stored fields, not the later one', true === ($r['success'] ?? null) && 'https://blog.example/about/' === $r['permalink'] && '<p>New body</p>' === $r['post_content'] && 'renamed' === $wpdb->rows[T_ID]['post_name']);
+reset_fixture(['permalinks' => [T_ID => 'https://blog.example/stale-cache/']]);
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a stale by-ID permalink source is not used: the permalink comes from the stored row object', true === ($r['success'] ?? null) && 'https://blog.example/about/' === $r['permalink']);
 
 echo "\n";
 if ($failures > 0) {

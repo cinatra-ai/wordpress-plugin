@@ -227,21 +227,47 @@ made in the transaction are rolled back with it.
   write (for example the slug, the author or a date), or adds or removes a
   column, the write is refused with `site_policy_conflict`. `data.changed`
   names those columns. Nothing is written, and no after-save hook runs.
+- What the ability guarantees, and nothing more: a save is stored exactly as
+  checked, or not at all,
+  - against concurrent writers on other connections (the row is locked from
+    the check to the commit, and the update applies only to the row as read);
+  - against site callbacks that write to the post or to other tables inside
+    the save (the save filters, `pre_post_update`): their writes are in the
+    save's transaction, a refusal rolls them back with it, and a posts row
+    that they changed is refused before the commit;
+  - against any site callback during the ability's own control statements:
+    none can run there (see below).
+
+  It only detects, and answers as `write_outcome_unknown` with
+  `data.site_changes_possible` `true`: site code that itself commits, rolls
+  back or begins a transaction inside the save (and a reconnect, which ends
+  the transaction the same way). The after-save hooks run after the commit,
+  as ordinary later saves; the guarantee does not extend to them.
 - The ability owns exactly one transaction, and it claims an outcome only
   while it can show that this transaction is intact:
   - Its own control statements (the open-transaction probe, `START
     TRANSACTION`, the savepoints and their release, the session settings,
-    the locked read, the engine check, the read-back, `COMMIT` and
-    `ROLLBACK`) run with the site's callbacks on WordPress's `query` filter
-    taken out for exactly that statement, and put back (the same hook
-    object) afterwards, also after an exception. The same holds for the
-    other hooks that WordPress can run inside a statement
+    the locked read, the engine check, the conditional update, the
+    read-back, `COMMIT` and `ROLLBACK`) run in windows in which the site's
+    callbacks on WordPress's `query` filter are taken out, and put back (the
+    same hook object) afterwards, also after an exception. The same holds
+    for the other hooks that WordPress can run inside a statement
     (`log_query_custom_data` with `SAVEQUERIES`, `pre_get_table_charset` and
     `pre_get_col_charset` for a statement that is not plain ASCII,
-    `incompatible_sql_modes` on a reconnect); database errors are kept out
-    of the error output then, so no translation filter runs either. So no
-    site code can act between two of these statements. The site's own
-    statements, and the update itself, keep their `query` filters.
+    `incompatible_sql_modes` on a reconnect, and `gettext` and
+    `gettext_default` for the messages that WordPress translates on rare
+    database errors); database errors are kept out of the error output. The
+    ability's own code calls no translation function, hook, option, cache or
+    post function inside a window: its messages are built outside. So no
+    site code can act inside a window: between `START TRANSACTION` and the
+    savepoints, between the release of `_3`, the update and its read-back,
+    and between the release of `_2` and `COMMIT` or `ROLLBACK`. Only the
+    statements that site code sends (the queries of the save filters and
+    hooks, the revision, every after-save hook) keep their `query` filters.
+    So a filter cannot rewrite the update into a different write. No known
+    kind of plugin depends on filtering this one statement: multilingual and
+    audit plugins act on post saves through the save actions
+    (`pre_post_update`, `post_updated`, `save_post`), which still run.
   - Right after `START TRANSACTION` it sets four savepoints with a random
     name (`cinatra_lock_<random>_1` to `_4`). After the row lock, before any
     site code runs, it releases `_4`; right before the update `_3`; right
@@ -252,10 +278,13 @@ made in the transaction are rolled back with it.
     transaction and a reconnect end the transaction and remove all
     savepoints. The connection object must also stay the same.
   - It sends its own `ROLLBACK` only for a transaction it started itself:
-    right after `START TRANSACTION` (when the savepoints cannot be set;
-    nothing else has run), or later while `_1` still releases on the same
-    connection, for example after a `COMMIT` that was not acknowledged. Then
-    nothing was written.
+    right after `START TRANSACTION`, when the savepoints cannot be set or
+    the connection object changed, on the connection that is current then
+    (only its own statements have run since `START TRANSACTION`, so the
+    transaction open there is the one that it started, also when WordPress
+    reconnected and repeated `START TRANSACTION`, or none is open), or later
+    while `_1` still releases on the same connection, for example after a
+    `COMMIT` that was not acknowledged. Then nothing was written.
   - If `_1` does not release, the transaction it started has already ended,
     and a transaction that is open now belongs to site code. The ability
     then sends nothing more on the connection, records that state (its
@@ -302,8 +331,8 @@ made in the transaction are rolled back with it.
   by this save, so code inside the save changed it (`site_policy_conflict`,
   `data.changed` names the columns, also a column that this save writes); if
   the connection was replaced during the update (WordPress repeats a
-  statement after a reconnect, outside the transaction), another save may
-  have changed it (`post_changed`).
+  statement after a reconnect, outside the transaction), the transaction is
+  gone and the answer is `write_outcome_unknown`.
 - `pre_post_update` runs after the filters, with the full filtered data,
   unslashed, inside the transaction, before the update, as in WordPress. It
   runs only when the write goes ahead. It is an action, so it cannot stop the
@@ -366,7 +395,13 @@ made in the transaction are rolled back with it.
   error, or a connection that reports no error number) refuses the write
   with `unsupported_storage`, without starting a transaction.
 - A hook that changes the post after the commit makes a separate, later save.
-  The answer reports what this save stored.
+  The answer reports what this save stored, every field from that one row,
+  the permalink too: it is computed with `get_permalink()` from a post object
+  built from the stored row, not by reading the post again by its ID, so a
+  later slug or status change or a stale cache copy cannot make it describe
+  another state of the row. What the link takes from outside the row (a
+  page's parents, a post's category, the permalink settings) is read as it
+  is then.
 - The posts table must use the InnoDB storage engine, because other engines
   cannot lock a row. Each write reads the engine again inside its transaction,
   after the row lock. On other engines, the write is refused.

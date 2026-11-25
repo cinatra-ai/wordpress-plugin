@@ -804,13 +804,15 @@ try {
 			cinatra_it_assert( true === ( $result['success'] ?? null ), 'the save did not succeed', $result );
 			cinatra_it_assert( array() === $acted, 'a site query filter ran for a control statement', $acted );
 			cinatra_it_assert( in_array( 'START TRANSACTION', $sent, true ) && in_array( 'COMMIT', $sent, true ) && ! in_array( 'COMMIT', $filtered, true ), 'the statement log and the filter view do not show the suspension', array( $sent, $filtered ) );
-			// The ability's conditional UPDATE ( WHERE `ID` = n AND the row condition );
-			// the after-save hooks send further UPDATEs of their own ( the revision ).
-			$conditional = preg_grep( '/^UPDATE `' . preg_quote( $wpdb->posts, '/' ) . '` SET .* WHERE `ID` = ' . (int) $id . ' AND SHA2\(/s', $filtered );
-			cinatra_it_assert( 1 === count( $conditional ), 'the site filter did not see the conditional UPDATE exactly once', $filtered );
+			// The ability's conditional UPDATE ( WHERE `ID` = n AND the row condition )
+			// is one of its control statements: sent, but not through the filter.
+			// The after-save hooks send further UPDATEs of their own ( the revision ).
+			$pattern = '/^UPDATE `' . preg_quote( $wpdb->posts, '/' ) . '` SET .* WHERE `ID` = ' . (int) $id . ' AND SHA2\(/s';
+			cinatra_it_assert( 1 === count( preg_grep( $pattern, $sent ) ), 'the conditional UPDATE was not sent exactly once', $sent );
+			cinatra_it_assert( array() === preg_grep( $pattern, $filtered ), 'the site filter saw the conditional UPDATE', $filtered );
 			cinatra_it_assert( $hook === $back && 10 === has_filter( 'query', 'cinatra_it_record_query' ), 'the query hook object or its callbacks were not restored' );
 			cinatra_it_assert( '' === cinatra_content_open_transaction_state() && false === cinatra_content_transaction()['open'], 'a transaction stayed open after the save', cinatra_it_diag() );
-			return 'filter calls on control statements: 0';
+			return 'filter calls on control statements ( the UPDATE included ): 0';
 		}
 	);
 
@@ -986,40 +988,74 @@ try {
 	);
 
 	cinatra_it_case(
-		'a query filter COMMITs right before the UPDATE -> the write ran outside the transaction: write_outcome_unknown ( matches ), site_changes_possible, no after-save hook',
+		'a query filter that would COMMIT at the conditional UPDATE and rewrite it into a write of another post is never called for it: the save stores its own row, the other post is untouched',
 		function () {
 			global $wpdb;
 			$id      = cinatra_it_post( 'publish', 'body' );
+			$other   = cinatra_it_post( 'publish', 'other body' );
 			$read    = cinatra_it_read( $id );
+			$before  = cinatra_it_row( $other );
 			$updated = 0;
+			$acted   = 0;
 			$after   = function ( $post_id ) use ( &$updated, $id ) {
 				if ( (int) $post_id === $id ) {
 					++$updated;
 				}
 			};
-			$commit  = function ( $query ) use ( &$commit ) {
+			$rewrite = function ( $query ) use ( &$acted, $other ) {
 				global $wpdb;
-				if ( 0 === strpos( ltrim( (string) $query ), 'UPDATE `' . $wpdb->posts . '` SET' ) ) {
-					// Ends this save's transaction right before its write: the
-					// UPDATE then runs with autocommit and is durable at once.
-					remove_filter( 'query', $commit );
+				if ( 0 === strpos( ltrim( (string) $query ), 'UPDATE `' . $wpdb->posts . '` SET' ) && false !== strpos( (string) $query, 'SHA2(' ) ) {
+					++$acted;
 					$wpdb->query( 'COMMIT' );
+					return $wpdb->prepare( "UPDATE {$wpdb->posts} SET post_title = %s WHERE ID = %d", 'cinatra-it hijacked', $other );
 				}
 				return $query;
 			};
 			add_action( 'post_updated', $after );
-			add_filter( 'query', $commit );
+			add_filter( 'query', $rewrite );
 			try {
-				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it written outside the transaction' ) ) );
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it not rewritten' ) ) );
 			} finally {
-				remove_filter( 'query', $commit );
+				remove_filter( 'query', $rewrite );
 				remove_action( 'post_updated', $after );
 			}
-			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'matches' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'the write outside the transaction was not reported as write_outcome_unknown ( matches )', $result );
-			cinatra_it_assert( false === strpos( (string) $result['message'], 'Nothing was written' ), 'the answer claims nothing was written', $result['message'] );
-			cinatra_it_assert( 0 === $updated, 'after-save hooks ran for an unproven write' );
-			cinatra_it_assert( 'cinatra-it written outside the transaction' === cinatra_it_row( $id )['post_content'], 'the autocommitted write is not stored (setup)' );
-			return 'cause=matches, stored, no after-save hook';
+			cinatra_it_assert( true === ( $result['success'] ?? null ), 'the save did not succeed', $result );
+			cinatra_it_assert( 0 === $acted, 'the site filter was called for the conditional UPDATE' );
+			cinatra_it_assert( $before === cinatra_it_row( $other ), 'the other post changed', cinatra_it_row( $other ) );
+			cinatra_it_assert( 'cinatra-it not rewritten' === cinatra_it_row( $id )['post_content'], 'the save did not store its own row' );
+			cinatra_it_assert( 1 === $updated, 'the after-save hooks did not run once for the committed save' );
+			cinatra_it_assert( '' === cinatra_content_open_transaction_state(), 'a transaction stayed open after the save', cinatra_it_diag() );
+			return 'filter not called for the UPDATE, other post untouched';
+		}
+	);
+
+	cinatra_it_case(
+		'an after-save hook changes the slug: the answer\'s permalink is the one of the stored row, not of the later state',
+		function () {
+			global $wpdb;
+			$structure = get_option( 'permalink_structure' );
+			update_option( 'permalink_structure', '/%postname%/' );
+			$id   = cinatra_it_post( 'publish', 'body' );
+			$read = cinatra_it_read( $id );
+			$hook = function ( $post_id ) use ( $id ) {
+				global $wpdb;
+				if ( (int) $post_id === $id ) {
+					$wpdb->update( $wpdb->posts, array( 'post_name' => 'cinatra-it-renamed-' . $id ), array( 'ID' => $id ) );
+					clean_post_cache( $id );
+				}
+			};
+			add_action( 'save_post', $hook );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it permalink of the stored row' ) ) );
+				$now    = get_permalink( $id );
+			} finally {
+				remove_action( 'save_post', $hook );
+				update_option( 'permalink_structure', $structure );
+			}
+			cinatra_it_assert( true === ( $result['success'] ?? null ), 'the save did not succeed', $result );
+			cinatra_it_assert( false !== strpos( (string) $now, 'cinatra-it-renamed-' ), 'the hook did not change the permalink (setup)', $now );
+			cinatra_it_assert( $read['permalink'] === $result['permalink'] && $now !== $result['permalink'], 'the answer\'s permalink is not the stored row\'s', array( $read['permalink'], $result['permalink'], $now ) );
+			return 'permalink of the stored row';
 		}
 	);
 
