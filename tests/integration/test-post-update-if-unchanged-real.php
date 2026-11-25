@@ -704,15 +704,28 @@ try {
 				}
 			};
 			$caught = null;
+			$input  = cinatra_it_input( $read, array( 'content' => 'must not be written' ) );
 			add_action( 'pre_post_update', $throw );
 			try {
-				cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
+				if ( 'ability' === $GLOBALS['cinatra_it_path'] ) {
+					// WP_Ability::invoke_callback() catches a Throwable of the
+					// execute callback and returns WP_Error
+					// ability_callback_exception with its message.
+					$answer = wp_get_ability( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED )->execute( $input );
+					if ( is_wp_error( $answer ) && 'ability_callback_exception' === $answer->get_error_code() && false !== strpos( $answer->get_error_message(), 'cinatra-it deliberate throw' ) ) {
+						$caught = 'cinatra-it deliberate throw';
+					} else {
+						$caught = is_wp_error( $answer ) ? array( $answer->get_error_code(), $answer->get_error_message() ) : $answer;
+					}
+				} else {
+					cinatra_ability_post_update_if_unchanged( $input );
+				}
 			} catch ( RuntimeException $e ) {
 				$caught = $e->getMessage();
 			} finally {
 				remove_action( 'pre_post_update', $throw );
 			}
-			cinatra_it_assert( 'cinatra-it deliberate throw' === $caught, 'the callback exception did not propagate unchanged', $caught );
+			cinatra_it_assert( 'cinatra-it deliberate throw' === $caught, 'the callback exception neither propagated unchanged ( direct call ) nor came back as ability_callback_exception ( Abilities API )', $caught );
 			cinatra_it_assert( false === cinatra_content_transaction()['open'], 'the tracker still marks the transaction open' );
 			$state = cinatra_content_open_transaction_state();
 			cinatra_it_assert( '' === $state, 'a transaction is still open on the connection', array( $state, cinatra_it_diag() ) );
