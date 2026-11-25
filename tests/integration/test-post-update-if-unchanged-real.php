@@ -745,6 +745,45 @@ try {
 	);
 
 	cinatra_it_case(
+		'transaction ended before the locked read -> transaction_conflict ( transaction_lost ) before any site callback',
+		function () {
+			global $wpdb;
+			$id      = cinatra_it_post( 'publish', 'body' );
+			$read    = cinatra_it_read( $id );
+			$before  = cinatra_it_row( $id );
+			$ran     = 0;
+			$counter = function ( $data ) use ( &$ran ) {
+				++$ran;
+				return $data;
+			};
+			$end     = function ( $query ) use ( &$end ) {
+				global $wpdb;
+				if ( false !== strpos( (string) $query, 'FOR UPDATE' ) ) {
+					// Ends this save's transaction right before its locked read:
+					// the read then runs with autocommit and locks nothing.
+					remove_filter( 'query', $end );
+					$wpdb->query( 'COMMIT' );
+				}
+				return $query;
+			};
+			add_filter( 'wp_insert_post_data', $counter );
+			add_action( 'pre_post_update', $counter );
+			add_filter( 'query', $end );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
+			} finally {
+				remove_filter( 'query', $end );
+				remove_filter( 'wp_insert_post_data', $counter );
+				remove_action( 'pre_post_update', $counter );
+			}
+			cinatra_it_assert( cinatra_it_refused( $result, 'transaction_conflict', 'transaction_lost' ) && ! isset( $result['data']['site_changes_possible'] ), 'the lost transaction was not refused before any callback', $result );
+			cinatra_it_assert( 0 === $ran, 'a site callback ran although the transaction was lost', $ran );
+			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
+			return 'refused before any callback';
+		}
+	);
+
+	cinatra_it_case(
 		'the conditional write is byte-exact: a case and trailing-space change under the column\'s collation matches no row',
 		function () {
 			global $wpdb;

@@ -227,16 +227,27 @@ made in the transaction are rolled back with it.
   write (for example the slug, the author or a date), or adds or removes a
   column, the write is refused with `site_policy_conflict`. `data.changed`
   names those columns. Nothing is written, and no after-save hook runs.
-- Before the update, the ability checks that it is still in its own
-  transaction on its own connection. Right after the row lock it sets a
-  savepoint with a random name (`SAVEPOINT cinatra_lock_<random>`); right
-  before the update, `RELEASE SAVEPOINT` of that name must succeed, and the
-  database connection must be the same one. A callback that ended the
-  transaction (`COMMIT`, or a statement that commits implicitly, also when it
-  starts a new transaction afterwards) removes the savepoint, and so does a
-  reconnect. Then the row is no longer locked, so the write is refused with
-  `transaction_conflict` (`data.cause` `transaction_lost` or
-  `connection_replaced`), and nothing is written.
+- The ability proves twice that it is still in its own transaction on its
+  own connection: after the row lock and before any site code runs (the
+  permission check's filters, the save filters, `wp_insert_post_data`,
+  `pre_post_update`), and again right before the update. Right after
+  `START TRANSACTION`, before the locked read, it sets a savepoint with a
+  random name (`SAVEPOINT cinatra_lock_<random>`). Each check needs the same
+  database connection and a successful `RELEASE SAVEPOINT` of that name (the
+  savepoint is then set again). Outside a transaction MySQL and MariaDB accept
+  `SAVEPOINT` but keep nothing, so the `RELEASE` fails with error 1305; a
+  `COMMIT`, a statement that commits implicitly (also when a new transaction
+  is started afterwards) and a reconnect all remove the savepoint. This works
+  on MySQL and MariaDB without any privilege (`@@in_transaction` exists only
+  in MariaDB, and `information_schema.INNODB_TRX` needs the `PROCESS`
+  privilege). If a check fails, the row is not locked, so the write is
+  refused with `transaction_conflict` (`data.cause` `transaction_lost` or
+  `connection_replaced`) and this save writes nothing. When the first check
+  fails, no site code has run, so nothing was written at all. When the
+  second check fails, site code has run, and what it stored itself may have
+  been committed outside the transaction: the refusal then says that the
+  post was not changed by this save and sets `data.site_changes_possible`
+  `true`.
 - The update itself is conditional: `WHERE ID = <id>` and, for every column
   of the locked row (the columns that the row token covers), `col IS NULL`
   when the column was NULL, otherwise
@@ -317,15 +328,16 @@ made in the transaction are rolled back with it.
   statement on a new connection after "server has gone away"; the server
   then rolled the transaction back, and later statements ran outside it), the
   outcome is unknown until the ability reads the row again, after a
-  `ROLLBACK` and a connection check (`wpdb::check_connection()`). If the row
-  is the row that this save stores, the save is stored: the ability runs the
-  hooks that WordPress runs after an update, as after a normal commit, and the
-  answer is a success with `data.commit_unacknowledged` `true` (otherwise
-  `false`). If the row is the row before the save, nothing was written
-  (`db_error`, or the refusal that was decided). Otherwise, or if the row
-  cannot be read, the answer is `write_outcome_unknown`: `data.cause` is
-  `unreadable` or `differs`, no after-save hook runs, and the caller must read
-  the post before it tries again.
+  `ROLLBACK` and a connection check (`wpdb::check_connection()`). The answer
+  is then never a success, and no after-save hook runs: after the `ROLLBACK`
+  the row is no longer locked, so another save can store the very values and
+  times that this save intended, and a row equal to the intended one does not
+  prove that this save stored it. If the row is the row before the save,
+  nothing was written (`db_error`, or the refusal that was decided).
+  Otherwise the answer is `write_outcome_unknown`: `data.cause` is `matches`
+  (the row holds exactly the intended change), `differs` (it holds something
+  else) or `unreadable`, and the caller must read the post before it tries
+  again.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines
@@ -367,9 +379,12 @@ or site code would change), `post_locked` (another user is editing the post),
 the current post; this shows that the post exists), `transaction_conflict`
 (`data.cause` names the reason), `empty_content`,
 `invalid`, `not_found`, `unsupported_storage`, `db_error` and
-`write_outcome_unknown` (`data.cause` is `unreadable` or `differs`: the
-database did not confirm the save, and it is not known whether the change
-was stored). After any other refusal, nothing is written. A refusal never
+`write_outcome_unknown` (`data.cause` is `matches`, `differs` or
+`unreadable`: the database did not confirm the save, and it is not known
+whether this save stored the change). `transaction_conflict` with
+`data.site_changes_possible` `true` means that this save did not change the
+post, but site code that ran during the save may have stored changes of its
+own. After any other refusal, nothing is written. A refusal never
 contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call
