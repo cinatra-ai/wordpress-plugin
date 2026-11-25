@@ -745,7 +745,7 @@ try {
 	);
 
 	cinatra_it_case(
-		'transaction ended before the locked read -> transaction_conflict ( transaction_lost ) before any site callback',
+		'a query filter ends the transaction before the locked read -> transaction_conflict ( transaction_lost ); no permission filter, save filter or pre_post_update runs, no UPDATE is sent',
 		function () {
 			global $wpdb;
 			$id      = cinatra_it_post( 'publish', 'body' );
@@ -766,20 +766,76 @@ try {
 				}
 				return $query;
 			};
+			$caps    = 0;
+			$cap_rec = function ( $allcaps ) use ( &$caps ) {
+				++$caps;
+				return $allcaps;
+			};
+			$input   = cinatra_it_input( $read, array( 'content' => 'must not be written' ) );
 			add_filter( 'wp_insert_post_data', $counter );
 			add_action( 'pre_post_update', $counter );
+			add_filter( 'user_has_cap', $cap_rec );
 			add_filter( 'query', $end );
+			cinatra_it_record();
 			try {
-				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, $input );
 			} finally {
+				$GLOBALS['cinatra_it_recording'] = false;
 				remove_filter( 'query', $end );
+				remove_filter( 'user_has_cap', $cap_rec );
 				remove_filter( 'wp_insert_post_data', $counter );
 				remove_action( 'pre_post_update', $counter );
 			}
+			$updates = array_filter(
+				$GLOBALS['cinatra_it_sql'],
+				function ( $sql ) use ( $wpdb ) {
+					return 0 === strpos( ltrim( $sql ), 'UPDATE `' . $wpdb->posts . '`' );
+				}
+			);
 			cinatra_it_assert( cinatra_it_refused( $result, 'transaction_conflict', 'transaction_lost' ) && ! isset( $result['data']['site_changes_possible'] ), 'the lost transaction was not refused before any callback', $result );
-			cinatra_it_assert( 0 === $ran, 'a site callback ran although the transaction was lost', $ran );
+			cinatra_it_assert( 0 === $ran, 'a save filter or pre_post_update ran although the transaction was lost', $ran );
+			cinatra_it_assert( 0 === $caps, 'the permission check ran although the transaction was lost', $caps );
+			cinatra_it_assert( array() === $updates, 'an UPDATE of the posts table was sent', array_values( $updates ) );
 			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
 			return 'refused before any callback';
+		}
+	);
+
+	cinatra_it_case(
+		'a query filter COMMITs right before the UPDATE -> the write ran outside the transaction: write_outcome_unknown ( matches ), site_changes_possible, no after-save hook',
+		function () {
+			global $wpdb;
+			$id      = cinatra_it_post( 'publish', 'body' );
+			$read    = cinatra_it_read( $id );
+			$updated = 0;
+			$after   = function ( $post_id ) use ( &$updated, $id ) {
+				if ( (int) $post_id === $id ) {
+					++$updated;
+				}
+			};
+			$commit  = function ( $query ) use ( &$commit ) {
+				global $wpdb;
+				if ( 0 === strpos( ltrim( (string) $query ), 'UPDATE `' . $wpdb->posts . '` SET' ) ) {
+					// Ends this save's transaction right before its write: the
+					// UPDATE then runs with autocommit and is durable at once.
+					remove_filter( 'query', $commit );
+					$wpdb->query( 'COMMIT' );
+				}
+				return $query;
+			};
+			add_action( 'post_updated', $after );
+			add_filter( 'query', $commit );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it written outside the transaction' ) ) );
+			} finally {
+				remove_filter( 'query', $commit );
+				remove_action( 'post_updated', $after );
+			}
+			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'matches' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'the write outside the transaction was not reported as write_outcome_unknown ( matches )', $result );
+			cinatra_it_assert( false === strpos( (string) $result['message'], 'Nothing was written' ), 'the answer claims nothing was written', $result['message'] );
+			cinatra_it_assert( 0 === $updated, 'after-save hooks ran for an unproven write' );
+			cinatra_it_assert( 'cinatra-it written outside the transaction' === cinatra_it_row( $id )['post_content'], 'the autocommitted write is not stored (setup)' );
+			return 'cause=matches, stored, no after-save hook';
 		}
 	);
 

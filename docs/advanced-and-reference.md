@@ -227,27 +227,55 @@ made in the transaction are rolled back with it.
   write (for example the slug, the author or a date), or adds or removes a
   column, the write is refused with `site_policy_conflict`. `data.changed`
   names those columns. Nothing is written, and no after-save hook runs.
-- The ability proves twice that it is still in its own transaction on its
-  own connection: after the row lock and before any site code runs (the
+- The ability proves three times that it is still in its own transaction on
+  its own connection: after the row lock and before any site code runs (the
   permission check's filters, the save filters, `wp_insert_post_data`,
-  `pre_post_update`), and again right before the update. Right after
-  `START TRANSACTION`, before the locked read, it sets a savepoint with a
-  random name (`SAVEPOINT cinatra_lock_<random>`). Each check needs the same
-  database connection and a successful `RELEASE SAVEPOINT` of that name (the
-  savepoint is then set again). Outside a transaction MySQL and MariaDB accept
+  `pre_post_update`), right before the update, and after the update, right
+  before the `COMMIT`. Right after `START TRANSACTION`, before the locked
+  read, it sets a savepoint with a random name
+  (`SAVEPOINT cinatra_lock_<random>`). Each proof needs the same database
+  connection and a successful `RELEASE SAVEPOINT` of that name (the savepoint
+  is then set again). Outside a transaction MySQL and MariaDB accept
   `SAVEPOINT` but keep nothing, so the `RELEASE` fails with error 1305; a
   `COMMIT`, a statement that commits implicitly (also when a new transaction
   is started afterwards) and a reconnect all remove the savepoint. This works
   on MySQL and MariaDB without any privilege (`@@in_transaction` exists only
   in MariaDB, and `information_schema.INNODB_TRX` needs the `PROCESS`
-  privilege). If a check fails, the row is not locked, so the write is
-  refused with `transaction_conflict` (`data.cause` `transaction_lost` or
-  `connection_replaced`) and this save writes nothing. When the first check
-  fails, no site code has run, so nothing was written at all. When the
-  second check fails, site code has run, and what it stored itself may have
-  been committed outside the transaction: the refusal then says that the
-  post was not changed by this save and sets `data.site_changes_possible`
-  `true`.
+  privilege).
+  - The first proof fails: no site code has run, so the write is refused
+    with `transaction_conflict` (`data.cause` `transaction_lost` or
+    `connection_replaced`) and nothing was written.
+  - The second proof fails: site code has run, and what it stored itself may
+    have been committed outside the transaction. The refusal says that the
+    post was not changed by this save and sets `data.site_changes_possible`
+    `true`.
+  - The third proof is the one that decides. WordPress runs the site's
+    `query` filters on every statement that the ability sends, so site code
+    can run between any two of them, also between the second proof and the
+    update (a filter that commits there makes the update run with
+    autocommit, where it is durable at once). No condition inside the
+    update can tell, on both MySQL and MariaDB, whether it runs inside the
+    transaction, and WordPress offers no supported way to send a statement
+    without the `query` filters. So the write is proven after it ran. If the
+    proof fails, the update cannot be undone: the ability reads the row and
+    answers `write_outcome_unknown` (`data.cause` `matches`, `differs` or
+    `unreadable`) with `data.site_changes_possible` `true`, never a success
+    and never "nothing was written", and no after-save hook runs. A refusal
+    that was decided after the update is checked the same way: if the
+    transaction was lost and the update changed no row, the refusal stands
+    with `data.site_changes_possible` `true`; otherwise the row is read as
+    above.
+  - What remains: a filter that commits at the ability's own `COMMIT` (after
+    the third proof) commits the same proven work, so the answer stays
+    correct. Site code that reads the savepoint name from the statement and
+    sets it again in a new transaction after committing can defeat the
+    proof; that is deliberate interference, which no check on the same
+    connection can rule out.
+- A failed database read is a database error, never `not_found`: the locked
+  read, the engine check and the read of `cinatra/post-read` answer
+  `db_error` with `data.cause` `lock_wait_timeout` (error 1205, another save
+  holds the row lock), `deadlock` (error 1213) or `read_failed`, after a
+  `ROLLBACK`. A row that does not exist stays `not_found`.
 - The update itself is conditional: `WHERE ID = <id>` and, for every column
   of the locked row (the columns that the row token covers), `col IS NULL`
   when the column was NULL, otherwise
@@ -380,11 +408,15 @@ the current post; this shows that the post exists), `transaction_conflict`
 (`data.cause` names the reason), `empty_content`,
 `invalid`, `not_found`, `unsupported_storage`, `db_error` and
 `write_outcome_unknown` (`data.cause` is `matches`, `differs` or
-`unreadable`: the database did not confirm the save, and it is not known
-whether this save stored the change). `transaction_conflict` with
-`data.site_changes_possible` `true` means that this save did not change the
-post, but site code that ran during the save may have stored changes of its
-own. After any other refusal, nothing is written. A refusal never
+`unreadable`: the database did not confirm the save, or the transaction was
+found lost after the write, and it is not known whether this save stored the
+change; with `data.site_changes_possible` `true`, site code may also have
+stored changes). `db_error` carries `data.cause` `lock_wait_timeout`,
+`deadlock` or `read_failed` when a read failed. A refusal with
+`data.site_changes_possible` `true` (`transaction_conflict`, or another code
+whose transaction was found lost after the write changed no row) means that
+this save did not change the post, but site code that ran during the save may
+have stored changes of its own. After any other refusal, nothing is written. A refusal never
 contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call

@@ -9,7 +9,7 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-11-25T12:04:08+00:00\n"
+"POT-Creation-Date: 2026-11-25T13:49:33+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: cinatra\n"
@@ -18,7 +18,7 @@ msgstr ""
 #. Author of the plugin
 #: cinatra.php
 #: cinatra.php:437
-#: cinatra.php:5709
+#: cinatra.php:5834
 msgid "Cinatra"
 msgstr ""
 
@@ -430,210 +430,230 @@ msgstr ""
 msgid "The post does not exist or you are not allowed to edit it."
 msgstr ""
 
-#: cinatra.php:4621
+#: cinatra.php:4534
+msgid "Another save held the post locked, and the database gave up waiting for it ( lock wait timeout or deadlock ). Nothing was written."
+msgstr ""
+
+#: cinatra.php:4535
+msgid "Another save held the post locked, and the database gave up waiting for it. Nothing was read."
+msgstr ""
+
+#: cinatra.php:4538
+msgid "The database could not read the post. Nothing was written."
+msgstr ""
+
+#: cinatra.php:4539
+msgid "The database could not read the post. Nothing was read."
+msgstr ""
+
+#: cinatra.php:4669
 msgid "The input must be an object."
 msgstr ""
 
-#: cinatra.php:4627
+#: cinatra.php:4675
 msgid "The input contains an unknown field."
 msgstr ""
 
-#: cinatra.php:4632
+#: cinatra.php:4680
 msgid "post_id must be a positive integer."
 msgstr ""
 
-#: cinatra.php:4637
+#: cinatra.php:4685
 msgid "if_unmodified_since must be the post_modified_gmt value of the read the change is based on."
 msgstr ""
 
-#: cinatra.php:4643
+#: cinatra.php:4691
 msgid "expected must be an object."
 msgstr ""
 
-#: cinatra.php:4650
+#: cinatra.php:4698
 msgid "expected must hold exactly title, content, excerpt, status and row_token as read."
 msgstr ""
 
-#: cinatra.php:4654
+#: cinatra.php:4702
 msgid "expected.row_token must be the row_token of the read the change is based on."
 msgstr ""
 
-#: cinatra.php:4659
+#: cinatra.php:4707
 msgid "The expected before-values must be strings."
 msgstr ""
 
-#: cinatra.php:4664
+#: cinatra.php:4712
 msgid "expected.status must be the post status as read."
 msgstr ""
 
-#: cinatra.php:4673
+#: cinatra.php:4721
 msgid "Field values must be strings."
 msgstr ""
 
-#: cinatra.php:4681
+#: cinatra.php:4729
 msgid "status may only be \"draft\". This ability never publishes."
 msgstr ""
 
-#: cinatra.php:4687
+#: cinatra.php:4735
 msgid "Nothing to write: give at least one of title, content, excerpt or status."
 msgstr ""
 
-#: cinatra.php:4920
+#: cinatra.php:4968
 msgid "This ability's database transaction ended during the save, before the write ( site code committed it, or the database connection was replaced ). The post was not changed by this save, but site code that ran during the save ( its save filters and hooks ) may have stored changes of its own that could not be rolled back."
 msgstr ""
 
-#: cinatra.php:4929
+#: cinatra.php:4977
 msgid "This ability's database transaction ended before the post was locked and checked ( the database connection was replaced ), so no site code ran and the post is not locked. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4931
+#: cinatra.php:4979
 msgid "A database transaction is already open on this connection ( or the call came from inside this ability's own save ), and starting another would commit it. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5131
+#: cinatra.php:5179
 msgid "The database did not report whether a transaction is already open on this connection, so the write cannot be made safely. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5145
+#: cinatra.php:5193
 msgid "The database transaction could not be started. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5157
+#: cinatra.php:5205
 msgid "The database transaction could not be marked. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5177
+#: cinatra.php:5225
 msgid "The site's object cache still serves a copy of the post that differs from the database ( site code cached it during the save, and the cache did not accept its removal ); WordPress may show that copy until the cache entry is replaced or expires."
 msgstr ""
 
-#: cinatra.php:5202
+#: cinatra.php:5261
 msgid "The posts table does not use the InnoDB storage engine, so the post cannot be locked during the check. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5238
+#: cinatra.php:5297
 msgid "This ability writes only published posts and drafts. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5251
+#: cinatra.php:5310
 msgid "Another user is editing this post right now. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5275
+#: cinatra.php:5334
 msgid "The post changed since it was read. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5341
+#: cinatra.php:5400
 msgid "The post would be empty ( content, title and excerpt ), or a site policy considers it empty. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5353
+#: cinatra.php:5412
 msgid "A site save policy for the post status does not allow this save. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5394
+#: cinatra.php:5453
 msgid "A site save policy ( wp_insert_post_data ) would change parts of the post this ability does not write. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5426
+#: cinatra.php:5485
 msgid "The posts table has a column name this ability cannot compare safely. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5440
+#: cinatra.php:5505
 msgid "The database update failed. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5450
+#: cinatra.php:5517
 msgid "The post could not be read back after the update. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5468
+#: cinatra.php:5530
 msgid "The post changed during the save, so the conditional write matched no row. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5474
+#: cinatra.php:5535
 msgid "The conditional write matched no row although the post reads unchanged. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5478
+#: cinatra.php:5539
 msgid "Site code changed the post row during the save, so the conditional write matched no row. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5493
+#: cinatra.php:5562
 msgid "The post row after the write is not exactly what this save wrote ( site code changed it during the save ). Nothing was written."
 msgstr ""
 
-#: cinatra.php:5552
+#: cinatra.php:5624
+msgid "This save did not change the post ( its write changed no row ), but its database transaction ended during the save, so changes that site code stored during the save may remain."
+msgstr ""
+
+#: cinatra.php:5668
 msgid "The database did not confirm the save, and the post could not be read back, so it is not known whether the change was stored. Read the post before trying again."
 msgstr ""
 
-#: cinatra.php:5556
+#: cinatra.php:5677
 msgid "The database did not confirm the commit; the post was read back and is unchanged. Nothing was written."
 msgstr ""
 
-#: cinatra.php:5561
+#: cinatra.php:5682
 msgid "The database did not confirm the save. The post now holds exactly the change this save intended, but that does not prove this save stored it ( another save can store the same values ), so the site's after-save hooks were not run for it. Read the post before trying again."
 msgstr ""
 
-#: cinatra.php:5564
+#: cinatra.php:5685
 msgid "The database did not confirm the save, and the post read back is neither the post as it was before the save nor the change this save intended, so it is not known whether the change was stored. Read the post before trying again."
 msgstr ""
 
-#: cinatra.php:5634
+#: cinatra.php:5759
 msgid "Refusal code, present only when success is false."
 msgstr ""
 
-#: cinatra.php:5653
+#: cinatra.php:5778
 msgid "On a successful write: true when the site's object cache did not accept the invalidation after the commit, so get_post() may still return the post as it was before this save. On a refusal: true when the cache still serves a copy that differs from the database after the rollback."
 msgstr ""
 
-#: cinatra.php:5657
+#: cinatra.php:5782
 msgid "On transaction_conflict: true when site code ran during the save before its transaction was found lost, so changes that site code stored itself may remain."
 msgstr ""
 
-#: cinatra.php:5673
+#: cinatra.php:5798
 msgid "SHA-256 fingerprint of every column of the posts row as read ( meta and terms are outside it ). Send it back as expected.row_token."
 msgstr ""
 
-#: cinatra.php:5680
+#: cinatra.php:5805
 msgid "Written fields whose stored value differs from the sent value because the save filters changed it."
 msgstr ""
 
-#: cinatra.php:5710
+#: cinatra.php:5835
 msgid "Cinatra abilities for reading a post and writing a reviewed change to it."
 msgstr ""
 
-#: cinatra.php:5731
+#: cinatra.php:5856
 msgid "The numeric ID of the post or page."
 msgstr ""
 
-#: cinatra.php:5738
+#: cinatra.php:5863
 msgid "Read a post for review"
 msgstr ""
 
-#: cinatra.php:5739
+#: cinatra.php:5864
 msgid "Read the raw stored title, content, excerpt, status, type, permalink and post_modified_gmt of a post or page, fresh from the database. Pass post_modified_gmt to cinatra/post-update-if-unchanged as if_unmodified_since."
 msgstr ""
 
-#: cinatra.php:5767
+#: cinatra.php:5892
 msgid "Write a reviewed change to a post"
 msgstr ""
 
-#: cinatra.php:5768
+#: cinatra.php:5893
 msgid "Write title, content and/or excerpt of a published post or draft (and optionally move it to draft) only if the post is unchanged since the read the review was based on. Writes only those columns. Refuses with a code (for example post_changed, post_locked, unsupported_status or invalid) and then writes nothing."
 msgstr ""
 
-#: cinatra.php:5777
+#: cinatra.php:5902
 msgid "The post_modified_gmt value of the read the change is based on."
 msgstr ""
 
-#: cinatra.php:5789
+#: cinatra.php:5914
 msgid "The row_token returned by cinatra/post-read for the read the change is based on."
 msgstr ""
 
-#: cinatra.php:5794
+#: cinatra.php:5919
 msgid "The title, content, excerpt and status as read, byte for byte, and the row_token of that read; always all five."
 msgstr ""
 
-#: cinatra.php:5802
+#: cinatra.php:5927
 msgid "Only \"draft\": move the post to draft in the same save. Omit to keep the current status."
 msgstr ""

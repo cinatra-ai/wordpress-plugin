@@ -4490,13 +4490,55 @@ function cinatra_content_not_found(): array {
  * @return array<string,string>|null The row, or null when it does not exist.
  */
 function cinatra_content_select_row( int $id, bool $for_update ): ?array {
+	return cinatra_content_read_row( $id, $for_update )[1];
+}
+
+/**
+ * Read one full post row and say which of three results it is: the row, no
+ * such row, or a failed read ( $wpdb->last_error set by the statement: for
+ * example a lock wait timeout, errno 1205, or a deadlock, errno 1213, on the
+ * locked read ). wpdb answers null for both of the last two; only the error
+ * tells them apart.
+ *
+ * @param int  $id         Post ID.
+ * @param bool $for_update True to add FOR UPDATE.
+ * @return array{0:string,1:array<string,string>|null,2:int} "row", "none" or "failed"; the row; the errno of a failed read.
+ */
+function cinatra_content_read_row( int $id, bool $for_update ): array {
 	global $wpdb;
 	if ( $for_update ) {
 		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->posts} WHERE ID = %d FOR UPDATE", $id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The row lock and the fresh value are the purpose; a cached value would defeat the check.
 	} else {
 		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->posts} WHERE ID = %d", $id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The fresh stored value is the purpose; a cached value could be stale.
 	}
-	return is_array( $row ) ? $row : null;
+	if ( is_array( $row ) ) {
+		return array( 'row', $row, 0 );
+	}
+	if ( '' !== (string) $wpdb->last_error ) {
+		return array( 'failed', null, cinatra_content_db_errno() );
+	}
+	return array( 'none', null, 0 );
+}
+
+/**
+ * The refusal for a database read that failed ( not a missing row ).
+ *
+ * @param int  $errno The error number of the failed statement.
+ * @param bool $write True for the write ( "Nothing was written" ), false for the read.
+ * @return array<string,mixed> The refusal result.
+ */
+function cinatra_content_read_failed( int $errno, bool $write ): array {
+	$cause = 1205 === $errno ? 'lock_wait_timeout' : ( 1213 === $errno ? 'deadlock' : 'read_failed' );
+	if ( 'read_failed' !== $cause ) {
+		$message = $write
+			? __( 'Another save held the post locked, and the database gave up waiting for it ( lock wait timeout or deadlock ). Nothing was written.', 'cinatra' )
+			: __( 'Another save held the post locked, and the database gave up waiting for it. Nothing was read.', 'cinatra' );
+	} else {
+		$message = $write
+			? __( 'The database could not read the post. Nothing was written.', 'cinatra' )
+			: __( 'The database could not read the post. Nothing was read.', 'cinatra' );
+	}
+	return cinatra_content_refusal( 'db_error', $message, null, array( 'cause' => $cause ) );
 }
 
 /**
@@ -4567,6 +4609,9 @@ function cinatra_content_row_token( array $row ): string {
 function cinatra_posts_table_engine(): string {
 	global $wpdb;
 	$read = $wpdb->get_var( $wpdb->prepare( 'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s', $wpdb->posts ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Deliberately uncached: the write must verify the engine in the same transaction that relies on it.
+	if ( null === $read && '' !== (string) $wpdb->last_error ) {
+		return 'failed:' . cinatra_content_db_errno();
+	}
 	return is_string( $read ) ? $read : '';
 }
 
@@ -4586,7 +4631,10 @@ function cinatra_ability_post_read( $input = array() ): array {
 	// the read and the check ( the read holds no lock ): then read again,
 	// once, before refusing.
 	for ( $attempt = 0; ; $attempt++ ) {
-		$row = cinatra_content_select_row( $id, false );
+		list( $state, $row, $errno ) = cinatra_content_read_row( $id, false );
+		if ( 'failed' === $state ) {
+			return cinatra_content_read_failed( $errno, false );
+		}
 		if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
 			return cinatra_content_not_found();
 		}
@@ -5190,12 +5238,23 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
  */
 function cinatra_content_update_in_transaction( array $parsed, $dbh, string $savepoint ): array {
 	global $wpdb;
-	$id  = (int) $parsed['id'];
-	$row = cinatra_content_select_row( $id, true );
+	$id = (int) $parsed['id'];
+	// The locked read: a failed read ( lock wait timeout, deadlock, a lost
+	// connection ) is a database error, never "not found".
+	list( $state, $row, $errno ) = cinatra_content_read_row( $id, true );
+	if ( 'failed' === $state ) {
+		cinatra_content_rollback( $id );
+		return cinatra_content_read_failed( $errno, true );
+	}
 
 	// Verified in this transaction, after the lock ( see the engine helper ):
 	// without InnoDB the row lock and the rollback would not protect the write.
-	if ( 'innodb' !== strtolower( cinatra_posts_table_engine() ) ) {
+	$engine = cinatra_posts_table_engine();
+	if ( 0 === strpos( $engine, 'failed:' ) ) {
+		cinatra_content_rollback( $id );
+		return cinatra_content_read_failed( (int) substr( $engine, 7 ), true );
+	}
+	if ( 'innodb' !== strtolower( $engine ) ) {
 		cinatra_content_rollback( $id );
 		return cinatra_content_refusal(
 			'unsupported_storage',
@@ -5437,22 +5496,26 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh, string $sav
 	// ( an identical write ) or no longer matched the locked row ( decided by
 	// the read below ); more than one is impossible for WHERE ID and is refused.
 	if ( false === $updated || 1 < (int) $updated ) {
-		$refusal = cinatra_content_refusal( 'db_error', __( 'The database update failed. Nothing was written.', 'cinatra' ), $current_modified );
-		if ( $wpdb->dbh !== $dbh ) {
-			return cinatra_content_settle_unconfirmed( $row, $data, $refusal );
-		}
-		cinatra_content_rollback( $id );
-		return $refusal;
+		return cinatra_content_end_after_update(
+			$row,
+			$data,
+			$updated,
+			$savepoint,
+			$dbh,
+			cinatra_content_refusal( 'db_error', __( 'The database update failed. Nothing was written.', 'cinatra' ), $current_modified )
+		);
 	}
 
-	$stored = cinatra_content_select_row( $id, false );
-	if ( null === $stored ) {
-		$refusal = cinatra_content_refusal( 'db_error', __( 'The post could not be read back after the update. Nothing was written.', 'cinatra' ), $current_modified );
-		if ( $wpdb->dbh !== $dbh ) {
-			return cinatra_content_settle_unconfirmed( $row, $data, $refusal );
-		}
-		cinatra_content_rollback( $id );
-		return $refusal;
+	list( $state, $stored ) = cinatra_content_read_row( $id, false );
+	if ( 'row' !== $state ) {
+		return cinatra_content_end_after_update(
+			$row,
+			$data,
+			$updated,
+			$savepoint,
+			$dbh,
+			cinatra_content_refusal( 'db_error', __( 'The post could not be read back after the update. Nothing was written.', 'cinatra' ), $current_modified )
+		);
 	}
 
 	// Zero changed rows and a row that is not this save's row: the condition
@@ -5461,24 +5524,24 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh, string $sav
 	// changed it; on a replaced connection another save may have.
 	if ( 0 === (int) $updated && array() !== cinatra_content_widened_columns( $row, $data, $stored ) ) {
 		$differs = cinatra_content_widened_columns( $row, array(), $stored );
-		cinatra_content_rollback( $id );
 		if ( $wpdb->dbh !== $dbh ) {
-			return cinatra_content_refusal(
+			$refusal = cinatra_content_refusal(
 				'post_changed',
 				__( 'The post changed during the save, so the conditional write matched no row. Nothing was written.', 'cinatra' ),
 				(string) $stored['post_modified_gmt'],
 				array( 'changed' => $differs )
 			);
+		} elseif ( array() === $differs ) {
+			$refusal = cinatra_content_refusal( 'db_error', __( 'The conditional write matched no row although the post reads unchanged. Nothing was written.', 'cinatra' ), $current_modified );
+		} else {
+			$refusal = cinatra_content_refusal(
+				'site_policy_conflict',
+				__( 'Site code changed the post row during the save, so the conditional write matched no row. Nothing was written.', 'cinatra' ),
+				$current_modified,
+				array( 'changed' => $differs )
+			);
 		}
-		if ( array() === $differs ) {
-			return cinatra_content_refusal( 'db_error', __( 'The conditional write matched no row although the post reads unchanged. Nothing was written.', 'cinatra' ), $current_modified );
-		}
-		return cinatra_content_refusal(
-			'site_policy_conflict',
-			__( 'Site code changed the post row during the save, so the conditional write matched no row. Nothing was written.', 'cinatra' ),
-			$current_modified,
-			array( 'changed' => $differs )
-		);
+		return cinatra_content_end_after_update( $row, $data, $updated, $savepoint, $dbh, $refusal );
 	}
 
 	// The row as it will be committed ( read in this transaction, still locked
@@ -5488,17 +5551,34 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh, string $sav
 	// slug. Any difference rolls the whole transaction back.
 	$widened = cinatra_content_widened_columns( $row, $data, $stored );
 	if ( array() !== $widened ) {
-		$refusal = cinatra_content_refusal(
-			'site_policy_conflict',
-			__( 'The post row after the write is not exactly what this save wrote ( site code changed it during the save ). Nothing was written.', 'cinatra' ),
-			$current_modified,
-			array( 'changed' => $widened )
+		return cinatra_content_end_after_update(
+			$row,
+			$data,
+			$updated,
+			$savepoint,
+			$dbh,
+			cinatra_content_refusal(
+				'site_policy_conflict',
+				__( 'The post row after the write is not exactly what this save wrote ( site code changed it during the save ). Nothing was written.', 'cinatra' ),
+				$current_modified,
+				array( 'changed' => $widened )
+			)
 		);
-		if ( $wpdb->dbh !== $dbh ) {
-			return cinatra_content_settle_unconfirmed( $row, $data, $refusal );
-		}
-		cinatra_content_rollback( $id );
-		return $refusal;
+	}
+
+	// The proof AFTER the write. WordPress runs the site's query filters on
+	// every statement this function sends, so site code can run between any
+	// two of them, also between the proof before the UPDATE and the UPDATE
+	// ( a filter that COMMITs there makes the UPDATE run with autocommit ).
+	// No expression in the UPDATE itself can tell, on both MySQL and MariaDB,
+	// whether it runs inside this transaction. So the write is proven after
+	// it ran: the savepoint set right after START TRANSACTION must still be
+	// releasable on the same connection. If it is not, the UPDATE may already
+	// be durable and cannot be undone: the outcome is settled by reading the
+	// row ( never a success, never "nothing was written" ).
+	$lost = cinatra_content_own_transaction_lost( $savepoint, $dbh );
+	if ( '' !== $lost ) {
+		return cinatra_content_settle_unconfirmed( $row, $data, null, $lost );
 	}
 
 	// A COMMIT counts only when it succeeded on the connection the transaction
@@ -5508,10 +5588,44 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh, string $sav
 	// the outcome unknown until the row is read.
 	$committed = $wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
 	if ( false === $committed || $wpdb->dbh !== $dbh ) {
-		return cinatra_content_settle_unconfirmed( $row, $data, null );
+		return cinatra_content_settle_unconfirmed( $row, $data, null, '' );
 	}
 	cinatra_content_transaction( false );
 	return cinatra_content_after_commit( $parsed, $stored, $post_before );
+}
+
+/**
+ * End the save with a refusal decided at or after the UPDATE. The rollback
+ * undoes the UPDATE only while this save's transaction is still the open
+ * one, so that is proven first ( cinatra_content_own_transaction_lost() ).
+ * Proven: ROLLBACK, the refusal as decided. Lost: site code ran during the
+ * save, and what it stored itself may have been committed. If this save's
+ * UPDATE changed no row ( 0 or failed ), the refusal stands, but it says that
+ * site changes may remain ( data.site_changes_possible ); otherwise the
+ * outcome is settled by reading the row.
+ *
+ * @param array<string,string> $row       The row as locked.
+ * @param array<string,string> $data      The columns this save wrote.
+ * @param int|false            $updated   The UPDATE's result.
+ * @param string               $savepoint The savepoint set right after START TRANSACTION.
+ * @param mixed                $dbh       The connection object the transaction started on.
+ * @param array<string,mixed>  $refusal   The refusal decided.
+ * @return array<string,mixed> The answer.
+ */
+function cinatra_content_end_after_update( array $row, array $data, $updated, string $savepoint, $dbh, array $refusal ): array {
+	$id   = (int) $row['ID'];
+	$lost = cinatra_content_own_transaction_lost( $savepoint, $dbh );
+	if ( '' === $lost ) {
+		cinatra_content_rollback( $id );
+		return $refusal;
+	}
+	if ( false === $updated || 0 === (int) $updated ) {
+		cinatra_content_rollback( $id );
+		$refusal['message']                       = __( 'This save did not change the post ( its write changed no row ), but its database transaction ended during the save, so changes that site code stored during the save may remain.', 'cinatra' );
+		$refusal['data']['site_changes_possible'] = true;
+		return $refusal;
+	}
+	return cinatra_content_settle_unconfirmed( $row, $data, null, $lost );
 }
 
 /**
@@ -5537,33 +5651,44 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh, string $sav
  * @param array<string,string> $row     The row as locked, before any hook ran.
  * @param array<string,string> $data    The columns this save wrote.
  * @param array|null           $refusal The refusal decided in the transaction, or null for an unconfirmed COMMIT.
+ * @param string               $lost    "" for an unconfirmed COMMIT, or the cause when this save's transaction was found lost after the UPDATE ( site code ran; data.site_changes_possible ).
  * @return array<string,mixed> The answer.
  */
-function cinatra_content_settle_unconfirmed( array $row, array $data, ?array $refusal ): array {
+function cinatra_content_settle_unconfirmed( array $row, array $data, ?array $refusal, string $lost = '' ): array {
 	global $wpdb;
 	$id = (int) $row['ID'];
 	cinatra_content_rollback( $id );
-	$now = null;
+	$state = 'failed';
+	$now   = null;
 	if ( $wpdb->check_connection( false ) ) {
-		$now = cinatra_content_select_row( $id, false );
+		list( $state, $now ) = cinatra_content_read_row( $id, false );
 	}
-	if ( null === $now ) {
+	if ( 'failed' === $state ) {
 		$cause   = 'unreadable';
 		$message = __( 'The database did not confirm the save, and the post could not be read back, so it is not known whether the change was stored. Read the post before trying again.', 'cinatra' );
-	} elseif ( hash_equals( cinatra_content_row_token( $row ), cinatra_content_row_token( $now ) ) ) {
+	} elseif ( null !== $now && hash_equals( cinatra_content_row_token( $row ), cinatra_content_row_token( $now ) ) ) {
+		if ( '' !== $lost ) {
+			// The post is as it was ( this save's UPDATE was undone with the
+			// transaction that took it ), but site code ran after the loss.
+			return cinatra_content_transaction_conflict( $lost, true );
+		}
 		return $refusal ?? cinatra_content_refusal(
 			'db_error',
 			__( 'The database did not confirm the commit; the post was read back and is unchanged. Nothing was written.', 'cinatra' ),
 			(string) $now['post_modified_gmt']
 		);
-	} elseif ( array() === cinatra_content_widened_columns( $row, $data, $now ) ) {
+	} elseif ( null !== $now && array() === cinatra_content_widened_columns( $row, $data, $now ) ) {
 		$cause   = 'matches';
 		$message = __( 'The database did not confirm the save. The post now holds exactly the change this save intended, but that does not prove this save stored it ( another save can store the same values ), so the site\'s after-save hooks were not run for it. Read the post before trying again.', 'cinatra' );
 	} else {
 		$cause   = 'differs';
 		$message = __( 'The database did not confirm the save, and the post read back is neither the post as it was before the save nor the change this save intended, so it is not known whether the change was stored. Read the post before trying again.', 'cinatra' );
 	}
-	return cinatra_content_refusal( 'write_outcome_unknown', $message, null, array( 'cause' => $cause ) );
+	$extra = array( 'cause' => $cause );
+	if ( '' !== $lost ) {
+		$extra['site_changes_possible'] = true;
+	}
+	return cinatra_content_refusal( 'write_outcome_unknown', $message, null, $extra );
 }
 
 /**
@@ -5646,7 +5771,7 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 				'current_status'        => array( 'type' => 'string' ),
 				'cause'                 => array(
 					'type' => 'string',
-					'enum' => array( 'nested', 'open_transaction', 'autocommit_off', 'transaction_lost', 'connection_replaced', 'unreadable', 'matches', 'differs' ),
+					'enum' => array( 'nested', 'open_transaction', 'autocommit_off', 'transaction_lost', 'connection_replaced', 'unreadable', 'matches', 'differs', 'lock_wait_timeout', 'deadlock', 'read_failed' ),
 				),
 				'cache_stale'           => array(
 					'type'        => 'boolean',
