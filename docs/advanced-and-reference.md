@@ -225,6 +225,29 @@ made in the transaction are rolled back with it.
   that is killed or a PHP error that stops the request before shutdown runs;
   in those cases the database rolls the transaction back when the connection
   closes, unless the site uses a persistent database connection.
+- The write owns its transaction or it does not run. In MySQL and MariaDB,
+  starting a transaction commits a transaction that is already open on the
+  same connection. So before it starts, the write refuses with
+  `transaction_conflict`, and does not start, commit or write anything,
+  when `data.cause` is one of these:
+  - `nested`: the call came from a callback inside this ability's own save
+    (for example from `pre_post_update`). The outer save continues
+    unchanged. A call from a hook after the commit is not nested.
+  - `autocommit_off`: the connection has `autocommit` set to 0. Then a
+    transaction is always open, so the write cannot own one.
+  - `open_transaction`: another transaction is open on the connection. On
+    MariaDB, the session variable `in_transaction` shows it. Where that
+    variable does not exist (MySQL), InnoDB's list of transactions
+    (`information_schema.INNODB_TRX`) shows a transaction of this connection
+    that has done InnoDB work.
+
+  Reading `autocommit` must work: if the database does not answer, the write
+  is refused with `unsupported_storage`. Limit: on MySQL, reading
+  `INNODB_TRX` needs the `PROCESS` privilege (and MySQL 5.6 or later). Without
+  it, the database cannot report another open transaction, and the write
+  runs. A transaction that was started but has not yet done InnoDB work is
+  not detected on MySQL. These checks read only (`SELECT` and `SHOW`), and
+  never commit anything.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines
@@ -263,7 +286,8 @@ The codes are `post_changed` (`data.changed` names the fields that differ),
 or site code would change), `post_locked` (another user is editing the post),
 `unsupported_status` (`data.current_status` names the status),
 `permission_unverified` (the permission decision could not be verified against
-the current post; this shows that the post exists), `empty_content`,
+the current post; this shows that the post exists), `transaction_conflict`
+(`data.cause` names the reason), `empty_content`,
 `invalid`, `not_found`, `unsupported_storage` and `db_error`. After a refusal, nothing
 is written, and a refusal never contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities

@@ -4826,6 +4826,63 @@ function cinatra_content_transaction( ?bool $open = null, int $id = 0 ): array {
 }
 
 /**
+ * Whether a transaction is already open on this database connection, read
+ * without any statement that commits implicitly ( only SELECT and SHOW ).
+ *
+ * 1. @@SESSION.autocommit ( MySQL and MariaDB ): 0 means every statement runs
+ *    inside a transaction that only COMMIT or ROLLBACK ends, so one may be
+ *    open with pending work: "autocommit_off". Unreadable: "unverifiable".
+ * 2. MariaDB's session variable in_transaction ( 1 while a transaction is in
+ *    progress ), read with SHOW SESSION VARIABLES, which returns no row
+ *    where the variable does not exist ( MySQL ) instead of an error.
+ * 3. Otherwise InnoDB's own list: a row in information_schema.INNODB_TRX for
+ *    this connection that is not a lone autocommit SELECT. This needs the
+ *    PROCESS privilege and the trx_autocommit_non_locking column; when the
+ *    query fails ( errors suppressed ), the server cannot tell and the write
+ *    proceeds: the documented limit. A transaction that has not touched
+ *    InnoDB yet is not listed there.
+ *
+ * @return string "" when none is detected, "autocommit_off",
+ *                "open_transaction" or "unverifiable".
+ */
+function cinatra_content_open_transaction_state(): string {
+	global $wpdb;
+	$autocommit = $wpdb->get_var( 'SELECT @@SESSION.autocommit' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Session state, read before the transaction.
+	if ( null === $autocommit ) {
+		return 'unverifiable';
+	}
+	if ( '1' !== (string) $autocommit ) {
+		return 'autocommit_off';
+	}
+	$in_transaction = $wpdb->get_var( "SHOW SESSION VARIABLES LIKE 'in_transaction'", 1 ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Session state, read before the transaction.
+	if ( null !== $in_transaction ) {
+		return in_array( strtoupper( (string) $in_transaction ), array( '0', 'OFF' ), true ) ? '' : 'open_transaction';
+	}
+	$suppressed = $wpdb->suppress_errors( true );
+	$rows       = $wpdb->get_var( 'SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID() AND trx_autocommit_non_locking = 0' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Session state, read before the transaction.
+	$wpdb->suppress_errors( $suppressed );
+	if ( null === $rows || '0' === (string) $rows ) {
+		return '';
+	}
+	return 'open_transaction';
+}
+
+/**
+ * The refusal when the write cannot own its transaction.
+ *
+ * @param string $cause "nested", "open_transaction" or "autocommit_off".
+ * @return array<string,mixed> The refusal result.
+ */
+function cinatra_content_transaction_conflict( string $cause ): array {
+	return cinatra_content_refusal(
+		'transaction_conflict',
+		__( 'A database transaction is already open on this connection ( or the call came from inside this ability\'s own save ), and starting another would commit it. Nothing was written.', 'cinatra' ),
+		null,
+		array( 'cause' => $cause )
+	);
+}
+
+/**
  * Shutdown guard for exit() or wp_die() inside a site callback while the
  * write's transaction is open: PHP then runs its shutdown functions and
  * WordPress fires the shutdown action, where this runs first ( lowest
@@ -4890,6 +4947,25 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		return $parsed;
 	}
 	$id = (int) $parsed['id'];
+
+	// The ability owns its transaction or it does not run. START TRANSACTION
+	// would implicitly COMMIT a transaction already open on this connection
+	// ( MySQL and MariaDB: transactions cannot be nested ), releasing its
+	// locks: refuse instead, before any statement that could commit.
+	if ( cinatra_content_transaction()['open'] ) {
+		// A call from a site callback inside this ability's own transaction.
+		return cinatra_content_transaction_conflict( 'nested' );
+	}
+	$foreign = cinatra_content_open_transaction_state();
+	if ( 'unverifiable' === $foreign ) {
+		return cinatra_content_refusal(
+			'unsupported_storage',
+			__( 'The database did not report its autocommit mode, so the write cannot be made safely. Nothing was written.', 'cinatra' )
+		);
+	}
+	if ( '' !== $foreign ) {
+		return cinatra_content_transaction_conflict( $foreign );
+	}
 
 	if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
 		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be started. Nothing was written.', 'cinatra' ) );
@@ -5203,6 +5279,10 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 				),
 				'wp_error_code'        => array( 'type' => 'string' ),
 				'current_status'       => array( 'type' => 'string' ),
+				'cause'                => array(
+					'type' => 'string',
+					'enum' => array( 'nested', 'open_transaction', 'autocommit_off' ),
+				),
 			),
 			'additionalProperties' => false,
 		),

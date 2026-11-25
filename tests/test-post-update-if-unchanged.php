@@ -88,8 +88,37 @@ class Cinatra_Test_Wpdb {
         }
         return $row;
     }
-    public function get_var($sql) {
+    // Pre-transaction checks: @@autocommit ( '1' ), in_transaction ( null: the
+    // variable does not exist, as on MySQL ), INNODB_TRX rows for this
+    // connection ( '0'; null: the query fails, e.g. no PROCESS privilege ).
+    public $autocommit = '1';
+    public $in_transaction = null;
+    public $innodb_trx = '0';
+    public $suppress_calls = [];
+    private $suppressed = false;
+    public function suppress_errors($suppress = true) {
+        $previous = $this->suppressed;
+        $this->suppressed = (bool) $suppress;
+        $this->suppress_calls[] = (bool) $suppress;
+        return $previous;
+    }
+    public function get_var($sql, $x = 0, $y = 0) {
         $this->log[] = $sql;
+        if (false !== strpos($sql, '@@SESSION.autocommit')) {
+            return $this->autocommit;
+        }
+        if (0 === strpos($sql, 'SHOW SESSION VARIABLES')) {
+            return 1 === $x ? $this->in_transaction : (null === $this->in_transaction ? null : 'in_transaction');
+        }
+        if (false !== strpos($sql, 'INNODB_TRX')) {
+            $GLOBALS['cinatra_test']['innodb_trx_suppressed'] = $this->suppressed;
+            if (null === $this->innodb_trx) {
+                return null;
+            }
+            // InnoDB may list the detection SELECT itself as an autocommit
+            // non-locking transaction ( trx_autocommit_non_locking = 1 ).
+            return false !== strpos($sql, 'trx_autocommit_non_locking = 0') ? $this->innodb_trx : (string) ((int) $this->innodb_trx + 1);
+        }
         return $this->engine;
     }
     public function get_col_charset($table, $column) {
@@ -482,8 +511,23 @@ function t_state_is_read(): void {
 }
 
 /** The log with SELECTs reduced to a tag. */
+/** The pre-transaction checks in the log ( excluded from statement_kinds() ). */
+function precheck_kinds(): array {
+    global $wpdb;
+    $kinds = [];
+    foreach ($wpdb->log as $sql) {
+        if (false !== strpos($sql, '@@SESSION.autocommit')) { $kinds[] = 'AUTOCOMMIT?'; }
+        elseif (0 === strpos($sql, 'SHOW SESSION VARIABLES')) { $kinds[] = 'IN-TRANSACTION?'; }
+        elseif (false !== strpos($sql, 'INNODB_TRX')) { $kinds[] = 'INNODB-TRX?'; }
+        elseif ('START TRANSACTION' === $sql) { $kinds[] = 'START TRANSACTION'; }
+    }
+    return $kinds;
+}
 function statement_kinds(): array {
     global $wpdb;
+    $log = array_values(array_filter($wpdb->log, function ($sql) {
+        return false === strpos($sql, '@@SESSION.autocommit') && 0 !== strpos($sql, 'SHOW SESSION VARIABLES') && false === strpos($sql, 'INNODB_TRX');
+    }));
     return array_map(function ($sql) {
         if (0 === strpos($sql, 'SELECT ENGINE')) {
             return 'ENGINE';
@@ -492,7 +536,7 @@ function statement_kinds(): array {
             return false !== strpos($sql, 'FOR UPDATE') ? 'SELECT-FOR-UPDATE' : 'SELECT';
         }
         return $sql;
-    }, $wpdb->log);
+    }, $log);
 }
 function hooks_fired(): array {
     return array_column($GLOBALS['cinatra_test']['fired'], 0);
@@ -1011,10 +1055,80 @@ $before = $wpdb->rows;
 try { cinatra_ability_post_update_if_unchanged(base_update()); } catch (Throwable $e) { }
 [$open_after_guard, $rows_after_guard, $log_after_guard] = $GLOBALS['cinatra_test']['after_guard'] ?? [true, null, []];
 check('the shutdown guard itself rolls back the open transaction ( exit / wp_die inside a callback )', false === $open_after_guard && $before === $rows_after_guard && 'ROLLBACK' === ($log_after_guard[count($log_after_guard) - 2] ?? null) && 'CLEAN-CACHE' === end($log_after_guard));
+// Ordering on the shutdown action ( the stub runs callbacks by priority, as WordPress ): the guard
+// ( PHP_INT_MIN ) must roll back before a later callback issues a statement on the connection.
+reset_fixture();
+add_action('shutdown', function () { global $wpdb; if (!empty($GLOBALS['cinatra_test']['late_shutdown'])) { $wpdb->query('INSERT late shutdown write'); } }, 1); // registered after the guard, priority 1 ( runs before any default-priority callback )
+$GLOBALS['cinatra_test']['late_shutdown'] = true;
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () {
+    do_action('shutdown'); // what WordPress fires after exit / wp_die()
+    throw new RuntimeException('simulated exit'); // the harness cannot exit; stop here
+};
+try { cinatra_ability_post_update_if_unchanged(base_update()); } catch (Throwable $e) { }
+$GLOBALS['cinatra_test']['late_shutdown'] = false;
+$kinds = statement_kinds();
+$rollback_at = array_search('ROLLBACK', $kinds, true);
+$late_at = array_search('INSERT late shutdown write', $kinds, true);
+check('on the shutdown action the guard rolls back BEFORE a later-priority callback issues a statement', false !== $rollback_at && false !== $late_at && $rollback_at < $late_at && !in_array('COMMIT', $kinds, true));
 reset_fixture();
 $wpdb->log = [];
 cinatra_content_shutdown_guard();
 check('the shutdown guard does nothing when no transaction is open', [] === statement_kinds());
+
+// ---------------------------------------------------------------------------
+echo "Transactions: the ability owns its transaction or it does not run\n";
+reset_fixture();
+$inner = null;
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () use (&$inner) {
+    if (null === $inner) {
+        $inner = 'running';
+        $inner = cinatra_ability_post_update_if_unchanged(array_diff_key(base_update(['title' => 'inner title']), ['content' => 1]));
+    }
+};
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a nested call from pre_post_update -> transaction_conflict ( nested ), before any SQL of its own', is_array($inner) && false === $inner['success'] && 'transaction_conflict' === $inner['code'] && 'nested' === ($inner['data']['cause'] ?? null));
+check('the inner call wrote nothing; the outer save completed with its own values', true === ($r['success'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content'] && 'About "us"' === $wpdb->rows[T_ID]['post_title']);
+check('exactly one START TRANSACTION and one set of checks ( the inner call issued no statement )', ['AUTOCOMMIT?', 'IN-TRANSACTION?', 'INNODB-TRX?', 'START TRANSACTION'] === precheck_kinds() && 1 === count(array_keys(statement_kinds(), 'COMMIT')));
+check('the outer lock was never released before its COMMIT ( no START or COMMIT between the lock and the write )', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'HOOK:pre_post_update', 'UPDATE-ROW', 'SELECT', 'COMMIT'] === array_slice(statement_kinds(), 0, 7));
+$foreign = [
+    'MariaDB in_transaction = 1'           => ['in_transaction' => '1', 'cause' => 'open_transaction', 'checks' => ['AUTOCOMMIT?', 'IN-TRANSACTION?']],
+    'MariaDB in_transaction = ON'          => ['in_transaction' => 'ON', 'cause' => 'open_transaction', 'checks' => ['AUTOCOMMIT?', 'IN-TRANSACTION?']],
+    'MariaDB in_transaction unreadable'    => ['in_transaction' => 'maybe', 'cause' => 'open_transaction', 'checks' => ['AUTOCOMMIT?', 'IN-TRANSACTION?']],
+    'MySQL: a locking InnoDB transaction'  => ['innodb_trx' => '1', 'cause' => 'open_transaction', 'checks' => ['AUTOCOMMIT?', 'IN-TRANSACTION?', 'INNODB-TRX?']],
+    'autocommit = 0 ( always in a transaction )' => ['autocommit' => '0', 'cause' => 'autocommit_off', 'checks' => ['AUTOCOMMIT?']],
+];
+foreach ($foreign as $label => $case) {
+    reset_fixture();
+    foreach (['in_transaction', 'innodb_trx', 'autocommit'] as $prop) { if (array_key_exists($prop, $case)) { $wpdb->$prop = $case[$prop]; } }
+    $before = $wpdb->rows;
+    $r = cinatra_ability_post_update_if_unchanged(base_update());
+    check("$label -> transaction_conflict ( {$case['cause']} ), no START TRANSACTION, no COMMIT, nothing written", is_refusal($r, 'transaction_conflict') && $case['cause'] === $r['data']['cause'] && $case['checks'] === precheck_kinds() && [] === statement_kinds() && $before === $wpdb->rows);
+}
+reset_fixture();
+$wpdb->in_transaction = '0';
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('MariaDB in_transaction = 0 -> proceeds without the INNODB_TRX query', true === ($r['success'] ?? null) && ['AUTOCOMMIT?', 'IN-TRANSACTION?', 'START TRANSACTION'] === precheck_kinds());
+reset_fixture();
+$wpdb->in_transaction = 'OFF';
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('MariaDB in_transaction = OFF -> proceeds', true === ($r['success'] ?? null));
+reset_fixture();
+$wpdb->innodb_trx = null; // MySQL without the PROCESS privilege ( or 5.5 ): the server cannot tell us
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('INNODB_TRX unreadable -> proceeds ( the documented limit ), with database errors suppressed for that query and restored', true === ($r['success'] ?? null) && true === ($GLOBALS['cinatra_test']['innodb_trx_suppressed'] ?? null) && [true, false] === $wpdb->suppress_calls);
+reset_fixture();
+$wpdb->autocommit = null;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('@@autocommit unreadable -> unsupported_storage ( fail closed: the variable exists on every supported server ), no START TRANSACTION', is_refusal($r, 'unsupported_storage') && [] === statement_kinds());
+reset_fixture();
+$r1 = cinatra_ability_post_update_if_unchanged(base_update());
+$r2 = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected([], T_ID), 'if_unmodified_since' => T_NOW, 'content' => '<p>Again</p>']));
+check('after a completed save the tracker is closed: a second save on the request runs', true === ($r1['success'] ?? null) && false === cinatra_content_transaction()['open']);
+reset_fixture();
+add_action('save_post', function () { if (!empty($GLOBALS['cinatra_test']['nested_after_commit'])) { $GLOBALS['cinatra_test']['nested_after_commit'] = false; $GLOBALS['cinatra_test']['nested_result'] = cinatra_ability_post_update_if_unchanged(['post_id' => T_POST_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected([], T_POST_ID), 'title' => 'by a save_post callback']); } }, 10, 3);
+$GLOBALS['cinatra_test']['nested_after_commit'] = true;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a call from an after-commit hook ( outer transaction closed ) is not nested and runs', true === ($r['success'] ?? null) && true === ($GLOBALS['cinatra_test']['nested_result']['success'] ?? null) && 'by a save_post callback' === $wpdb->rows[T_POST_ID]['post_title']);
 
 echo "Affected rows\n";
 reset_fixture();

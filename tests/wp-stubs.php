@@ -53,11 +53,19 @@ function add_action($hook, $cb, $priority = 10, $args = 1) {
     // plugin load time. Only the option-lifecycle hooks are ever REPLAYED (see
     // update_option below); everything else is capture-only.
     $GLOBALS['cinatra_test_actions'][$hook][] = $cb;
+    $GLOBALS['cinatra_test_action_priorities'][$hook][] = (int) $priority;
     return true;
 }
+/** Runs a hook's callbacks as WordPress does: ascending priority, then registration order. */
 function cinatra_test_do_action($hook, ...$args) {
-    foreach ($GLOBALS['cinatra_test_actions'][$hook] ?? [] as $cb) {
-        call_user_func_array($cb, $args);
+    $callbacks  = $GLOBALS['cinatra_test_actions'][$hook] ?? [];
+    $priorities = $GLOBALS['cinatra_test_action_priorities'][$hook] ?? [];
+    $order = array_keys($callbacks);
+    usort($order, function ($a, $b) use ($priorities) {
+        return [($priorities[$a] ?? 10), $a] <=> [($priorities[$b] ?? 10), $b];
+    });
+    foreach ($order as $i) {
+        call_user_func_array($callbacks[$i], $args);
     }
 }
 // Real do_action() -- WP core's own hook-firing function. Previously
