@@ -113,9 +113,16 @@ transaction, it does these steps:
 5. It runs `pre_post_update` with that full data, and then writes only the
    requested fields, `post_status` `draft` when requested, and the two
    modification times, with one database update.
+6. It reads the row again in the same transaction and checks that the row is
+   exactly the locked row with the columns that this save wrote (see below).
 
 If a step refuses, the transaction is rolled back, nothing is written, and no
-WordPress update hook runs.
+after-save hook runs (none of the hooks that WordPress runs after an update,
+from `transition_post_status` to `wp_after_insert_post`). A refusal before
+the write fires no hook at all. `pre_post_update` may have fired when the
+refusal happens at or after the write (`db_error`, or the check in step 6),
+because an action cannot be undone. The database changes that its callbacks
+made in the transaction are rolled back with it.
 
 - `expected` must always contain all five values, `title`, `content`,
   `excerpt`, `status` and `row_token`, exactly as the read returned them, also
@@ -130,8 +137,12 @@ WordPress update hook runs.
   `future`, `private`, `pending` and `auto-draft`.
 - `status` may only be `"draft"`. If `status` is not given, the status does
   not change. Thus an edit to a published page is live immediately. The
-  ability never publishes: a site filter that would change the status is
-  refused (see below).
+  status that this save stores (`draft` when requested, otherwise the current
+  status) goes through the status save filters that WordPress applies on an
+  update (`pre_post_status` and `status_save_pre`). If such a site policy
+  returns a different status, for example because it does not allow a
+  direct unpublish, the write is refused with `site_policy_conflict`. The
+  ability never publishes.
 - Each written field goes through the same save filters that WordPress applies
   to that field on a normal save by that user, including the site's own save
   filters. For users without the `unfiltered_html` capability, WordPress
@@ -168,6 +179,24 @@ WordPress update hook runs.
   unslashed, inside the transaction, before the update, as in WordPress. It
   runs only when the write goes ahead. It is an action, so it cannot stop the
   write.
+- After the update and before the commit, the ability reads the row again in
+  the same transaction, while it still holds the lock. Each column that this
+  save wrote must hold the written value, and every other column must hold
+  the value of the locked row. Thus a callback (`pre_post_update`, a save
+  filter or `wp_insert_post_data`) that writes the posts row directly cannot
+  widen the write, for example publish the post or change its slug. If the
+  row differs, the transaction is rolled back and the write is refused with
+  `site_policy_conflict`. `data.changed` names the columns.
+- Limit: a callback's database writes to other tables (for example post meta
+  or terms) through the WordPress database connection are part of the same
+  transaction on InnoDB tables. They are rolled back on a refusal and
+  committed on success. The ability does not check them. Writes to tables
+  that do not use InnoDB, writes through another connection, and effects
+  outside the database (the object cache, files, emails, HTTP requests) are
+  not rolled back. A callback that ends the transaction itself (`COMMIT`, or
+  a statement that commits implicitly, such as `CREATE TABLE`) also commits
+  the changes made up to that point, so a later refusal cannot roll them
+  back.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines
@@ -182,8 +211,8 @@ answer.
 A refusal is a normal result, not an error:
 `{ "success": false, "code": "...", "message": "...", "data": { "current_modified_gmt": ... } }`.
 The codes are `post_changed` (`data.changed` names the fields that differ),
-`site_policy_conflict` (`data.changed` names the columns that a site filter
-would change), `post_locked` (another user is editing the post),
+`site_policy_conflict` (`data.changed` names the columns that a site policy
+or site code would change), `post_locked` (another user is editing the post),
 `unsupported_status` (`data.current_status` names the status), `invalid`,
 `not_found`, `unsupported_storage` and `db_error`. After a refusal, nothing
 is written, and a refusal never contains post content.

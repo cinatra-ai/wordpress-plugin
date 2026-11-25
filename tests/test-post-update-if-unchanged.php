@@ -47,6 +47,7 @@ class Cinatra_Test_Wpdb {
     public $charset = 'utf8mb4';
     public $fail = [];          // statement => true to make it return false
     public $update_result = null; // forced return of update() (e.g. false, 2)
+    public $store_as = []; // column => value the database keeps instead of the sent one
     public $updates = [];       // captured update() calls
     private $snapshot = null;
 
@@ -98,7 +99,8 @@ class Cinatra_Test_Wpdb {
                 if ((string) $this->rows[$id][$col] !== (string) $value) {
                     $changed = 1;
                 }
-                $this->rows[$id][$col] = (string) $value;
+                // store_as: the database keeps a different value than sent ( e.g. truncation ).
+                $this->rows[$id][$col] = (string) ($this->store_as[$col] ?? $value);
             }
         }
         // MySQL reports CHANGED rows: an identical write affects 0 rows.
@@ -308,6 +310,13 @@ cinatra_test_record_hooks([
     'publish_page', 'draft_page', 'publish_post', 'draft_post', 'edit_post_page', 'edit_post_post', 'edit_post',
     'post_updated', 'save_post_page', 'save_post_post', 'save_post', 'wp_insert_post', 'wp_after_insert_post',
 ]);
+// Per-test pre_post_update callbacks ( reset with the fixture ): a site callback
+// that writes to the database inside the transaction.
+add_action('pre_post_update', function (...$args) {
+    foreach ($GLOBALS['cinatra_test']['pre_post_update_cbs'] ?? [] as $cb) {
+        $cb(...$args);
+    }
+}, 10, 2);
 
 /** A posts row with every column of core's wp_posts schema, in table order. */
 function t_row(int $id, string $type, array $over = []): array {
@@ -451,6 +460,23 @@ function base_update(array $extra = []): array {
         'expected'            => full_expected([], (int) ($extra['post_id'] ?? T_ID)),
         'content'             => '<p>New body</p>',
     ], $extra);
+}
+
+/**
+ * A refusal at or after the write: well-formed, everything rolled back, the
+ * cache cleaned, pre_post_update fired ( it cannot be un-fired ) and no
+ * after-save hook.
+ */
+function is_late_refusal($r, string $code, array $before): bool {
+    global $wpdb;
+    return is_array($r)
+        && false === ($r['success'] ?? null)
+        && $code === ($r['code'] ?? null)
+        && is_array($r['data'] ?? null)
+        && $before === $wpdb->rows
+        && ['pre_post_update'] === hooks_fired()
+        && !in_array('COMMIT', statement_kinds(), true)
+        && ['ROLLBACK', 'CLEAN-CACHE'] === array_slice(statement_kinds(), -2);
 }
 
 /** A refusal is well-formed, carries no post content, and fired no hook. */
@@ -646,7 +672,7 @@ $r = cinatra_ability_post_update_if_unchanged([
 check('a restricted user\'s title edit succeeds', true === ($r['success'] ?? null));
 check('the untouched body (admin markup) is kept byte for byte', $admin_markup === $wpdb->rows[T_ID]['post_content']);
 check('the written title went through kses', 'New title' === $wpdb->rows[T_ID]['post_title'] && ['post_title'] === $r['sanitized_fields']);
-check('only post_title was run through the save chain', ['post_title'] === $GLOBALS['cinatra_test']['sanitized']);
+check('only post_title ( and the status, which this save stores ) ran through a save chain; content and excerpt did not', ['post_title', 'post_status'] === $GLOBALS['cinatra_test']['sanitized']);
 check('the content chain did not run for an unwritten body', empty($GLOBALS['cinatra_test']['content_chain_ran']));
 reset_fixture();
 $GLOBALS['cinatra_test']['save_filters']['content_save_pre'][] = function ($v) { return str_replace('darn', 'd**n', $v); };
@@ -715,12 +741,87 @@ $GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('a policy returning a non-array -> site_policy_conflict', is_refusal($r, 'site_policy_conflict'));
 
+// ---------------------------------------------------------------------------
+echo "Site policy: the status save-filter chain\n";
+reset_fixture();
+$seen = [];
+$GLOBALS['cinatra_test']['save_filters']['pre_post_status'][] = function ($v) use (&$seen) { $seen[] = ['pre_post_status', $v]; return $v; };
+$GLOBALS['cinatra_test']['save_filters']['status_save_pre'][] = function ($v) use (&$seen) { $seen[] = ['status_save_pre', $v]; return $v; };
+$r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft']));
+check('status draft runs pre_post_status then status_save_pre with "draft"', true === ($r['success'] ?? null) && [['pre_post_status', 'draft'], ['status_save_pre', 'draft']] === $seen && in_array('post_status', $GLOBALS['cinatra_test']['sanitized'], true));
+foreach (['pre_post_status', 'status_save_pre'] as $hook) {
+    reset_fixture();
+    $GLOBALS['cinatra_test']['save_filters'][$hook][] = function ($v) { return 'pending'; }; // a workflow policy: no direct unpublish
+    $before = $wpdb->rows;
+    $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft']));
+    check("a $hook policy that does not allow draft -> site_policy_conflict naming post_status, nothing written, no hook", is_refusal($r, 'site_policy_conflict') && ['post_status'] === $r['data']['changed'] && $before === $wpdb->rows && [] === $wpdb->updates);
+}
+reset_fixture();
+$seen = [];
+$GLOBALS['cinatra_test']['save_filters']['status_save_pre'][] = function ($v) use (&$seen) { $seen[] = $v; return 'draft' === $v ? 'pending' : $v; };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a content-only edit runs the chain on the kept status ( publish ); a policy that blocks only draft lets it pass', true === ($r['success'] ?? null) && ['publish'] === $seen && 'publish' === $wpdb->rows[T_ID]['post_status']);
+reset_fixture();
+$GLOBALS['cinatra_test']['save_filters']['status_save_pre'][] = function ($v) { return 'pending'; };
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a content-only edit whose status policy would change the kept status -> site_policy_conflict, nothing written', is_refusal($r, 'site_policy_conflict') && ['post_status'] === $r['data']['changed'] && $before === $wpdb->rows);
+
+// ---------------------------------------------------------------------------
+echo "Post-write check: callbacks cannot widen the write\n";
+$widen = [
+    'pre_post_update publishes the draft'  => ['post_status', function () { global $wpdb; $wpdb->rows[T_ID]['post_status'] = 'publish'; }],
+    'pre_post_update changes the slug'     => ['post_name', function () { global $wpdb; $wpdb->rows[T_ID]['post_name'] = 'hijacked'; }],
+    'pre_post_update rewrites the content' => ['post_content', function () { global $wpdb; $wpdb->rows[T_ID]['post_content'] = 'other'; }],
+];
+foreach ($widen as $label => [$col, $cb]) {
+    reset_fixture();
+    $wpdb->rows[T_ID]['post_status'] = 'draft';
+    t_state_is_read();
+    $GLOBALS['cinatra_test']['pre_post_update_cbs'][] = $cb;
+    $before = $wpdb->rows;
+    $r = cinatra_ability_post_update_if_unchanged(base_update());
+    // A callback's change to a column this save writes is overwritten by the write itself.
+    if ('post_content' === $col) {
+        check("$label -> overwritten by this save's own value (the stored content is what this save wrote)", true === ($r['success'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+        continue;
+    }
+    check("$label -> site_policy_conflict naming $col, rolled back, no after-save hook", is_late_refusal($r, 'site_policy_conflict', $before) && [$col] === ($r['data']['changed'] ?? null));
+    check("$label -> the publish webhook is not sent", [] === $GLOBALS['cinatra_test']['remote_post_calls']);
+}
+reset_fixture();
+$wpdb->rows[T_ID]['post_status'] = 'draft';
+t_state_is_read();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->rows[T_ID]['post_excerpt'] = 'changed by a callback'; };
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a callback changing an unwritten text column -> site_policy_conflict naming post_excerpt', is_late_refusal($r, 'site_policy_conflict', $before) && ['post_excerpt'] === ($r['data']['changed'] ?? null));
+reset_fixture();
+$GLOBALS['cinatra_test']['save_filters']['content_save_pre'][] = function ($v) { global $wpdb; $wpdb->rows[T_ID]['post_name'] = 'by-a-save-filter'; return $v; };
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a *_save_pre filter writing the slug to the database -> site_policy_conflict, rolled back', false === ($r['success'] ?? null) && 'site_policy_conflict' === ($r['code'] ?? null) && ['post_name'] === $r['data']['changed'] && $before === $wpdb->rows && !in_array('COMMIT', statement_kinds(), true));
+reset_fixture();
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { global $wpdb; $wpdb->rows[T_ID]['post_author'] = '1'; return $d; };
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a wp_insert_post_data filter writing the author to the database -> site_policy_conflict, rolled back', false === ($r['success'] ?? null) && 'site_policy_conflict' === ($r['code'] ?? null) && ['post_author'] === $r['data']['changed'] && $before === $wpdb->rows && !in_array('COMMIT', statement_kinds(), true));
+reset_fixture();
+$wpdb->store_as = ['post_content' => '<p>New bo'];
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a written column stored differently than written ( e.g. truncated ) -> site_policy_conflict naming it, rolled back', is_late_refusal($r, 'site_policy_conflict', $before) && ['post_content'] === ($r['data']['changed'] ?? null));
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->rows[T_ID]['post_content'] = '<p>New body</p>'; };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a callback writing the same values as this save is no conflict', true === ($r['success'] ?? null));
+
 echo "Affected rows\n";
 reset_fixture();
 $wpdb->update_result = false;
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('update returning false -> db_error, rolled back, no hook except pre_post_update', false === $r['success'] && 'db_error' === $r['code'] && $before === $wpdb->rows && ['pre_post_update'] === hooks_fired() && ['ROLLBACK', 'CLEAN-CACHE'] === array_slice(statement_kinds(), -2));
+check('update returning false -> db_error at the write: rolled back, pre_post_update had fired, no after-save hook', is_late_refusal($r, 'db_error', $before));
 reset_fixture();
 $wpdb->update_result = 2;
 $r = cinatra_ability_post_update_if_unchanged(base_update());

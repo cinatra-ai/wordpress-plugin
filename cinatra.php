@@ -4273,7 +4273,7 @@ add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );
 // the save filters over every field, rewrite terms and fire hooks inside the
 // transaction. The hooks WordPress fires after an update run only after the
 // COMMIT. An edit saved in between makes the write refuse, nothing is
-// written, and no hook fires.
+// written, and no after-save hook fires.
 //
 // Both register on the Abilities API hooks only; the plugin loads unchanged
 // when the Abilities API is absent, and nothing runs until a caller invokes an
@@ -4682,6 +4682,31 @@ function cinatra_content_policy_conflicts( array $given, $filtered, array $free 
 }
 
 /**
+ * The columns of the row read back after the update that are not what this
+ * save stores: a written column must hold the written value, every other
+ * column the locked row's value; no column may appear or disappear.
+ *
+ * @param array<string,mixed>  $locked The row as locked, before any hook ran.
+ * @param array<string,string> $data   The columns this save wrote.
+ * @param array<string,mixed>  $stored The row read back in the transaction.
+ * @return string[] The differing columns; empty when none.
+ */
+function cinatra_content_widened_columns( array $locked, array $data, array $stored ): array {
+	$widened = array();
+	foreach ( array_unique( array_merge( array_keys( $locked ), array_keys( $stored ) ) ) as $column ) {
+		if ( ! array_key_exists( $column, $locked ) || ! array_key_exists( $column, $stored ) ) {
+			$widened[] = (string) $column;
+			continue;
+		}
+		$want = array_key_exists( $column, $data ) ? $data[ $column ] : $locked[ $column ];
+		if ( ( null === $want ) !== ( null === $stored[ $column ] ) || (string) $want !== (string) $stored[ $column ] ) {
+			$widened[] = (string) $column;
+		}
+	}
+	return $widened;
+}
+
+/**
  * Roll back the open transaction and, when a write may have run, drop the
  * post's object cache so no request serves the rolled-back value.
  *
@@ -4704,14 +4729,17 @@ function cinatra_content_rollback( int $touched_id = 0 ): void {
  * draft, refuse when another user holds the edit lock, compare
  * post_modified_gmt, title, content, excerpt and status byte for byte and the
  * row token over every column, run the per-field save filters over the
- * written fields, build core's full update data and run wp_insert_post_data
- * over it ( refusing a result that changes anything this save does not
- * write ), fire pre_post_update with the full filtered data, and write only
- * the written columns, post_status "draft" when asked and the two
- * modification times. COMMIT; then clean the cache and fire the hooks
- * core's wp_insert_post() fires on an update, in core's order with core's
- * arguments ( post_updated also makes core store the revision ). Any refusal
- * or error rolls back, writes nothing and fires no update hook.
+ * written fields and the status chain over the stored status, build core's
+ * full update data and run wp_insert_post_data over it ( refusing a result
+ * that changes anything this save does not write ), fire pre_post_update
+ * with the full filtered data, write only the written columns, post_status
+ * "draft" when asked and the two modification times, and read the row back
+ * to verify that it is exactly the locked row with those columns. COMMIT;
+ * then clean the cache and fire the hooks core's wp_insert_post() fires on
+ * an update, in core's order with core's arguments ( post_updated also makes
+ * core store the revision ). Any refusal or error rolls back, writes nothing
+ * and fires no after-save hook; pre_post_update may have fired when the
+ * refusal comes at or after the write.
  *
  * @param mixed $input Ability input.
  * @return array<string,mixed> The stored values after the save, or a refusal result.
@@ -4818,8 +4846,24 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		cinatra_content_rollback();
 		return cinatra_content_refusal( 'invalid', __( 'Title, content and excerpt cannot all be empty.', 'cinatra' ), $current_modified );
 	}
+	// The status runs through core's status chain too ( pre_post_status and
+	// status_save_pre, slashed, as sanitize_post() runs it for an update ):
+	// "draft" when asked, otherwise the current status, which this save keeps.
+	// A workflow policy that turns it into anything else cannot be applied by
+	// this save: refuse.
+	$store_status = null !== $parsed['status'] ? 'draft' : (string) $row['post_status'];
+	$status_after = wp_unslash( sanitize_post_field( 'post_status', wp_slash( $store_status ), $id, 'db' ) );
+	if ( $status_after !== $store_status ) {
+		cinatra_content_rollback();
+		return cinatra_content_refusal(
+			'site_policy_conflict',
+			__( 'A site save policy for the post status does not allow this save. Nothing was written.', 'cinatra' ),
+			$current_modified,
+			array( 'changed' => array( 'post_status' ) )
+		);
+	}
 	if ( null !== $parsed['status'] ) {
-		$written['post_status'] = 'draft'; // The literal value asked for.
+		$written['post_status'] = 'draft';
 	}
 	$written['post_modified']     = current_time( 'mysql' );
 	$written['post_modified_gmt'] = current_time( 'mysql', 1 );
@@ -4876,6 +4920,22 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 	if ( null === $stored ) {
 		cinatra_content_rollback( $id );
 		return cinatra_content_refusal( 'db_error', __( 'The post could not be read back after the update. Nothing was written.', 'cinatra' ), $current_modified );
+	}
+
+	// The row as it will be committed ( read in this transaction, still locked
+	// by it ) must be exactly the locked row with this save's columns: a
+	// callback ( pre_post_update, a save filter ) that wrote the posts row
+	// directly cannot widen the write, for example publish it or change its
+	// slug. Any difference rolls the whole transaction back.
+	$widened = cinatra_content_widened_columns( $row, $data, $stored );
+	if ( array() !== $widened ) {
+		cinatra_content_rollback( $id );
+		return cinatra_content_refusal(
+			'site_policy_conflict',
+			__( 'The post row after the write is not exactly what this save wrote ( site code changed it during the save ). Nothing was written.', 'cinatra' ),
+			$current_modified,
+			array( 'changed' => $widened )
+		);
 	}
 
 	if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.

@@ -9,7 +9,7 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-11-25T06:15:52+00:00\n"
+"POT-Creation-Date: 2026-11-25T06:47:56+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: cinatra\n"
@@ -18,7 +18,7 @@ msgstr ""
 #. Author of the plugin
 #: cinatra.php
 #: cinatra.php:437
-#: cinatra.php:4986
+#: cinatra.php:5046
 msgid "Cinatra"
 msgstr ""
 
@@ -474,94 +474,102 @@ msgstr ""
 msgid "Nothing to write: give at least one of title, content, excerpt or status."
 msgstr ""
 
-#: cinatra.php:4735
+#: cinatra.php:4763
 msgid "The database transaction could not be started. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4746
+#: cinatra.php:4774
 msgid "The posts table does not use the InnoDB storage engine, so the post cannot be locked during the check. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4760
+#: cinatra.php:4788
 msgid "This ability writes only published posts and drafts. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4773
+#: cinatra.php:4801
 msgid "Another user is editing this post right now. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4797
+#: cinatra.php:4825
 msgid "The post changed since it was read. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4819
+#: cinatra.php:4847
 msgid "Title, content and excerpt cannot all be empty."
 msgstr ""
 
-#: cinatra.php:4851
+#: cinatra.php:4860
+msgid "A site save policy for the post status does not allow this save. Nothing was written."
+msgstr ""
+
+#: cinatra.php:4895
 msgid "A site save policy ( wp_insert_post_data ) would change parts of the post this ability does not write. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4872
+#: cinatra.php:4916
 msgid "The database update failed. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4878
+#: cinatra.php:4922
 msgid "The post could not be read back after the update. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4883
+#: cinatra.php:4935
+msgid "The post row after the write is not exactly what this save wrote ( site code changed it during the save ). Nothing was written."
+msgstr ""
+
+#: cinatra.php:4943
 msgid "The database transaction could not be committed. Nothing was written."
 msgstr ""
 
-#: cinatra.php:4923
+#: cinatra.php:4983
 msgid "Refusal code, present only when success is false."
 msgstr ""
 
-#: cinatra.php:4950
+#: cinatra.php:5010
 msgid "SHA-256 fingerprint of every column of the posts row as read ( meta and terms are outside it ). Send it back as expected.row_token."
 msgstr ""
 
-#: cinatra.php:4957
+#: cinatra.php:5017
 msgid "Written fields whose stored value differs from the sent value because the save filters changed it."
 msgstr ""
 
-#: cinatra.php:4987
+#: cinatra.php:5047
 msgid "Cinatra abilities for reading a post and writing a reviewed change to it."
 msgstr ""
 
-#: cinatra.php:5008
+#: cinatra.php:5068
 msgid "The numeric ID of the post or page."
 msgstr ""
 
-#: cinatra.php:5015
+#: cinatra.php:5075
 msgid "Read a post for review"
 msgstr ""
 
-#: cinatra.php:5016
+#: cinatra.php:5076
 msgid "Read the raw stored title, content, excerpt, status, type, permalink and post_modified_gmt of a post or page, fresh from the database. Pass post_modified_gmt to cinatra/post-update-if-unchanged as if_unmodified_since."
 msgstr ""
 
-#: cinatra.php:5044
+#: cinatra.php:5104
 msgid "Write a reviewed change to a post"
 msgstr ""
 
-#: cinatra.php:5045
+#: cinatra.php:5105
 msgid "Write title, content and/or excerpt of a published post or draft (and optionally move it to draft) only if the post is unchanged since the read the review was based on. Writes only those columns. Refuses with a code (for example post_changed, post_locked, unsupported_status or invalid) and then writes nothing."
 msgstr ""
 
-#: cinatra.php:5054
+#: cinatra.php:5114
 msgid "The post_modified_gmt value of the read the change is based on."
 msgstr ""
 
-#: cinatra.php:5066
+#: cinatra.php:5126
 msgid "The row_token returned by cinatra/post-read for the read the change is based on."
 msgstr ""
 
-#: cinatra.php:5071
+#: cinatra.php:5131
 msgid "The title, content, excerpt and status as read, byte for byte, and the row_token of that read; always all five."
 msgstr ""
 
-#: cinatra.php:5079
+#: cinatra.php:5139
 msgid "Only \"draft\": move the post to draft in the same save. Omit to keep the current status."
 msgstr ""
