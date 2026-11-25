@@ -321,6 +321,28 @@ function cinatra_it_refused( array $result, string $code, ?string $cause = null 
 }
 
 /**
+ * A second database connection with WordPress's own credentials ( another
+ * request's connection ), for a write between two of this connection's
+ * statements.
+ *
+ * @return mysqli The connection.
+ */
+function cinatra_it_second_connection(): mysqli {
+	global $wpdb;
+	$host = $wpdb->parse_db_host( DB_HOST );
+	if ( ! is_array( $host ) ) {
+		cinatra_it_fail( 'DB_HOST could not be parsed (setup)' );
+	}
+	list( $name, $port, $socket ) = $host;
+	$link = mysqli_init();
+	if ( ! $link || ! mysqli_real_connect( $link, (string) $name, DB_USER, DB_PASSWORD, DB_NAME, null === $port ? null : (int) $port, $socket ) ) {
+		cinatra_it_fail( 'the second connection could not be opened (setup)' );
+	}
+	mysqli_set_charset( $link, (string) $wpdb->charset );
+	return $link;
+}
+
+/**
  * Run one case and print its line.
  *
  * @param string   $name The case name.
@@ -689,6 +711,63 @@ try {
 			cinatra_it_assert( cinatra_it_refused( $result, 'site_policy_conflict' ) && in_array( 'post_name', (array) ( $result['data']['changed'] ?? array() ), true ), 'the slug write was not refused by the post-write check', $result );
 			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'the slug or the content survived the rollback', cinatra_it_row( $id ) );
 			return 'changed=' . wp_json_encode( $result['data']['changed'] );
+		}
+	);
+
+	cinatra_it_case(
+		'pre_post_update callback COMMITs, a second connection saves the content -> transaction_conflict ( transaction_lost ), the other save intact',
+		function () {
+			global $wpdb;
+			$id     = cinatra_it_post( 'publish', 'body' );
+			$read   = cinatra_it_read( $id );
+			$other  = cinatra_it_second_connection();
+			$commit = function ( $post_id ) use ( $id, $other ) {
+				global $wpdb;
+				if ( (int) $post_id === $id ) {
+					// Ends this save's transaction: the row is no longer locked,
+					// so the other connection's autocommit UPDATE does not wait.
+					$wpdb->query( 'COMMIT' );
+					$wpdb->query( 'START TRANSACTION' );
+					mysqli_query( $other, "UPDATE {$wpdb->posts} SET post_content = 'cinatra-it saved by another connection' WHERE ID = " . (int) $id );
+				}
+			};
+			add_action( 'pre_post_update', $commit );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not overwrite' ) ) );
+			} finally {
+				remove_action( 'pre_post_update', $commit );
+				mysqli_close( $other );
+			}
+			cinatra_it_assert( cinatra_it_refused( $result, 'transaction_conflict', 'transaction_lost' ), 'the write was not refused as transaction_lost', $result );
+			cinatra_it_assert( 'cinatra-it saved by another connection' === cinatra_it_row( $id )['post_content'], 'the other connection\'s save was overwritten', cinatra_it_row( $id )['post_content'] );
+			return 'cause=transaction_lost, other save intact';
+		}
+	);
+
+	cinatra_it_case(
+		'the conditional write is byte-exact: a case and trailing-space change under the column\'s collation matches no row',
+		function () {
+			global $wpdb;
+			$id     = cinatra_it_post( 'publish', 'body' );
+			$read   = cinatra_it_read( $id );
+			$before = cinatra_it_row( $id );
+			$alike  = function ( $post_id ) use ( $id ) {
+				global $wpdb;
+				if ( (int) $post_id === $id ) {
+					// Equal to 'body' under a case-insensitive PAD SPACE collation, not byte-equal.
+					$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->posts} SET post_content = %s WHERE ID = %d", 'BODY ', $id ) );
+				}
+			};
+			add_action( 'pre_post_update', $alike );
+			try {
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'title' => 'cinatra-it new title' ) ) );
+			} finally {
+				remove_action( 'pre_post_update', $alike );
+			}
+			$collation = $wpdb->get_var( $wpdb->prepare( 'SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s', $wpdb->posts, 'post_content' ) );
+			cinatra_it_assert( cinatra_it_refused( $result, 'site_policy_conflict' ) && array( 'post_content' ) === ( $result['data']['changed'] ?? null ) && false !== strpos( (string) $result['message'], 'matched no row' ), 'the conditional write was not refused by its row condition', $result );
+			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
+			return 'collation=' . $collation;
 		}
 	);
 

@@ -22,8 +22,9 @@
  *
  * Covers: statement and hook order with core's hook arguments; the exact
  * columns written; capability re-checked against the fresh row; a filter can
- * never make the stored status anything but the requested draft; no hook on a
- * refusal; a floating-date draft keeps its dates; no term function; the save
+ * never make the stored status anything but the requested draft; no
+ * after-save hook on a refusal ( the clean_post_cache action of the rollback's
+ * cache clean may fire ); a floating-date draft keeps its dates; no term function; the save
  * filters run over written fields only (untouched markup survives a restricted
  * user's title edit); slashing; affected rows; the expected/written contract;
  * the status rules; the engine read; the read ability; the registration.
@@ -52,6 +53,9 @@ class Cinatra_Test_Wpdb {
     private $snapshot = null;
 
     public function prepare($query, ...$args) {
+        if (1 === count($args) && is_array($args[0])) {
+            $args = $args[0]; // wpdb::prepare( $query, array( ... ) )
+        }
         $i = 0;
         return preg_replace_callback('/%[ds]/', function ($m) use (&$i, $args) {
             $v = $args[$i++] ?? '';
@@ -75,8 +79,12 @@ class Cinatra_Test_Wpdb {
         $this->log[] = $sql;
         if (preg_match('/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) (\S+)$/', $sql, $m)) {
             [, $kind, $name] = $m;
-            $GLOBALS['cinatra_test']['probe_names'][] = $name;
-            $GLOBALS['cinatra_test']['probe_suppressed'][$kind] = $this->suppressed;
+            if (0 === strpos($name, 'cinatra_probe_')) {
+                $GLOBALS['cinatra_test']['probe_names'][] = $name;
+                $GLOBALS['cinatra_test']['probe_suppressed'][$kind] = $this->suppressed;
+            } else {
+                $GLOBALS['cinatra_test']['lock_savepoint'][] = [$kind, $name, $this->suppressed];
+            }
             if (isset($this->probe_errno[$kind])) {
                 if (is_object($this->dbh)) { $this->dbh->errno = $this->probe_errno[$kind]; }
                 return false;
@@ -94,6 +102,11 @@ class Cinatra_Test_Wpdb {
             if ('RELEASE SAVEPOINT' === $kind) { unset($this->savepoints[$name]); }
             if (is_object($this->dbh)) { $this->dbh->errno = 0; }
             return 0;
+        }
+        // The conditional write: UPDATE `wp_posts` SET `col` = '...', ...
+        // WHERE `ID` = n AND <one condition per column of the locked row>.
+        if (0 === strpos($sql, 'UPDATE `')) {
+            return $this->conditional_update($sql);
         }
         // on_commit: the test decides what COMMIT does ( see apply_commit(),
         // server_rollback(), lose_connection() ) and what it returns.
@@ -117,6 +130,66 @@ class Cinatra_Test_Wpdb {
             $this->savepoints = [];
         }
         return 0;
+    }
+    public $before_update = null;  // callable( $wpdb ): runs when the UPDATE reaches the server
+    public $update_sql = [];       // each UPDATE statement as sent
+    public $conditions = [];       // the parsed row condition of each UPDATE: column => sha256 hex | null
+    /**
+     * Parse and run the plugin's conditional UPDATE: the SET list ( values
+     * quoted by prepare() above ), WHERE `ID` = n, then per column either
+     * `col` IS NULL or SHA2(CONVERT(`col` USING cs), 256) = 'hex'. The row
+     * changes only when every condition holds on the current row.
+     */
+    private function conditional_update($sql) {
+        $this->log[count($this->log) - 1] = 'UPDATE-ROW'; // query() logged the statement
+        $this->update_sql[] = $sql;
+        if (null !== $this->before_update) {
+            ($this->before_update)($this);
+        }
+        if (!preg_match('/^UPDATE `([^`]+)` SET /', $sql, $m)) {
+            return false;
+        }
+        $table = $m[1];
+        $pos = strlen($m[0]);
+        $data = [];
+        while (preg_match('/\G`(\w+)` = \'((?:[^\'\\\\]|\\\\.)*)\'(, )?/s', $sql, $mm, 0, $pos)) {
+            $data[$mm[1]] = stripslashes($mm[2]);
+            $pos += strlen($mm[0]);
+            if (!isset($mm[3])) { break; }
+        }
+        if (!preg_match('/\G WHERE `ID` = (\d+) AND (.*)$/s', $sql, $w, 0, $pos)) {
+            return false;
+        }
+        $id = (int) $w[1];
+        $cond = [];
+        foreach (explode(' AND ', $w[2]) as $part) {
+            if (preg_match('/^`(\w+)` IS NULL$/', $part, $c)) {
+                $cond[$c[1]] = null;
+            } elseif (preg_match('/^SHA2\((?:CONVERT\(`(\w+)` USING \w+\)|`(\w+)`), 256\) = \'([0-9a-f]{64})\'$/', $part, $c)) {
+                $cond['' !== $c[1] ? $c[1] : $c[2]] = $c[3];
+            } else {
+                return false;
+            }
+        }
+        $this->conditions[] = $cond;
+        $this->updates[] = ['table' => $table, 'data' => $data, 'where' => ['ID' => $id]];
+        $match = isset($this->rows[$id]) && array_keys($cond) === array_keys($this->rows[$id]);
+        foreach ($cond as $col => $hex) {
+            $have = $this->rows[$id][$col] ?? null;
+            if (null === $hex ? null !== $have : (null === $have || hash('sha256', (string) $have) !== $hex)) {
+                $match = false;
+            }
+        }
+        $changed = 0;
+        if ($match) {
+            foreach ($data as $col => $value) {
+                if ((string) $this->rows[$id][$col] !== (string) $value) {
+                    $changed = 1;
+                }
+                $this->rows[$id][$col] = (string) ($this->store_as[$col] ?? $value);
+            }
+        }
+        return null !== $this->update_result ? $this->update_result : $changed;
     }
     public $on_commit = null;      // callable( $wpdb ): what COMMIT does and returns
     public $select_fails = false;  // get_row() answers null ( a failed read )
@@ -515,6 +588,8 @@ add_action('pre_post_update', function (...$args) {
     }
 }, 10, 2);
 
+add_action('clean_post_cache', function () { $GLOBALS['cinatra_test']['clean_post_cache_fired'] = ($GLOBALS['cinatra_test']['clean_post_cache_fired'] ?? 0) + 1; });
+
 /** A posts row with every column of core's wp_posts schema, in table order. */
 function t_row(int $id, string $type, array $over = []): array {
     return array_merge([
@@ -624,7 +699,7 @@ function precheck_kinds(): array {
         elseif (0 === strpos($sql, 'SHOW SESSION VARIABLES')) { $kinds[] = 'IN-TRANSACTION?'; }
         elseif (false !== strpos($sql, 'INNODB_TRX')) { $kinds[] = 'INNODB-TRX?'; }
         elseif (preg_match('/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) /', $sql, $m)) { $kinds[] = $m[1]; }
-        elseif ('START TRANSACTION' === $sql) { $kinds[] = 'START TRANSACTION'; }
+        elseif ('START TRANSACTION' === $sql) { $kinds[] = 'START TRANSACTION'; break; } // the checks before the transaction
     }
     return $kinds;
 }
@@ -694,7 +769,16 @@ function is_late_refusal($r, string $code, array $before): bool {
         && ['ROLLBACK', 'CLEAN-CACHE'] === array_slice(statement_kinds(), -2);
 }
 
-/** A refusal is well-formed, carries no post content, and fired no hook. */
+/** The hooks core's wp_insert_post() fires after an update ( a refusal fires none ). */
+const T_AFTER_SAVE_HOOKS = [
+    'transition_post_status', 'publish_to_publish', 'publish_to_draft', 'draft_to_draft', 'publish_page', 'draft_page', 'publish_post', 'draft_post',
+    'edit_post_page', 'edit_post_post', 'edit_post', 'post_updated', 'save_post_page', 'save_post_post', 'save_post', 'wp_insert_post', 'wp_after_insert_post',
+];
+/**
+ * A refusal before the write: well-formed, no post content, no after-save
+ * hook and no pre_post_update. The rollback's cache clean may fire core's
+ * clean_post_cache action; that is not a save hook.
+ */
 function is_refusal($r, string $code): bool {
     return is_array($r)
         && false === ($r['success'] ?? null)
@@ -703,7 +787,8 @@ function is_refusal($r, string $code): bool {
         && is_array($r['data'] ?? null)
         && array_key_exists('current_modified_gmt', $r['data'])
         && false === strpos(json_encode($r), 'SECRET-BODY-MARKER')
-        && [] === $GLOBALS['cinatra_test']['fired']
+        && [] === array_intersect(hooks_fired(), T_AFTER_SAVE_HOOKS)
+        && !in_array('pre_post_update', hooks_fired(), true)
         && [] === $GLOBALS['cinatra_test']['update_calls'];
 }
 
@@ -867,7 +952,7 @@ t_state_is_read();
 $before = $wpdb->rows;
 $GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { $d['post_status'] = 'publish'; return $d; };
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a site filter that would publish a draft -> site_policy_conflict naming post_status, nothing written, no hook', is_refusal($r, 'site_policy_conflict') && ['post_status'] === $r['data']['changed'] && $before === $wpdb->rows);
+check('a site filter that would publish a draft -> site_policy_conflict naming post_status, nothing written, no after-save hook', is_refusal($r, 'site_policy_conflict') && ['post_status'] === $r['data']['changed'] && $before === $wpdb->rows);
 
 // ---------------------------------------------------------------------------
 echo "Capability: re-checked against the FRESH row under the lock\n";
@@ -908,12 +993,12 @@ check('permission callback: a logged-out caller is refused', false === cinatra_c
 $GLOBALS['cinatra_test']['current_user_id'] = 3;
 
 // ---------------------------------------------------------------------------
-echo "Refusals: nothing written, no hook\n";
+echo "Refusals: nothing written, no after-save hook\n";
 reset_fixture();
 $wpdb->rows[T_ID]['post_modified_gmt'] = '2026-11-25 10:03:00';
 $GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('post_changed (modified), current value given, no hook', is_refusal($r, 'post_changed') && '2026-11-25 10:03:00' === $r['data']['current_modified_gmt'] && ['post_modified_gmt', 'row_token'] === $r['data']['changed']);
+check('post_changed (modified), current value given, no after-save hook', is_refusal($r, 'post_changed') && '2026-11-25 10:03:00' === $r['data']['current_modified_gmt'] && ['post_modified_gmt', 'row_token'] === $r['data']['changed']);
 check('post_changed rolls back without an update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK', 'CLEAN-CACHE'] === statement_kinds());
 foreach (['post_title' => 'title', 'post_content' => 'content', 'post_excerpt' => 'excerpt'] as $col => $name) {
     reset_fixture();
@@ -930,7 +1015,8 @@ $r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_ex
 check('a one-byte difference refuses', is_refusal($r, 'post_changed'));
 reset_fixture(['post_lock' => [T_ID => 9]]);
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('post_locked, no hook', is_refusal($r, 'post_locked') && T_MODIFIED === $r['data']['current_modified_gmt']);
+check('post_locked, no after-save hook', is_refusal($r, 'post_locked') && T_MODIFIED === $r['data']['current_modified_gmt']);
+check('that refusal\'s rollback cleaned the cache through core, so the clean_post_cache action fired; it is not a save hook', ($GLOBALS['cinatra_test']['clean_post_cache_fired'] ?? 0) > 0);
 foreach (['pending', 'future', 'private', 'trash', 'auto-draft'] as $state) {
     reset_fixture();
     $wpdb->rows[T_ID]['post_status'] = $state;
@@ -954,7 +1040,7 @@ $seen = null;
 $GLOBALS['cinatra_test']['save_filters']['wp_insert_post_empty_content'][] = function ($maybe_empty, $postarr) use (&$seen) { $seen = [$maybe_empty, $postarr]; return true; };
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a site filter vetoing a non-empty save is honoured -> empty_content, nothing written, no hook', is_refusal($r, 'empty_content') && $before === $wpdb->rows);
+check('a site filter vetoing a non-empty save is honoured -> empty_content, nothing written, no after-save hook', is_refusal($r, 'empty_content') && $before === $wpdb->rows);
 check('the veto filter got core\'s arguments: false and the sanitized postarr', is_array($seen) && false === $seen[0] && T_ID === ($seen[1]['ID'] ?? null) && 'db' === ($seen[1]['filter'] ?? null) && '<p>New body</p>' === ($seen[1]['post_content'] ?? null));
 
 // ---------------------------------------------------------------------------
@@ -1046,7 +1132,7 @@ foreach ($conflicts as $col => $cb) {
     $before = $wpdb->rows;
     // post_status: this save unpublishes ( stores draft ); the policy would keep it published.
     $r = cinatra_ability_post_update_if_unchanged(base_update('post_status' === $col ? ['status' => 'draft'] : []));
-    check("a policy changing $col (not written) -> site_policy_conflict, nothing written, no hook", is_refusal($r, 'site_policy_conflict') && [$col] === $r['data']['changed'] && $before === $wpdb->rows && [] === $wpdb->updates);
+    check("a policy changing $col (not written) -> site_policy_conflict, nothing written, no after-save hook", is_refusal($r, 'site_policy_conflict') && [$col] === $r['data']['changed'] && $before === $wpdb->rows && [] === $wpdb->updates);
 }
 reset_fixture();
 $GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d) { return 'not an array'; };
@@ -1066,7 +1152,7 @@ foreach (['pre_post_status', 'status_save_pre'] as $hook) {
     $GLOBALS['cinatra_test']['save_filters'][$hook][] = function ($v) { return 'pending'; }; // a workflow policy: no direct unpublish
     $before = $wpdb->rows;
     $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft']));
-    check("a $hook policy that does not allow draft -> site_policy_conflict naming post_status, nothing written, no hook", is_refusal($r, 'site_policy_conflict') && ['post_status'] === $r['data']['changed'] && $before === $wpdb->rows && [] === $wpdb->updates);
+    check("a $hook policy that does not allow draft -> site_policy_conflict naming post_status, nothing written, no after-save hook", is_refusal($r, 'site_policy_conflict') && ['post_status'] === $r['data']['changed'] && $before === $wpdb->rows && [] === $wpdb->updates);
 }
 reset_fixture();
 $seen = [];
@@ -1095,7 +1181,8 @@ foreach ($widen as $label => [$col, $cb]) {
     $r = cinatra_ability_post_update_if_unchanged(base_update());
     // A callback's change to a column this save writes is overwritten by the write itself.
     if ('post_content' === $col) {
-        check("$label -> overwritten by this save's own value (the stored content is what this save wrote)", true === ($r['success'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+        // The write is conditional on the locked row: a column changed during the save is never overwritten.
+        check("$label -> the conditional write matches no row: site_policy_conflict naming post_content, rolled back, no after-save hook", is_late_refusal($r, 'site_policy_conflict', $before) && ['post_content'] === ($r['data']['changed'] ?? null) && false !== strpos($r['message'], 'matched no row'));
         continue;
     }
     check("$label -> site_policy_conflict naming $col, rolled back, no after-save hook", is_late_refusal($r, 'site_policy_conflict', $before) && [$col] === ($r['data']['changed'] ?? null));
@@ -1126,7 +1213,7 @@ check('a written column stored differently than written ( e.g. truncated ) -> si
 reset_fixture();
 $GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->rows[T_ID]['post_content'] = '<p>New body</p>'; };
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a callback writing the same values as this save is no conflict', true === ($r['success'] ?? null));
+check('a callback writing the same content as this save also changed the locked row: refused ( site_policy_conflict naming post_content ), never overwritten', 'site_policy_conflict' === ($r['code'] ?? null) && ['post_content'] === ($r['data']['changed'] ?? null) && T_CONTENT === $wpdb->rows[T_ID]['post_content']);
 
 // ---------------------------------------------------------------------------
 echo "Permission: a stale cache that wrongly DENIES does not refuse\n";
@@ -1236,7 +1323,7 @@ $r = cinatra_ability_post_update_if_unchanged(base_update());
 $names = $GLOBALS['cinatra_test']['probe_names'] ?? [];
 check('nothing open: SAVEPOINT, ROLLBACK TO fails with 1305 -> proceeds; no in_transaction or INNODB_TRX query', true === ($r['success'] ?? null) && ['AUTOCOMMIT?', 'SAVEPOINT', 'ROLLBACK TO SAVEPOINT', 'START TRANSACTION'] === precheck_kinds() && !isset($GLOBALS['cinatra_test']['dropped_detection_query']));
 check('the probe savepoint name is per call, unlikely to collide ( cinatra_probe_ + 16 hex ), the same in both statements', 2 === count($names) && 1 === preg_match('/^cinatra_probe_[0-9a-f]{16}$/', $names[0]) && $names[0] === $names[1]);
-check('the expected 1305 runs with database errors suppressed, restored afterwards', true === ($GLOBALS['cinatra_test']['probe_suppressed']['ROLLBACK TO SAVEPOINT'] ?? null) && false === ($GLOBALS['cinatra_test']['probe_suppressed']['SAVEPOINT'] ?? null) && [true, false] === $wpdb->suppress_calls);
+check('the expected 1305 runs with database errors suppressed, restored afterwards', true === ($GLOBALS['cinatra_test']['probe_suppressed']['ROLLBACK TO SAVEPOINT'] ?? null) && false === ($GLOBALS['cinatra_test']['probe_suppressed']['SAVEPOINT'] ?? null) && [true, false] === array_slice($wpdb->suppress_calls, 0, 2));
 $first_name = $names[0] ?? '';
 reset_fixture();
 cinatra_ability_post_update_if_unchanged(base_update());
@@ -1405,7 +1492,7 @@ echo "Transaction errors\n";
 reset_fixture();
 $wpdb->fail['START TRANSACTION'] = true;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('START TRANSACTION failure -> db_error, no select, no hook', is_refusal($r, 'db_error') && ['START TRANSACTION'] === statement_kinds());
+check('START TRANSACTION failure -> db_error, no select, no after-save hook', is_refusal($r, 'db_error') && ['START TRANSACTION'] === statement_kinds());
 reset_fixture();
 $wpdb->fail['COMMIT'] = true;
 $before = $wpdb->rows;
@@ -1452,20 +1539,57 @@ $wpdb->on_commit = function ($db) { $db->lose_connection(); return 0; };
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('COMMIT "succeeds" on a new connection: not taken as a commit; the read shows the old row -> db_error, no after-save hook', 'db_error' === ($r['code'] ?? null) && $before === $wpdb->rows && ['pre_post_update'] === hooks_fired());
-// ( 7 ) The connection was replaced during the save: the UPDATE ran with
-// autocommit on the new connection, so a later refusal cannot roll it back.
-reset_fixture();
-$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function ($id) {
+echo "Transaction lost before the write: refused, nothing written, another save survives\n";
+// ( 7 ) A pre_post_update callback ends the transaction ( COMMIT ); then
+// another request saves new content ( the row is no longer locked ).
+$other_save = function () {
     global $wpdb;
-    $wpdb->lose_connection();
-    $wpdb->rows[T_ID]['post_name'] = 'by-a-callback'; // its own write, autocommitted
+    $wpdb->rows[T_ID]['post_content'] = 'saved by another request';
+    $wpdb->rows[T_ID]['post_modified_gmt'] = '2026-11-25 10:04:00';
 };
-$r = cinatra_ability_post_update_if_unchanged(base_update());
-check('connection replaced before a late refusal, the row is not the old one -> write_outcome_unknown ( differs ), not "Nothing was written"', 'write_outcome_unknown' === ($r['code'] ?? null) && 'differs' === ($r['data']['cause'] ?? null) && ['pre_post_update'] === hooks_fired() && false === strpos($r['message'], 'Nothing was written'));
 reset_fixture();
-$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function ($id) { global $wpdb; $wpdb->lose_connection(); };
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () use ($other_save) { global $wpdb; $wpdb->query('COMMIT'); $other_save(); };
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('connection replaced during the save, the row read back is the intended one -> success with data.commit_unacknowledged true', true === ($r['success'] ?? null) && true === ($r['data']['commit_unacknowledged'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+check('callback COMMIT, then another save -> transaction_conflict ( transaction_lost ), no UPDATE, the other save\'s content intact', 'transaction_conflict' === ($r['code'] ?? null) && 'transaction_lost' === ($r['data']['cause'] ?? null) && [] === $wpdb->updates && 'saved by another request' === $wpdb->rows[T_ID]['post_content'] && ['pre_post_update'] === hooks_fired());
+// The same when the callback opens a new transaction afterwards ( a generic
+// "is a transaction open" probe would say yes; this save's savepoint is gone ).
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () use ($other_save) { global $wpdb; $wpdb->query('COMMIT'); $other_save(); $wpdb->query('START TRANSACTION'); };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('callback COMMIT + START TRANSACTION, another save in between -> transaction_conflict ( transaction_lost ), nothing written', 'transaction_conflict' === ($r['code'] ?? null) && 'transaction_lost' === ($r['data']['cause'] ?? null) && [] === $wpdb->updates && 'saved by another request' === $wpdb->rows[T_ID]['post_content']);
+check('the check is RELEASE SAVEPOINT of the savepoint set right after the lock ( cinatra_lock_ + 16 hex ), errors suppressed', 2 === count($GLOBALS['cinatra_test']['lock_savepoint'] ?? []) && 'SAVEPOINT' === $GLOBALS['cinatra_test']['lock_savepoint'][0][0] && 'RELEASE SAVEPOINT' === $GLOBALS['cinatra_test']['lock_savepoint'][1][0] && 1 === preg_match('/^cinatra_lock_[0-9a-f]{16}$/', $GLOBALS['cinatra_test']['lock_savepoint'][0][1]) && $GLOBALS['cinatra_test']['lock_savepoint'][0][1] === $GLOBALS['cinatra_test']['lock_savepoint'][1][1] && true === $GLOBALS['cinatra_test']['lock_savepoint'][1][2]);
+// ( 8 ) wpdb reconnects after the lock; another request saves in between.
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () use ($other_save) { global $wpdb; $wpdb->lose_connection(); $other_save(); };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('reconnect after the lock, another save in between -> transaction_conflict ( connection_replaced ), no UPDATE, the other save intact', 'transaction_conflict' === ($r['code'] ?? null) && 'connection_replaced' === ($r['data']['cause'] ?? null) && [] === $wpdb->updates && 'saved by another request' === $wpdb->rows[T_ID]['post_content']);
+reset_fixture();
+$GLOBALS['cinatra_test']['pre_post_update_cbs'][] = function () { global $wpdb; $wpdb->lose_connection(); $wpdb->rows[T_ID]['post_name'] = 'by-a-callback'; };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('reconnect after the lock, the callback\'s own write -> transaction_conflict, this save wrote nothing', 'transaction_conflict' === ($r['code'] ?? null) && [] === $wpdb->updates && T_CONTENT === $wpdb->rows[T_ID]['post_content']);
+// ( 9 ) wpdb reconnects DURING the UPDATE and repeats it with autocommit;
+// another request saved in between: the row condition does not match.
+reset_fixture();
+$wpdb->before_update = function ($db) use ($other_save) { $db->before_update = null; $db->lose_connection(); $other_save(); };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('reconnect during the UPDATE, another save in between -> zero rows, post_changed, the other save intact, no after-save hook', 'post_changed' === ($r['code'] ?? null) && in_array('post_content', $r['data']['changed'] ?? [], true) && 'saved by another request' === $wpdb->rows[T_ID]['post_content'] && ['pre_post_update'] === hooks_fired());
+reset_fixture();
+$wpdb->before_update = function ($db) { $db->before_update = null; $db->lose_connection(); };
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('reconnect during the UPDATE, no other save -> the condition matches the locked row; settled by the read: success, data.commit_unacknowledged true', true === ($r['success'] ?? null) && true === ($r['data']['commit_unacknowledged'] ?? null) && '<p>New body</p>' === $wpdb->rows[T_ID]['post_content']);
+
+echo "The row condition: every column, byte-exact, NULL-safe\n";
+reset_fixture();
+$wpdb->rows[T_ID]['post_password'] = null;
+t_state_is_read();
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+$cond = $wpdb->conditions[0] ?? [];
+$want = [];
+foreach ($wpdb->rows[T_ID] as $col => $v) { $want[$col] = null; }
+foreach (t_row(T_ID, 'page', ['post_password' => null]) as $col => $v) { $want[$col] = null === $v ? null : hash('sha256', (string) $v); }
+check('the UPDATE carries one condition per column of the locked row: SHA-256 of the value as read, IS NULL for NULL', true === ($r['success'] ?? null) && $want === $cond);
+check('the hash is computed by the server over the value in the connection character set ( SHA2(CONVERT(`col` USING utf8mb4), 256) ), WHERE `ID` first', false !== strpos($wpdb->update_sql[0] ?? '', "WHERE `ID` = 42 AND SHA2(CONVERT(`ID` USING utf8mb4), 256) = '") && false !== strpos($wpdb->update_sql[0], '`post_password` IS NULL'));
+check('the identical-content write ( zero changed rows, the row is this save\'s row ) still answers success', (function () { global $wpdb; reset_fixture(['now' => T_MODIFIED, 'now_local' => '2026-11-25 11:00:00']); $r = cinatra_ability_post_update_if_unchanged(base_update(['content' => T_CONTENT])); return true === ($r['success'] ?? null) && t_row(T_ID, 'page') === $wpdb->rows[T_ID]; })());
 check('write_outcome_unknown and its causes are declared in the output schema', in_array('unreadable', cinatra_content_output_schema(true)['properties']['data']['properties']['cause']['enum'], true) && in_array('differs', cinatra_content_output_schema(true)['properties']['data']['properties']['cause']['enum'], true));
 
 // ---------------------------------------------------------------------------
@@ -1549,7 +1673,7 @@ reset_fixture(['clean_ignored' => true]);
 $wpdb->rows[T_ID]['post_author'] = '9';
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('the same for the write: permission_unverified at once ( row locked ), nothing written, no hook', is_refusal($r, 'permission_unverified') && $before === $wpdb->rows && 1 === count(array_filter(statement_kinds(), function ($k) { return 'SELECT-FOR-UPDATE' === $k; })));
+check('the same for the write: permission_unverified at once ( row locked ), nothing written, no after-save hook', is_refusal($r, 'permission_unverified') && $before === $wpdb->rows && 1 === count(array_filter(statement_kinds(), function ($k) { return 'SELECT-FOR-UPDATE' === $k; })));
 // Whole-row rule: any column of the object get_post() returns must equal the fresh row.
 foreach (['post_name' => 'old-slug', 'post_content' => 'older cached content', 'post_author' => '3', 'post_type' => 'post', 'post_status' => 'draft', 'post_parent' => '5', 'menu_order' => '4', 'guid' => 'x'] as $col => $stale) {
     reset_fixture(['clean_ignored' => true]);
@@ -1622,7 +1746,7 @@ reset_fixture();
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
 check('success with raw content (backslashes intact)', true === $r['success'] && T_CONTENT === $r['post_content']);
 check('raw title, excerpt, status, type, modified, permalink', 'About "us"' === $r['post_title'] && 'Old excerpt' === $r['post_excerpt'] && 'publish' === $r['post_status'] && 'page' === $r['post_type'] && T_MODIFIED === $r['post_modified_gmt'] && 'https://blog.example/about/' === $r['permalink']);
-check('exactly one plain select, no lock, no transaction, no hook', ['SELECT'] === statement_kinds() && [] === hooks_fired());
+check('exactly one plain select, no lock, no transaction, no save hook', ['SELECT'] === statement_kinds() && [] === hooks_fired());
 check('read output keys', ['success', 'post_id', 'post_title', 'post_content', 'post_excerpt', 'post_status', 'post_type', 'post_modified_gmt', 'permalink', 'row_token'] === array_keys($r));
 check('read row_token is the canonical token of the row it read', t_token($wpdb->rows[T_ID]) === $r['row_token']);
 $r2 = cinatra_ability_post_read(['post_id' => T_ID]);

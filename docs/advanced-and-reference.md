@@ -110,9 +110,11 @@ transaction, it does these steps:
    the author), the write is refused.
 4. It builds the full post data as WordPress does for an update and runs the
    site's `wp_insert_post_data` filters over it (see below).
-5. It runs `pre_post_update` with that full data, and then writes only the
-   requested fields, `post_status` `draft` when requested, and the two
-   modification times, with one database update.
+5. It runs `pre_post_update` with that full data, checks that it is still in
+   its own transaction (see below), and then writes only the requested
+   fields, `post_status` `draft` when requested, and the two modification
+   times, with one database update. That update applies only while the row
+   is still exactly the locked row (see below).
 6. It reads the row again in the same transaction and checks that the row is
    exactly the locked row with the columns that this save wrote (see below).
 
@@ -130,7 +132,9 @@ deletes), the ability cannot remove it without writing the cache, so the
 refusal adds `data.cache_stale` `true` and says so in its message (not for
 `not_found`, `permission_unverified` and `unsupported_storage`, which stay
 identical). A refusal before
-the write fires no hook at all. `pre_post_update` may have fired when the
+the write fires no save hook: no after-save hook and no `pre_post_update`.
+The rollback's cache clear fires WordPress's `clean_post_cache` action, which
+is not a save hook. `pre_post_update` may have fired when the
 refusal happens at or after the write (`db_error`, or the check in step 6),
 because an action cannot be undone. The database changes that its callbacks
 made in the transaction are rolled back with it.
@@ -222,7 +226,33 @@ made in the transaction are rolled back with it.
   the status that this save stores, or any column that this save does not
   write (for example the slug, the author or a date), or adds or removes a
   column, the write is refused with `site_policy_conflict`. `data.changed`
-  names those columns. Nothing is written, and no hook runs.
+  names those columns. Nothing is written, and no after-save hook runs.
+- Before the update, the ability checks that it is still in its own
+  transaction on its own connection. Right after the row lock it sets a
+  savepoint with a random name (`SAVEPOINT cinatra_lock_<random>`); right
+  before the update, `RELEASE SAVEPOINT` of that name must succeed, and the
+  database connection must be the same one. A callback that ended the
+  transaction (`COMMIT`, or a statement that commits implicitly, also when it
+  starts a new transaction afterwards) removes the savepoint, and so does a
+  reconnect. Then the row is no longer locked, so the write is refused with
+  `transaction_conflict` (`data.cause` `transaction_lost` or
+  `connection_replaced`), and nothing is written.
+- The update itself is conditional: `WHERE ID = <id>` and, for every column
+  of the locked row (the columns that the row token covers), `col IS NULL`
+  when the column was NULL, otherwise
+  `SHA2(CONVERT(col USING <connection character set>), 256)` equal to the
+  SHA-256 of the value that was read. The server hashes the same bytes that
+  were read, so the comparison is byte-exact and does not depend on the
+  column's collation (a case-insensitive or trailing-space-insensitive
+  collation would make a plain `=` accept a different value). If the update
+  changes no row, the ability reads the row: if it is the row that this save
+  stores, the write was identical (success). Otherwise the condition did not
+  match and nothing was written: on the same connection the row stayed locked
+  by this save, so code inside the save changed it (`site_policy_conflict`,
+  `data.changed` names the columns, also a column that this save writes); if
+  the connection was replaced during the update (WordPress repeats a
+  statement after a reconnect, outside the transaction), another save may
+  have changed it (`post_changed`).
 - `pre_post_update` runs after the filters, with the full filtered data,
   unslashed, inside the transaction, before the update, as in WordPress. It
   runs only when the write goes ahead. It is an action, so it cannot stop the

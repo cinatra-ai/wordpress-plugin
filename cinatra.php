@@ -4910,12 +4910,44 @@ function cinatra_content_db_errno(): int {
  * @return array<string,mixed> The refusal result.
  */
 function cinatra_content_transaction_conflict( string $cause ): array {
-	return cinatra_content_refusal(
-		'transaction_conflict',
-		__( 'A database transaction is already open on this connection ( or the call came from inside this ability\'s own save ), and starting another would commit it. Nothing was written.', 'cinatra' ),
-		null,
-		array( 'cause' => $cause )
-	);
+	if ( 'transaction_lost' === $cause || 'connection_replaced' === $cause ) {
+		$message = __( 'This ability\'s database transaction ended during the save, before the write ( site code committed it, or the database connection was replaced ), so the post is no longer locked. Nothing was written.', 'cinatra' );
+	} else {
+		$message = __( 'A database transaction is already open on this connection ( or the call came from inside this ability\'s own save ), and starting another would commit it. Nothing was written.', 'cinatra' );
+	}
+	return cinatra_content_refusal( 'transaction_conflict', $message, null, array( 'cause' => $cause ) );
+}
+
+/**
+ * The WHERE condition that the row is still exactly the locked row: one
+ * condition per column of the row ( the columns the row token covers ),
+ * NULL-safe and byte-exact. A NULL column must be NULL; any other column's
+ * SHA-256, computed by the server over its value in the connection character
+ * set ( CONVERT( col USING <charset> ), the bytes wpdb read ), must equal the
+ * hash of the value read. A hash comparison does not depend on the column's
+ * collation ( a case-insensitive or PAD SPACE collation would make "a" equal
+ * "A" or "a " in a plain = ), and the hex literals are ASCII.
+ *
+ * @param array<string,mixed> $row The row as locked.
+ * @return array{0:string,1:string[]}|null The condition with %s placeholders and its values, or null when a column name is not a plain identifier.
+ */
+function cinatra_content_row_condition( array $row ): ?array {
+	global $wpdb;
+	$charset = (string) $wpdb->charset;
+	$parts   = array();
+	$values  = array();
+	foreach ( $row as $column => $value ) {
+		if ( 1 !== preg_match( '/^[A-Za-z0-9_]+$/', (string) $column ) ) {
+			return null;
+		}
+		if ( null === $value ) {
+			$parts[] = "`{$column}` IS NULL";
+			continue;
+		}
+		$parts[]  = 1 === preg_match( '/^[a-z0-9_]+$/', $charset ) ? "SHA2(CONVERT(`{$column}` USING {$charset}), 256) = %s" : "SHA2(`{$column}`, 256) = %s";
+		$values[] = hash( 'sha256', (string) $value );
+	}
+	return array( implode( ' AND ', $parts ), $values );
 }
 
 /**
@@ -5117,6 +5149,20 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh ): array {
 		cinatra_content_rollback( $id );
 		return cinatra_content_not_found();
 	}
+	// A savepoint of this transaction, set right after the lock and before
+	// any site callback: right before the write, RELEASE SAVEPOINT succeeds
+	// only inside this same transaction ( COMMIT, ROLLBACK, an implicit commit
+	// and a new connection all remove it ), so it proves the row is still
+	// locked by this save.
+	try {
+		$lock_savepoint = 'cinatra_lock_' . bin2hex( random_bytes( 8 ) );
+	} catch ( Exception $e ) {
+		$lock_savepoint = '';
+	}
+	if ( '' === $lock_savepoint || false === $wpdb->query( "SAVEPOINT {$lock_savepoint}" ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Transaction control; the name is a fixed prefix and hex digits.
+		cinatra_content_rollback( $id );
+		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be marked. Nothing was written.', 'cinatra' ) );
+	}
 	// The row is locked: no legitimate change is possible, so an unverified
 	// decision refuses at once.
 	list( $permission, $post_before ) = cinatra_content_row_permission( $row );
@@ -5304,9 +5350,42 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh ): array {
 	/** This action is documented in wp-includes/post.php ( fired by core right before the update, with the full unslashed data ). */
 	do_action( 'pre_post_update', $id, $filtered ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook, fired where wp_insert_post() fires it.
 
-	$updated = $wpdb->update( $wpdb->posts, $data, array( 'ID' => $id ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The narrow write itself; the cache is cleaned after the commit.
-	// MySQL reports CHANGED rows: 0 means the locked row already held these
-	// values; more than one is impossible for WHERE ID and is refused.
+	// Still in this save's transaction, on its connection? A callback may
+	// have ended it ( COMMIT, a statement that commits implicitly ) or wpdb
+	// may have reconnected; a write now would run with autocommit on a row
+	// that is no longer locked. Refuse without writing.
+	if ( $wpdb->dbh !== $dbh ) {
+		cinatra_content_rollback( $id );
+		return cinatra_content_transaction_conflict( 'connection_replaced' );
+	}
+	$suppressed = $wpdb->suppress_errors( true );
+	$released   = $wpdb->query( "RELEASE SAVEPOINT {$lock_savepoint}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Transaction control; the name is a fixed prefix and hex digits.
+	$wpdb->suppress_errors( $suppressed );
+	if ( false === $released || $wpdb->dbh !== $dbh ) {
+		cinatra_content_rollback( $id );
+		return cinatra_content_transaction_conflict( $wpdb->dbh !== $dbh ? 'connection_replaced' : 'transaction_lost' );
+	}
+
+	// The write is conditional on the row still being exactly the locked row
+	// ( every column, byte-exact, see cinatra_content_row_condition() ), so
+	// even a write that runs outside the transaction ( wpdb reconnects and
+	// repeats a statement after error 2006 ) cannot overwrite another save.
+	$condition = cinatra_content_row_condition( $row );
+	if ( null === $condition ) {
+		cinatra_content_rollback( $id );
+		return cinatra_content_refusal( 'unsupported_storage', __( 'The posts table has a column name this ability cannot compare safely. Nothing was written.', 'cinatra' ), $current_modified );
+	}
+	$set_parts  = array();
+	$set_values = array();
+	foreach ( $data as $column => $value ) {
+		$set_parts[]  = "`{$column}` = %s";
+		$set_values[] = $value;
+	}
+	$sql     = 'UPDATE `' . $wpdb->posts . '` SET ' . implode( ', ', $set_parts ) . ' WHERE `ID` = %d AND ' . $condition[0];
+	$updated = $wpdb->query( $wpdb->prepare( $sql, array_merge( $set_values, array( $id ), $condition[1] ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- The narrow conditional write; column names are this save's fixed columns and checked identifiers; the cache is cleaned after the commit.
+	// MySQL reports CHANGED rows: 0 means the row already held these values
+	// ( an identical write ) or no longer matched the locked row ( decided by
+	// the read below ); more than one is impossible for WHERE ID and is refused.
 	if ( false === $updated || 1 < (int) $updated ) {
 		$refusal = cinatra_content_refusal( 'db_error', __( 'The database update failed. Nothing was written.', 'cinatra' ), $current_modified );
 		if ( $wpdb->dbh !== $dbh ) {
@@ -5324,6 +5403,32 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh ): array {
 		}
 		cinatra_content_rollback( $id );
 		return $refusal;
+	}
+
+	// Zero changed rows and a row that is not this save's row: the condition
+	// did not match, so this UPDATE changed nothing. On the same connection
+	// the row stayed locked by this transaction, so site code inside the save
+	// changed it; on a replaced connection another save may have.
+	if ( 0 === (int) $updated && array() !== cinatra_content_widened_columns( $row, $data, $stored ) ) {
+		$differs = cinatra_content_widened_columns( $row, array(), $stored );
+		cinatra_content_rollback( $id );
+		if ( $wpdb->dbh !== $dbh ) {
+			return cinatra_content_refusal(
+				'post_changed',
+				__( 'The post changed during the save, so the conditional write matched no row. Nothing was written.', 'cinatra' ),
+				(string) $stored['post_modified_gmt'],
+				array( 'changed' => $differs )
+			);
+		}
+		if ( array() === $differs ) {
+			return cinatra_content_refusal( 'db_error', __( 'The conditional write matched no row although the post reads unchanged. Nothing was written.', 'cinatra' ), $current_modified );
+		}
+		return cinatra_content_refusal(
+			'site_policy_conflict',
+			__( 'Site code changed the post row during the save, so the conditional write matched no row. Nothing was written.', 'cinatra' ),
+			$current_modified,
+			array( 'changed' => $differs )
+		);
 	}
 
 	// The row as it will be committed ( read in this transaction, still locked
@@ -5373,7 +5478,11 @@ function cinatra_content_update_in_transaction( array $parsed, $dbh ): array {
  *   refusal ), the row this save stores: it is durable, so what a committed
  *   write runs, runs now ( the after-save hooks and the revision; skipping
  *   them would leave a stored change without them ), and the answer says
- *   data.commit_unacknowledged;
+ *   data.commit_unacknowledged. This shape ( the locked row with this
+ *   save's columns ) proves this save's write and no intervening one: the
+ *   UPDATE ran only after the savepoint check proved the row still locked,
+ *   and only under the row condition ( cinatra_content_row_condition() ),
+ *   so it changed the row only while every column was the locked value;
  * - the row before the save: nothing was written; the refusal, or db_error
  *   for an unconfirmed COMMIT;
  * - anything else, or no read: write_outcome_unknown ( cause "differs" or
@@ -5502,7 +5611,7 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 				'current_status'        => array( 'type' => 'string' ),
 				'cause'                 => array(
 					'type' => 'string',
-					'enum' => array( 'nested', 'open_transaction', 'autocommit_off', 'unreadable', 'differs' ),
+					'enum' => array( 'nested', 'open_transaction', 'autocommit_off', 'transaction_lost', 'connection_replaced', 'unreadable', 'differs' ),
 				),
 				'cache_stale'           => array(
 					'type'        => 'boolean',
