@@ -116,8 +116,10 @@ transaction, it does these steps:
 6. It reads the row again in the same transaction and checks that the row is
    exactly the locked row with the columns that this save wrote (see below).
 
-If a step refuses, the transaction is rolled back, nothing is written, and no
-after-save hook runs (none of the hooks that WordPress runs after an update,
+If a step refuses, the transaction is rolled back, the post's object cache is
+cleared through WordPress (`clean_post_cache()`, so that no request gets a
+version of the post that a callback cached during the transaction), nothing
+is written, and no after-save hook runs (none of the hooks that WordPress runs after an update,
 from `transition_post_status` to `wp_after_insert_post`). A refusal before
 the write fires no hook at all. `pre_post_update` may have fired when the
 refusal happens at or after the write (`db_error`, or the check in step 6),
@@ -165,12 +167,28 @@ made in the transaction are rolled back with it.
   excerpt). The site's `wp_insert_post_empty_content` filters then decide,
   with the same arguments as in WordPress, and can also refuse a save that
   is not empty. A refused save gives `empty_content`.
-- After the commit, the ability clears the post's cache and runs the hooks that
-  WordPress runs after an update, in the same order and with the same
-  arguments: `transition_post_status` (with `{old}_to_{new}` and
-  `{new}_{post_type}`), `edit_post_{post_type}`, `edit_post`, `post_updated`
-  (WordPress then stores a revision), `save_post_{post_type}`, `save_post`,
-  `wp_insert_post` and `wp_after_insert_post`.
+- After the commit, the ability clears the post's cache through WordPress
+  (`clean_post_cache()`) and runs the hooks that WordPress runs after an
+  update, in the same order and with the same arguments:
+  `transition_post_status` (with `{old}_to_{new}` and `{new}_{post_type}`),
+  `edit_post_{post_type}`, `edit_post`, `post_updated` (WordPress then stores
+  a revision), `save_post_{post_type}`, `save_post`, `wp_insert_post` and
+  `wp_after_insert_post`.
+- After it clears the cache, the ability checks that `get_post()` returns the
+  committed row, over every column. If it does not (the site suspended cache
+  invalidation with `wp_suspend_cache_invalidation()`, or an object-cache
+  drop-in ignores it), the save is still committed and the answer is a
+  success with `data.cache_stale` `true` (otherwise `false`). The hooks then
+  get a post object that the ability builds from the committed row, as
+  WordPress builds one from the database (`sanitize_post()` in the `raw`
+  context and `new WP_Post`), without writing it to the cache: that object
+  is the post argument of every hook above and the `$post_after` of
+  `post_updated`; `$post_before` is the post before the save, as always.
+  Code that calls `get_post()` itself, for example the revision that
+  WordPress stores on `post_updated`, can still get the old cached post, and
+  the site can keep serving it until its cache expires. The ability does not
+  resume a suspended cache invalidation: WordPress leaves that decision to
+  the code that suspended it.
 - The site's save policy applies. As in WordPress, the ability builds the
   full post data (all the columns that WordPress builds for an update: the
   locked row with the requested fields, the status and the new modification
@@ -235,19 +253,22 @@ made in the transaction are rolled back with it.
     unchanged. A call from a hook after the commit is not nested.
   - `autocommit_off`: the connection has `autocommit` set to 0. Then a
     transaction is always open, so the write cannot own one.
-  - `open_transaction`: another transaction is open on the connection. On
-    MariaDB, the session variable `in_transaction` shows it. Where that
-    variable does not exist (MySQL), InnoDB's list of transactions
-    (`information_schema.INNODB_TRX`) shows a transaction of this connection
-    that has done InnoDB work.
+  - `open_transaction`: another transaction is open on the connection, also
+    one that has not written anything yet.
 
-  Reading `autocommit` must work: if the database does not answer, the write
-  is refused with `unsupported_storage`. Limit: on MySQL, reading
-  `INNODB_TRX` needs the `PROCESS` privilege (and MySQL 5.6 or later). Without
-  it, the database cannot report another open transaction, and the write
-  runs. A transaction that was started but has not yet done InnoDB work is
-  not detected on MySQL. These checks read only (`SELECT` and `SHOW`), and
-  never commit anything.
+  The ability finds an open transaction with a savepoint probe, which needs
+  no privilege: `SAVEPOINT cinatra_probe_<random>`, then `ROLLBACK TO
+  SAVEPOINT` of that name. With no transaction open, MySQL and MariaDB accept
+  the `SAVEPOINT` but do not keep it, so the `ROLLBACK TO` fails with error
+  1305 (the savepoint does not exist): no transaction is open. Inside a
+  transaction both statements succeed and change nothing; the ability then
+  removes its savepoint with `RELEASE SAVEPOINT`. None of these statements
+  commits a transaction. The name has a random part for each call, because a
+  `SAVEPOINT` replaces a savepoint of the same name. The expected error is
+  kept out of the database error output. Reading `autocommit` must work, and
+  the probe must give one of these two answers: any other result (another
+  error, or a connection that reports no error number) refuses the write
+  with `unsupported_storage`, without starting a transaction.
 - A hook that changes the post after the commit makes a separate, later save.
   The answer reports what this save stored.
 - The posts table must use the InnoDB storage engine, because other engines

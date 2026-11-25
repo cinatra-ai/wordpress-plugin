@@ -15,10 +15,13 @@
  *
  * The test creates its own posts and an editor user, deletes them at the end
  * (also after a failure), prints one line per case and exits non-zero on the
- * first failure. Each line carries the database diagnostics the detection
- * reads: the raw @@SESSION.autocommit, the in_transaction row (MariaDB) or its
- * absence (MySQL), and the number of information_schema.INNODB_TRX rows of
- * this connection.
+ * first failure. Each line carries raw database diagnostics: the
+ * @@SESSION.autocommit the detection reads, the result of a raw savepoint
+ * probe (ROLLBACK TO SAVEPOINT succeeds inside a transaction, fails with
+ * errno 1305 outside one), and, for comparison only, the in_transaction row
+ * (MariaDB) or its absence (MySQL) and the information_schema.INNODB_TRX
+ * count of this connection (not used by the detection: InnoDB refreshes that
+ * table's cache at most every 100 ms, so it can miss an open transaction).
  *
  * The abilities are invoked through the Abilities API (wp_get_ability() and
  * WP_Ability::execute(), which also runs the input and output schema checks
@@ -84,13 +87,49 @@ function cinatra_it_assert( bool $condition, string $reason, $detail = null ): v
 }
 
 /**
+ * The error number of the last statement on $wpdb's connection.
+ *
+ * @return int The errno.
+ */
+function cinatra_it_errno(): int {
+	global $wpdb;
+	$dbh = $wpdb->dbh;
+	return $dbh instanceof mysqli ? (int) mysqli_errno( $dbh ) : -1;
+}
+
+/**
+ * A raw savepoint probe, independent of the plugin's: SAVEPOINT, then
+ * ROLLBACK TO SAVEPOINT, then RELEASE when it succeeded.
+ *
+ * @return string "open" ( ROLLBACK TO succeeded ), "none(errno=1305)" or the errno seen.
+ */
+function cinatra_it_raw_probe(): string {
+	global $wpdb;
+	$name       = 'cinatra_it_raw_' . bin2hex( random_bytes( 4 ) );
+	$suppressed = $wpdb->suppress_errors( true );
+	$set        = $wpdb->query( "SAVEPOINT {$name}" );
+	$set_errno  = cinatra_it_errno();
+	$back       = $wpdb->query( "ROLLBACK TO SAVEPOINT {$name}" );
+	$back_errno = cinatra_it_errno();
+	if ( false !== $back ) {
+		$wpdb->query( "RELEASE SAVEPOINT {$name}" );
+	}
+	$wpdb->suppress_errors( $suppressed );
+	if ( false === $set ) {
+		return 'savepoint-failed(errno=' . $set_errno . ')';
+	}
+	return false !== $back ? 'open' : 'none(errno=' . $back_errno . ')';
+}
+
+/**
  * The raw database diagnostics of this connection.
  *
- * @return string One line: autocommit, in_transaction, INNODB_TRX rows.
+ * @return string One line: autocommit, raw probe, in_transaction, INNODB_TRX rows.
  */
 function cinatra_it_diag(): string {
 	global $wpdb;
 	$autocommit = $wpdb->get_var( 'SELECT @@SESSION.autocommit' );
+	$probe      = cinatra_it_raw_probe();
 	$in_trx_row = $wpdb->get_row( "SHOW SESSION VARIABLES LIKE 'in_transaction'", ARRAY_N );
 	$suppressed = $wpdb->suppress_errors( true );
 	$trx_all    = $wpdb->get_var( 'SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()' );
@@ -98,8 +137,9 @@ function cinatra_it_diag(): string {
 	$trx_error  = $wpdb->last_error;
 	$wpdb->suppress_errors( $suppressed );
 	return sprintf(
-		'@@autocommit=%s in_transaction=%s innodb_trx(own)=%s innodb_trx(own,not-autocommit-select)=%s%s',
+		'@@autocommit=%s raw_probe=%s in_transaction=%s innodb_trx(own)=%s innodb_trx(own,not-autocommit-select)=%s%s',
 		null === $autocommit ? 'NULL' : (string) $autocommit,
+		$probe,
 		is_array( $in_trx_row ) ? wp_json_encode( $in_trx_row ) : '(no row)',
 		null === $trx_all ? 'NULL' : (string) $trx_all,
 		null === $trx_rw ? 'NULL' : (string) $trx_rw,
@@ -235,6 +275,22 @@ function cinatra_it_record(): void {
 }
 
 /**
+ * The savepoint statements among the recorded ones.
+ *
+ * @return string[] The statements.
+ */
+function cinatra_it_probe_statements(): array {
+	return array_values(
+		array_filter(
+			$GLOBALS['cinatra_it_sql'],
+			function ( $sql ) {
+				return 1 === preg_match( '/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) /', $sql );
+			}
+		)
+	);
+}
+
+/**
  * Whether a recorded statement is an UPDATE of the posts table that stores
  * post_status 'publish'.
  *
@@ -323,13 +379,56 @@ try {
 	cinatra_it_log( 'INFO start | ' . cinatra_it_diag() );
 
 	cinatra_it_case(
-		'detection: no transaction open',
+		'detection: no transaction open -> "" ( ROLLBACK TO fails with 1305 )',
 		function () {
-			$state = cinatra_content_open_transaction_state();
+			cinatra_it_record();
+			$state                           = cinatra_content_open_transaction_state();
+			$GLOBALS['cinatra_it_recording'] = false;
+			$errno                           = cinatra_it_errno();
 			cinatra_it_assert( '' === $state, 'the detection reports a transaction on a fresh connection', $state );
-			return 'state=""';
+			cinatra_it_assert( 1305 === $errno, 'the probe did not end on errno 1305', $errno );
+			return 'state="" errno=' . $errno . ' statements=' . wp_json_encode( cinatra_it_probe_statements() );
 		}
 	);
+
+	foreach ( array( 'without a prior write', 'after an options write' ) as $cinatra_it_variant ) {
+		cinatra_it_case(
+			'detection: foreign transaction ' . $cinatra_it_variant . ' -> open_transaction; not committed; no savepoint left',
+			function () use ( $cinatra_it_variant ) {
+				global $wpdb;
+				$wpdb->query( 'START TRANSACTION' );
+				$wpdb->query( 'SAVEPOINT cinatra_it_site_sp' );
+				if ( 'after an options write' === $cinatra_it_variant ) {
+					$inserted = $wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, %s)", $GLOBALS['cinatra_it_option'], 'before-probe', 'off' ) );
+					cinatra_it_assert( 1 === $inserted, 'the foreign options write failed', $wpdb->last_error );
+				}
+				cinatra_it_record();
+				$state                           = cinatra_content_open_transaction_state();
+				$GLOBALS['cinatra_it_recording'] = false;
+				$probe_sql                       = cinatra_it_probe_statements();
+				preg_match( '/^SAVEPOINT (\S+)$/', (string) ( $probe_sql[0] ?? '' ), $m );
+				// The probe's savepoint is gone ( RELEASE of it fails with 1305 );
+				// the site's own savepoint is still there.
+				$suppressed = $wpdb->suppress_errors( true );
+				$left       = isset( $m[1] ) ? $wpdb->query( "RELEASE SAVEPOINT {$m[1]}" ) : null;
+				$left_errno = cinatra_it_errno();
+				$site_sp    = $wpdb->query( 'RELEASE SAVEPOINT cinatra_it_site_sp' );
+				$wpdb->suppress_errors( $suppressed );
+				// Still inside the same transaction: a write after the probe is
+				// rolled back with everything else.
+				$after = $wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, %s)", $GLOBALS['cinatra_it_option'] . '_after', 'after-probe', 'off' ) );
+				$wpdb->query( 'ROLLBACK' );
+				$survivors = $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name IN (%s, %s)", $GLOBALS['cinatra_it_option'], $GLOBALS['cinatra_it_option'] . '_after' ) );
+				cinatra_it_assert( 'open_transaction' === $state, 'the detection did not see the foreign transaction', array( $state, $probe_sql ) );
+				cinatra_it_assert( 3 === count( $probe_sql ) && isset( $m[1] ) && 1 === preg_match( '/^cinatra_probe_[0-9a-f]{16}$/', $m[1] ), 'the probe did not run SAVEPOINT, ROLLBACK TO, RELEASE with a random name', $probe_sql );
+				cinatra_it_assert( false === $left && 1305 === $left_errno, 'the probe left its savepoint behind', array( $left, $left_errno ) );
+				cinatra_it_assert( false !== $site_sp, 'the site\'s own savepoint was disturbed', $wpdb->last_error );
+				cinatra_it_assert( 1 === $after, 'the transaction did not survive the probe (write after it failed)', $wpdb->last_error );
+				cinatra_it_assert( '0' === (string) $survivors, 'a foreign write survived the ROLLBACK: the probe committed the transaction', $survivors );
+				return 'state=open_transaction statements=' . wp_json_encode( $probe_sql );
+			}
+		);
+	}
 
 	cinatra_it_case(
 		'content-only update succeeds; post_updated fires after COMMIT',
@@ -402,11 +501,12 @@ try {
 			$read   = cinatra_it_read( $id );
 			$before = cinatra_it_row( $id );
 			$wpdb->query( 'START TRANSACTION' );
-			$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, %s)", $GLOBALS['cinatra_it_option'], 'foreign', 'off' ) );
-			$during = cinatra_it_diag();
+			$inserted = $wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, %s)", $GLOBALS['cinatra_it_option'], 'foreign', 'off' ) );
+			$during   = cinatra_it_diag();
 			$state  = cinatra_content_open_transaction_state();
 			$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
 			$wpdb->query( 'ROLLBACK' );
+			cinatra_it_assert( 1 === $inserted, 'the foreign options write failed', $wpdb->last_error );
 			cinatra_it_assert( 'open_transaction' === $state, 'the detection did not see the foreign transaction', array( $state, $during ) );
 			cinatra_it_assert( cinatra_it_refused( $result, 'transaction_conflict', 'open_transaction' ), 'the write was not refused with transaction_conflict/open_transaction', array( $result, $during ) );
 			$option = $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = %s", $GLOBALS['cinatra_it_option'] ) );
@@ -668,6 +768,7 @@ try {
 		wp_delete_post( $cinatra_it_post_id, true );
 	}
 	$wpdb->delete( $wpdb->options, array( 'option_name' => $GLOBALS['cinatra_it_option'] ) );
+	$wpdb->delete( $wpdb->options, array( 'option_name' => $GLOBALS['cinatra_it_option'] . '_after' ) );
 	if ( 0 < $GLOBALS['cinatra_it_editor'] ) {
 		require_once ABSPATH . 'wp-admin/includes/user.php';
 		wp_delete_user( $GLOBALS['cinatra_it_editor'] );

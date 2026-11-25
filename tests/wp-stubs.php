@@ -311,7 +311,8 @@ class WP_Post {
     public $post_mime_type;
     public $comment_count;
     public $filter;
-    public function __construct(array $fields = []) {
+    public function __construct($fields = []) {
+        $fields = (array) $fields; // core takes an object ( get_object_vars ); the tests also pass arrays
         $this->ID = $fields['ID'] ?? 0;
         $this->post_type = $fields['post_type'] ?? 'post';
         $this->post_title = $fields['post_title'] ?? '';

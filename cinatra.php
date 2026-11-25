@@ -4826,23 +4826,26 @@ function cinatra_content_transaction( ?bool $open = null, int $id = 0 ): array {
 }
 
 /**
- * Whether a transaction is already open on this database connection, read
- * without any statement that commits implicitly ( only SELECT and SHOW ).
+ * Whether a transaction is already open on this database connection, found
+ * without any privilege and without any statement that commits implicitly.
  *
- * 1. @@SESSION.autocommit ( MySQL and MariaDB ): 0 means every statement runs
- *    inside a transaction that only COMMIT or ROLLBACK ends, so one may be
- *    open with pending work: "autocommit_off". Unreadable: "unverifiable".
- * 2. MariaDB's session variable in_transaction ( 1 while a transaction is in
- *    progress ), read with SHOW SESSION VARIABLES, which returns no row
- *    where the variable does not exist ( MySQL ) instead of an error.
- * 3. Otherwise InnoDB's own list: a row in information_schema.INNODB_TRX for
- *    this connection that is not a lone autocommit SELECT. This needs the
- *    PROCESS privilege and the trx_autocommit_non_locking column; when the
- *    query fails ( errors suppressed ), the server cannot tell and the write
- *    proceeds: the documented limit. A transaction that has not touched
- *    InnoDB yet is not listed there.
+ * 1. @@SESSION.autocommit: 0 means every statement runs inside a transaction
+ *    that only COMMIT or ROLLBACK ends, so one may be open with pending work:
+ *    "autocommit_off". Unreadable: "unverifiable".
+ * 2. The savepoint probe: SAVEPOINT <name>, then ROLLBACK TO SAVEPOINT <name>.
+ *    MySQL and MariaDB ( sql/transaction.cc, trans_savepoint() ) accept
+ *    SAVEPOINT outside a multi-statement transaction and do nothing, so the
+ *    ROLLBACK TO then fails with error 1305 ( ER_SP_DOES_NOT_EXIST ): no
+ *    transaction is open. Inside a transaction, with or without a write so
+ *    far, both succeed and change nothing ( ROLLBACK TO SAVEPOINT does not
+ *    end the transaction, and nothing happened after the savepoint ); then
+ *    RELEASE SAVEPOINT removes it: "open_transaction". Neither statement is
+ *    on the manual's implicit-commit list. The name has a random suffix per
+ *    call: SAVEPOINT replaces a savepoint of the same name, so a foreign one
+ *    could only be moved by a 64-bit collision. Any other failure ( another
+ *    error, no errno from the connection ) is "unverifiable": fail closed.
  *
- * @return string "" when none is detected, "autocommit_off",
+ * @return string "" when no transaction is open, "autocommit_off",
  *                "open_transaction" or "unverifiable".
  */
 function cinatra_content_open_transaction_state(): string {
@@ -4854,17 +4857,38 @@ function cinatra_content_open_transaction_state(): string {
 	if ( '1' !== (string) $autocommit ) {
 		return 'autocommit_off';
 	}
-	$in_transaction = $wpdb->get_var( "SHOW SESSION VARIABLES LIKE 'in_transaction'", 1 ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Session state, read before the transaction.
-	if ( null !== $in_transaction ) {
-		return in_array( strtoupper( (string) $in_transaction ), array( '0', 'OFF' ), true ) ? '' : 'open_transaction';
+	try {
+		$probe = 'cinatra_probe_' . bin2hex( random_bytes( 8 ) );
+	} catch ( Exception $e ) {
+		return 'unverifiable';
 	}
+	if ( false === $wpdb->query( "SAVEPOINT {$probe}" ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Transaction probe; the name is a fixed prefix and hex digits.
+		return 'unverifiable';
+	}
+	// The expected answer when nothing is open is error 1305: keep it out of
+	// the error output, then restore the previous setting.
 	$suppressed = $wpdb->suppress_errors( true );
-	$rows       = $wpdb->get_var( 'SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID() AND trx_autocommit_non_locking = 0' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Session state, read before the transaction.
+	$rolled     = $wpdb->query( "ROLLBACK TO SAVEPOINT {$probe}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Transaction probe; the name is a fixed prefix and hex digits.
+	$errno      = false === $rolled ? cinatra_content_db_errno() : 0;
 	$wpdb->suppress_errors( $suppressed );
-	if ( null === $rows || '0' === (string) $rows ) {
-		return '';
+	if ( false === $rolled ) {
+		return 1305 === $errno ? '' : 'unverifiable';
 	}
+	// Open. Remove the probe's savepoint; the answer stays "open" either way.
+	$wpdb->query( "RELEASE SAVEPOINT {$probe}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Transaction probe; the name is a fixed prefix and hex digits.
 	return 'open_transaction';
+}
+
+/**
+ * The error number of the last statement on $wpdb's connection ( mysqli
+ * errno ), or 0 when the connection does not report one.
+ *
+ * @return int The error number.
+ */
+function cinatra_content_db_errno(): int {
+	global $wpdb;
+	$dbh = $wpdb->dbh;
+	return is_object( $dbh ) && isset( $dbh->errno ) ? (int) $dbh->errno : 0;
 }
 
 /**
@@ -4901,19 +4925,21 @@ function cinatra_content_shutdown_guard(): void {
 add_action( 'shutdown', 'cinatra_content_shutdown_guard', PHP_INT_MIN );
 
 /**
- * Roll back the open transaction and, when a write may have run, drop the
- * post's object cache so no request serves the rolled-back value.
+ * Roll back the open transaction and evict the post's object cache through
+ * core ( clean_post_cache() ), on EVERY rollback: a site callback inside the
+ * transaction ( a save filter, current_user_can() filters, pre_post_update )
+ * may have updated the same post and cached the uncommitted row; no request
+ * may serve it after the rollback. The one rollback helper; the post ID is
+ * known from the input before the transaction starts.
  *
- * @param int $touched_id Post ID whose cache to clean, or 0.
+ * @param int $id Post ID of the write.
  * @return void
  */
-function cinatra_content_rollback( int $touched_id = 0 ): void {
+function cinatra_content_rollback( int $id ): void {
 	global $wpdb;
 	cinatra_content_transaction( false );
 	$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
-	if ( 0 < $touched_id ) {
-		clean_post_cache( $touched_id );
-	}
+	clean_post_cache( $id );
 }
 
 /**
@@ -4960,7 +4986,7 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 	if ( 'unverifiable' === $foreign ) {
 		return cinatra_content_refusal(
 			'unsupported_storage',
-			__( 'The database did not report its autocommit mode, so the write cannot be made safely. Nothing was written.', 'cinatra' )
+			__( 'The database did not report whether a transaction is already open on this connection, so the write cannot be made safely. Nothing was written.', 'cinatra' )
 		);
 	}
 	if ( '' !== $foreign ) {
@@ -5000,7 +5026,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 	// Verified in this transaction, after the lock ( see the engine helper ):
 	// without InnoDB the row lock and the rollback would not protect the write.
 	if ( 'innodb' !== strtolower( cinatra_posts_table_engine() ) ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_refusal(
 			'unsupported_storage',
 			__( 'The posts table does not use the InnoDB storage engine, so the post cannot be locked during the check. Nothing was written.', 'cinatra' )
@@ -5008,7 +5034,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 	}
 
 	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_not_found();
 	}
 	// The row is locked: no legitimate change is possible, so an unverified
@@ -5019,13 +5045,13 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 		return cinatra_content_permission_unverified();
 	}
 	if ( 'allowed' !== $permission ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_not_found();
 	}
 	$current_modified = (string) $row['post_modified_gmt'];
 
 	if ( ! in_array( (string) $row['post_status'], cinatra_content_writable_statuses(), true ) ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_refusal(
 			'unsupported_status',
 			__( 'This ability writes only published posts and drafts. Nothing was written.', 'cinatra' ),
@@ -5038,7 +5064,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 		require_once ABSPATH . 'wp-admin/includes/post.php';
 	}
 	if ( false !== wp_check_post_lock( $id ) ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_refusal(
 			'post_locked',
 			__( 'Another user is editing this post right now. Nothing was written.', 'cinatra' ),
@@ -5062,7 +5088,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 		$changed[] = 'row_token';
 	}
 	if ( array() !== $changed ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_refusal(
 			'post_changed',
 			__( 'The post changed since it was read. Nothing was written.', 'cinatra' ),
@@ -5130,7 +5156,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 		&& post_type_supports( $post_type, 'excerpt' );
 	/** This filter is documented in wp-includes/post.php. */
 	if ( apply_filters( 'wp_insert_post_empty_content', $maybe_empty, $postarr ) ) { // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own save filter, run as wp_insert_post() runs it.
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_refusal( 'empty_content', __( 'The post would be empty ( content, title and excerpt ), or a site policy considers it empty. Nothing was written.', 'cinatra' ), $current_modified );
 	}
 	// The status went through core's status chain above ( pre_post_status and
@@ -5140,7 +5166,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 	$store_status = null !== $parsed['status'] ? 'draft' : (string) $row['post_status'];
 	$status_after = wp_unslash( (string) $postarr['post_status'] );
 	if ( $status_after !== $store_status ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_refusal(
 			'site_policy_conflict',
 			__( 'A site save policy for the post status does not allow this save. Nothing was written.', 'cinatra' ),
@@ -5173,7 +5199,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 	$filtered = apply_filters( 'wp_insert_post_data', wp_slash( $prospective ), $postarr, $unsanitized_postarr, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own save filter, run as wp_insert_post() runs it.
 	$conflict = cinatra_content_policy_conflicts( $prospective, $filtered, array_diff( array_keys( $written ), array( 'post_status' ) ) );
 	if ( array() !== $conflict ) {
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_refusal(
 			'site_policy_conflict',
 			__( 'A site save policy ( wp_insert_post_data ) would change parts of the post this ability does not write. Nothing was written.', 'cinatra' ),
@@ -5232,12 +5258,25 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 	// Committed. Now what wp_insert_post() does after its update, in its
 	// order and with its arguments. A hook that changes the post now makes an
 	// ordinary later save; the answer reports what THIS save stored.
+	//
+	// Invalidate through core, then verify: get_post() must return the
+	// committed row over every column. When it does not ( invalidation
+	// suspended with wp_suspend_cache_invalidation(), or ignored by an
+	// object-cache drop-in ), the save is still committed: the hooks get a
+	// post built from the committed row as WP_Post::get_instance() builds it
+	// ( sanitize_post( row, 'raw' ), new WP_Post ), without writing the cache,
+	// and the answer says data.cache_stale. The suspension is not lifted:
+	// core documents it as the caller's decision, not as safe to override.
 	clean_post_cache( $id );
-	$post = get_post( $id );
+	$post        = get_post( $id );
+	$cache_stale = ! cinatra_content_post_matches_row( $post, $stored );
+	if ( $cache_stale ) {
+		$post = new WP_Post( sanitize_post( (object) $stored, 'raw' ) );
+	}
 	wp_transition_post_status( (string) $stored['post_status'], (string) $post_before->post_status, $post );
 	do_action( "edit_post_{$post->post_type}", $id, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
 	do_action( 'edit_post', $id, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
-	$post_after = get_post( $id );
+	$post_after = $cache_stale ? $post : get_post( $id );
 	do_action( 'post_updated', $id, $post_after, $post_before ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook ( core stores the revision on it ).
 	do_action( "save_post_{$post->post_type}", $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
 	do_action( 'save_post', $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
@@ -5252,6 +5291,7 @@ function cinatra_content_update_in_transaction( array $parsed ): array {
 		}
 	}
 	$answer['sanitized_fields'] = $sanitized;
+	$answer['data']             = array( 'cache_stale' => $cache_stale );
 	return $answer;
 }
 
@@ -5282,6 +5322,10 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 				'cause'                => array(
 					'type' => 'string',
 					'enum' => array( 'nested', 'open_transaction', 'autocommit_off' ),
+				),
+				'cache_stale'          => array(
+					'type'        => 'boolean',
+					'description' => __( 'On a successful write: true when the site\'s object cache did not accept the invalidation after the commit, so get_post() may still return the post as it was before this save.', 'cinatra' ),
 				),
 			),
 			'additionalProperties' => false,
