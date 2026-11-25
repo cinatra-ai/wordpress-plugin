@@ -133,8 +133,13 @@ if (!function_exists('wp_check_post_lock')) {
     }
 }
 if (!function_exists('wp_cache_set')) {
+    /** cache_set_mode: 'fail' ( returns false, keeps the old entry ) or 'ignore' ( a drop-in that reports success but keeps the old entry ). */
     function wp_cache_set($key, $data, $group = '', $expire = 0) {
-        if ('posts' === $group) {
+        $mode = $GLOBALS['cinatra_test']['cache_set_mode'] ?? '';
+        if ('fail' === $mode) {
+            return false;
+        }
+        if ('posts' === $group && 'ignore' !== $mode) {
             $GLOBALS['cinatra_test']['post_cache'][(int) $key] = (array) $data;
         }
         return true;
@@ -169,6 +174,10 @@ if (!function_exists('get_post')) {
         }
         $p = new WP_Post($GLOBALS['cinatra_test']['post_cache'][$id]);
         $p->ID = (int) $p->ID;
+        // get_post_rewrite: site code that changes what get_post() returns.
+        if (isset($GLOBALS['cinatra_test']['get_post_rewrite'])) {
+            $p = ($GLOBALS['cinatra_test']['get_post_rewrite'])($p);
+        }
         return $p;
     }
 }
@@ -380,7 +389,7 @@ function reset_fixture(array $overrides = []) {
         'caps_fn'          => function ($cap, ...$args) {
             if ('edit_post' === $cap) {
                 $post = get_post((int) ($args[0] ?? 0));
-                return null !== $post && (int) $GLOBALS['cinatra_test']['current_user_id'] === (int) $GLOBALS['cinatra_test']['post_cache'][$post->ID]['post_author'];
+                return null !== $post && (int) $GLOBALS['cinatra_test']['current_user_id'] === (int) $post->post_author;
             }
             if ('unfiltered_html' === $cap) {
                 return $GLOBALS['cinatra_test']['unfiltered_html'] ?? true;
@@ -901,6 +910,85 @@ $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft'])
 check('status draft on a draft is allowed (no change)', true === $r['success'] && 'draft' === $r['post_status']);
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+echo "Permission: provably decided on the fresh row\n";
+// The object cache still holds the row with author 3 ( allowed ); the fresh row says author 9.
+foreach (['fail' => 'wp_cache_set fails', 'ignore' => 'a drop-in ignores wp_cache_set'] as $mode => $label) {
+    reset_fixture(['cache_set_mode' => $mode]);
+    $wpdb->rows[T_ID]['post_author'] = '9';
+    $r = cinatra_ability_post_read(['post_id' => T_ID]);
+    check("$label with a stale allowing row cached: read -> permission_unverified, no content", is_refusal($r, 'permission_unverified') && !isset($r['post_content']) && false === strpos(json_encode($r), 'Old excerpt') && null === $r['data']['current_modified_gmt']);
+    check("$label: the stale cache entry is dropped after the read", !isset($GLOBALS['cinatra_test']['post_cache'][T_ID]));
+    reset_fixture(['cache_set_mode' => $mode]);
+    $wpdb->rows[T_ID]['post_author'] = '9';
+    $before = $wpdb->rows;
+    $r = cinatra_ability_post_update_if_unchanged(base_update());
+    check("$label with a stale allowing row cached: write -> permission_unverified, nothing written, no hook", is_refusal($r, 'permission_unverified') && $before === $wpdb->rows && [] === $wpdb->updates && !in_array('COMMIT', statement_kinds(), true));
+    check("$label: write drops the stale cache entry", !isset($GLOBALS['cinatra_test']['post_cache'][T_ID]));
+}
+reset_fixture(['cache_set_mode' => 'ignore']);
+$wpdb->rows[T_ID]['post_content'] = 'content changed, capability fields equal';
+t_state_is_read();
+$GLOBALS['cinatra_test']['post_cache'][T_ID]['post_content'] = 'older cached content';
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('an ignored set with equal capability fields is verified: the read returns the fresh content', true === ($r['success'] ?? null) && 'content changed, capability fields equal' === $r['post_content']);
+foreach (['post_author' => '3', 'post_type' => 'page', 'post_status' => 'publish', 'post_parent' => '0'] as $field => $stale) {
+    reset_fixture(['cache_set_mode' => 'ignore']);
+    $fresh = ['post_author' => '9', 'post_type' => 'post', 'post_status' => 'draft', 'post_parent' => '5'][$field];
+    $wpdb->rows[T_ID][$field] = $fresh;
+    $GLOBALS['cinatra_test']['post_cache'][T_ID][$field] = $stale;
+    $r = cinatra_ability_post_read(['post_id' => T_ID]);
+    check("the cached $field differs from the fresh row -> permission_unverified, no content", is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+}
+reset_fixture();
+$wpdb->rows[T_ID]['post_author'] = '9';
+$GLOBALS['cinatra_test']['get_post_rewrite'] = function ($p) { $p->post_author = '3'; return $p; };
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('a get_post rewrite returning a different author -> read refused with permission_unverified', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a get_post rewrite returning a different author -> write refused, nothing written', is_refusal($r, 'permission_unverified') && $before === $wpdb->rows);
+reset_fixture();
+$GLOBALS['cinatra_test']['get_post_rewrite'] = function ($p) { $p->post_status = 'private'; return $p; };
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('a get_post rewrite of the status ( allowed author ) is still refused: not verifiable', is_refusal($r, 'permission_unverified'));
+reset_fixture();
+$calls = 0;
+$GLOBALS['cinatra_test']['get_post_rewrite'] = function ($p) use (&$calls) { if (2 === ++$calls) { $GLOBALS['cinatra_test']['flip'] = true; } if (!empty($GLOBALS['cinatra_test']['flip'])) { $p->post_author = '9'; } return $p; };
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('the cached row changing during the capability check -> permission_unverified', is_refusal($r, 'permission_unverified'));
+// The decision inside current_user_can() is bracketed by a read-back before and after.
+$decide_by_get_post = function ($post_id) { $p = get_post($post_id); return null !== $p && (int) $GLOBALS['cinatra_test']['current_user_id'] === (int) $p->post_author; };
+// B: the stale entry decides, then is evicted ( get_post reloads the fresh row ): only the BEFORE read-back sees it.
+reset_fixture(['cache_set_mode' => 'ignore']);
+$wpdb->rows[T_ID]['post_author'] = '9';
+$GLOBALS['cinatra_test']['early_done'] = false;
+$GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use ($decide_by_get_post) {
+    if ('edit_post' !== $cap) { return 'unfiltered_html' === $cap; }
+    $allowed = $decide_by_get_post((int) $args[0]);
+    if ($GLOBALS['cinatra_test']['early_done']) { unset($GLOBALS['cinatra_test']['post_cache'][(int) $args[0]]); } // evicted after the authoritative decision
+    $GLOBALS['cinatra_test']['early_done'] = true;
+    return $allowed;
+};
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('a stale entry that decides and is then evicted -> permission_unverified ( the read-back before the decision )', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+// A: another process puts a stale row into the shared cache during the check: only the AFTER read-back sees it.
+reset_fixture();
+$wpdb->rows[T_ID]['post_author'] = '9';
+$GLOBALS['cinatra_test']['post_cache'][T_ID]['post_author'] = '9';
+$GLOBALS['cinatra_test']['early_done'] = false;
+$GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use ($decide_by_get_post) {
+    if ('edit_post' !== $cap) { return 'unfiltered_html' === $cap; }
+    if (!$GLOBALS['cinatra_test']['early_done']) { $GLOBALS['cinatra_test']['early_done'] = true; return true; } // the early ( cache ) permission callback
+    $GLOBALS['cinatra_test']['post_cache'][(int) $args[0]]['post_author'] = '3'; // stale, allowing
+    return $decide_by_get_post((int) $args[0]);
+};
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('a stale row put into the cache during the decision -> permission_unverified ( the read-back after the decision )', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+reset_fixture();
+$r = cinatra_ability_post_read(['post_id' => T_ID]);
+check('normal case: the fresh row verified, read succeeds', true === ($r['success'] ?? null));
+
 echo "Read: raw values, fresh capability\n";
 reset_fixture();
 $r = cinatra_ability_post_read(['post_id' => T_ID]);

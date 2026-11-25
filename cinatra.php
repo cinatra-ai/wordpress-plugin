@@ -4365,22 +4365,77 @@ function cinatra_content_can_edit( $input = array() ): bool {
 }
 
 /**
- * Capability check against a FRESH row: the row is put into the object cache
- * exactly as WP_Post::get_instance() caches a raw row, so current_user_can()
- * ( map_meta_cap reads the post through get_post() ) decides on the author,
- * type and status of this row and not on an older cached copy. The write
- * calls it while it holds the row lock, so the cached value is the current
- * row until the commit.
+ * The post fields core's map_meta_cap() reads for edit_post, through
+ * get_post(): ID ( the privacy policy page check ), post_type, post_author,
+ * post_status, and post_parent ( for a revision ). For a trashed post it
+ * also reads the _wp_trash_meta_status meta, which is outside the row.
+ *
+ * @return string[] Field names.
+ */
+function cinatra_content_capability_fields(): array {
+	return array( 'ID', 'post_type', 'post_author', 'post_status', 'post_parent' );
+}
+
+/**
+ * Whether get_post() - the road map_meta_cap() takes - returns the given
+ * row's capability fields.
+ *
+ * @param array<string,string> $row Posts-table row.
+ * @return bool True when they all match.
+ */
+function cinatra_content_get_post_matches_row( array $row ): bool {
+	$post = get_post( (int) $row['ID'] );
+	if ( ! $post instanceof WP_Post ) {
+		return false;
+	}
+	foreach ( cinatra_content_capability_fields() as $field ) {
+		if ( (string) $post->$field !== (string) $row[ $field ] ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Capability check that is PROVABLY decided on a fresh row. The row is put
+ * into the object cache exactly as WP_Post::get_instance() caches a raw row,
+ * so current_user_can() ( map_meta_cap reads the post through get_post() )
+ * decides on this row and not on an older cached copy. Because that can fail
+ * ( wp_cache_set() fails, an object-cache drop-in ignores it, site code
+ * changes what get_post() returns ), get_post() is read back before and
+ * after the decision and must return the row's capability fields both times;
+ * otherwise the decision is not verifiable and the answer is "unverified".
+ * The write calls it while it holds the row lock.
  *
  * @param array<string,string> $row Posts-table row ( every column ).
- * @return bool True when the current user may edit the post as it is in the row.
+ * @return string "allowed", "denied" or "unverified".
  */
-function cinatra_content_can_edit_row( array $row ): bool {
+function cinatra_content_row_permission( array $row ): string {
 	$id             = (int) $row['ID'];
 	$cached         = (object) $row;
 	$cached->filter = 'raw';
 	wp_cache_set( $id, $cached, 'posts' );
-	return (bool) current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
+	if ( ! cinatra_content_get_post_matches_row( $row ) ) {
+		return 'unverified';
+	}
+	$allowed = (bool) current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
+	if ( ! cinatra_content_get_post_matches_row( $row ) ) {
+		return 'unverified';
+	}
+	return $allowed ? 'allowed' : 'denied';
+}
+
+/**
+ * The refusal for a permission decision that could not be verified on the
+ * fresh row. It carries no post content and no modification time.
+ *
+ * @return array<string,mixed> The refusal result.
+ */
+function cinatra_content_permission_unverified(): array {
+	return cinatra_content_refusal(
+		'permission_unverified',
+		__( 'The permission check could not be verified against the current post ( the object cache did not take the fresh post ). Nothing was read or written.', 'cinatra' )
+	);
 }
 
 /**
@@ -4522,9 +4577,12 @@ function cinatra_ability_post_read( $input = array() ): array {
 	}
 	// Re-check against the row just read; then drop the primed cache entry,
 	// so the read leaves the object cache as WordPress would fill it.
-	$allowed = cinatra_content_can_edit_row( $row );
+	$permission = cinatra_content_row_permission( $row );
 	wp_cache_delete( $id, 'posts' );
-	if ( ! $allowed ) {
+	if ( 'unverified' === $permission ) {
+		return cinatra_content_permission_unverified();
+	}
+	if ( 'allowed' !== $permission ) {
 		return cinatra_content_not_found();
 	}
 	return cinatra_content_shape_row( $row );
@@ -4775,7 +4833,18 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		);
 	}
 
-	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) || ! cinatra_content_can_edit_row( $row ) ) {
+	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
+		cinatra_content_rollback();
+		return cinatra_content_not_found();
+	}
+	$permission = cinatra_content_row_permission( $row );
+	if ( 'unverified' === $permission ) {
+		// Drop the entry that did not take the fresh row ( it may be stale ).
+		wp_cache_delete( $id, 'posts' );
+		cinatra_content_rollback();
+		return cinatra_content_permission_unverified();
+	}
+	if ( 'allowed' !== $permission ) {
 		cinatra_content_rollback();
 		return cinatra_content_not_found();
 	}

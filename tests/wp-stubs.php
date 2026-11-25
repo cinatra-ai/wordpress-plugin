@@ -287,6 +287,9 @@ class WP_Post {
     public $post_name;
     // The list ability (wordpress-plugin#82) serializes the GMT publish date.
     public $post_date_gmt;
+    // The fields core's map_meta_cap reads for edit_post ( content abilities ).
+    public $post_author;
+    public $post_parent;
     public function __construct(array $fields = []) {
         $this->ID = $fields['ID'] ?? 0;
         $this->post_type = $fields['post_type'] ?? 'post';
@@ -298,6 +301,8 @@ class WP_Post {
         $this->post_excerpt = $fields['post_excerpt'] ?? '';
         $this->post_name = $fields['post_name'] ?? '';
         $this->post_date_gmt = $fields['post_date_gmt'] ?? '2026-06-24 12:00:00';
+        $this->post_author = $fields['post_author'] ?? '0';
+        $this->post_parent = $fields['post_parent'] ?? 0;
     }
 }
 function get_the_title($post) {

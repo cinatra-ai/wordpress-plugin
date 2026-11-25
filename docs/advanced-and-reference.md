@@ -208,13 +208,26 @@ check it against the row that they read. An unknown post, a post that is not a
 post or a page, and a post that the user cannot edit give the same `not_found`
 answer.
 
+WordPress decides `edit_post` on the post that `get_post()` returns, which can
+come from the object cache. The abilities put the row that they read into the
+cache and read it back through `get_post()` before and after the capability
+check. The fields that WordPress uses for this decision (`ID`, `post_type`,
+`post_author`, `post_status` and `post_parent`) must equal the row both times.
+If they do not (for example, the object cache did not store the row, or site
+code changes what `get_post()` returns), the decision cannot be verified. The
+ability then refuses with `permission_unverified`: nothing is read or written,
+and the answer contains no post content. The read removes its cache entry
+afterwards, and a refused write removes an entry that did not take the row.
+
 A refusal is a normal result, not an error:
 `{ "success": false, "code": "...", "message": "...", "data": { "current_modified_gmt": ... } }`.
 The codes are `post_changed` (`data.changed` names the fields that differ),
 `site_policy_conflict` (`data.changed` names the columns that a site policy
 or site code would change), `post_locked` (another user is editing the post),
-`unsupported_status` (`data.current_status` names the status), `invalid`,
-`not_found`, `unsupported_storage` and `db_error`. After a refusal, nothing
+`unsupported_status` (`data.current_status` names the status),
+`permission_unverified` (the permission decision could not be verified against
+the current post), `invalid`, `not_found`, `unsupported_storage` and
+`db_error`. After a refusal, nothing
 is written, and a refusal never contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call
