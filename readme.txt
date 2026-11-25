@@ -59,6 +59,9 @@ WordPress supports plugin-to-plugin dependencies via the `Requires Plugins:` hea
 3. Connect the plugin to your Cinatra instance from the Cinatra settings page: enter your instance's web address and click the Connect with Cinatra button. No key is copied or pasted.
 
 == Changelog ==
+= Unreleased =
+* New: two abilities for the Cinatra assistant, for sites that run the WordPress Abilities API and the MCP Adapter. "cinatra/post-read" reads a post or page exactly as stored. "cinatra/post-update-if-unchanged" writes a reviewed change only if nobody saved the post since it was read: the check and the write happen in one database transaction with the post row locked, so an edit saved in between is never overwritten. Nothing changes on your site until the assistant calls them.
+
 = 0.1.7 =
 * Removed the plugin's own built-in content-editing tools (create/read/update/delete posts, list posts and pages, upload media) and its dedicated MCP server. These were an early, plugin-specific way for the assistant to edit your content; the assistant now reaches your WordPress content exclusively through two companion plugins — the WordPress MCP Adapter (https://wordpress.org/plugins/mcp-adapter/) and Enable Abilities for MCP (https://wordpress.org/plugins/enable-abilities-for-mcp/) — with no loss of capability. If you already have those companion plugins installed and active, there is nothing to do.
 * The settings page no longer shows a "Cinatra AI tools: N enrolled" count, since it described the now-removed built-in tools.

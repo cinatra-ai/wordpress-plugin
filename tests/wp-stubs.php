@@ -53,11 +53,19 @@ function add_action($hook, $cb, $priority = 10, $args = 1) {
     // plugin load time. Only the option-lifecycle hooks are ever REPLAYED (see
     // update_option below); everything else is capture-only.
     $GLOBALS['cinatra_test_actions'][$hook][] = $cb;
+    $GLOBALS['cinatra_test_action_priorities'][$hook][] = (int) $priority;
     return true;
 }
+/** Runs a hook's callbacks as WordPress does: ascending priority, then registration order. */
 function cinatra_test_do_action($hook, ...$args) {
-    foreach ($GLOBALS['cinatra_test_actions'][$hook] ?? [] as $cb) {
-        call_user_func_array($cb, $args);
+    $callbacks  = $GLOBALS['cinatra_test_actions'][$hook] ?? [];
+    $priorities = $GLOBALS['cinatra_test_action_priorities'][$hook] ?? [];
+    $order = array_keys($callbacks);
+    usort($order, function ($a, $b) use ($priorities) {
+        return [($priorities[$a] ?? 10), $a] <=> [($priorities[$b] ?? 10), $b];
+    });
+    foreach ($order as $i) {
+        call_user_func_array($callbacks[$i], $args);
     }
 }
 // Real do_action() -- WP core's own hook-firing function. Previously
@@ -162,9 +170,22 @@ function register_rest_route($namespace = '', $route = '', $args = []) {
     ];
     return true;
 }
-function __($text, $domain = 'default') { return $text; }
-function esc_html__($text, $domain = 'default') { return $text; }
-function esc_attr__($text, $domain = 'default') { return $text; }
+// As core's translate(): the gettext and gettext_{domain} filters run on
+// every translated string, through the WP_Hook objects in $wp_filter ( a test
+// that installs one sees each call, so site code that a translation reaches
+// is testable ).
+function cinatra_stub_translate($text, $domain) {
+    $translation = $text;
+    foreach (['gettext', 'gettext_' . $domain] as $hook) {
+        if (isset($GLOBALS['wp_filter'][$hook]) && is_object($GLOBALS['wp_filter'][$hook]) && method_exists($GLOBALS['wp_filter'][$hook], 'apply_filters')) {
+            $translation = $GLOBALS['wp_filter'][$hook]->apply_filters($translation, [$translation, $text, $domain]);
+        }
+    }
+    return $translation;
+}
+function __($text, $domain = 'default') { return cinatra_stub_translate($text, $domain); }
+function esc_html__($text, $domain = 'default') { return cinatra_stub_translate($text, $domain); }
+function esc_attr__($text, $domain = 'default') { return cinatra_stub_translate($text, $domain); }
 function esc_html($t) { return $t; }
 function esc_url($url) { return $url; }
 function esc_url_raw($url, $protocols = null) { return $url; }
@@ -287,7 +308,24 @@ class WP_Post {
     public $post_name;
     // The list ability (wordpress-plugin#82) serializes the GMT publish date.
     public $post_date_gmt;
-    public function __construct(array $fields = []) {
+    // The remaining wp_posts columns, as core's WP_Post declares them ( content abilities ).
+    public $post_author;
+    public $post_parent;
+    public $post_date;
+    public $post_content_filtered;
+    public $comment_status;
+    public $ping_status;
+    public $post_password;
+    public $to_ping;
+    public $pinged;
+    public $post_modified;
+    public $guid;
+    public $menu_order;
+    public $post_mime_type;
+    public $comment_count;
+    public $filter;
+    public function __construct($fields = []) {
+        $fields = (array) $fields; // core takes an object ( get_object_vars ); the tests also pass arrays
         $this->ID = $fields['ID'] ?? 0;
         $this->post_type = $fields['post_type'] ?? 'post';
         $this->post_title = $fields['post_title'] ?? '';
@@ -298,13 +336,49 @@ class WP_Post {
         $this->post_excerpt = $fields['post_excerpt'] ?? '';
         $this->post_name = $fields['post_name'] ?? '';
         $this->post_date_gmt = $fields['post_date_gmt'] ?? '2026-06-24 12:00:00';
+        $this->post_author = $fields['post_author'] ?? '0';
+        $this->post_parent = $fields['post_parent'] ?? 0;
+        foreach (['post_date', 'post_content_filtered', 'comment_status', 'ping_status', 'post_password', 'to_ping', 'pinged', 'post_modified', 'guid', 'menu_order', 'post_mime_type', 'comment_count', 'filter'] as $k) {
+            $this->$k = $fields[$k] ?? null;
+        }
+    }
+    /** As core: get_object_vars() plus ancestors, page_template, post_category, tags_input ( fixture values ). */
+    public function to_array() {
+        // Core's WP_Post declares its properties in this order ( the posts table's
+        // column order, then filter ); get_object_vars() follows it.
+        $post = [];
+        foreach (['ID', 'post_author', 'post_date', 'post_date_gmt', 'post_content', 'post_title', 'post_excerpt', 'post_status', 'comment_status', 'ping_status', 'post_password', 'post_name', 'to_ping', 'pinged', 'post_modified', 'post_modified_gmt', 'post_content_filtered', 'post_parent', 'guid', 'menu_order', 'post_type', 'post_mime_type', 'comment_count', 'filter'] as $k) {
+            $post[$k] = $this->$k;
+        }
+        $extra = $GLOBALS['cinatra_test']['post_extra'][(int) $this->ID] ?? [];
+        return array_merge($post, [
+            'ancestors'     => $extra['ancestors'] ?? [],
+            'page_template' => $extra['page_template'] ?? '',
+            'post_category' => $extra['post_category'] ?? [],
+            'tags_input'    => $extra['tags_input'] ?? [],
+        ]);
     }
 }
 function get_the_title($post) {
     return $post instanceof WP_Post ? (string) $post->post_title : '';
 }
 function get_permalink($post) {
-    return $post instanceof WP_Post ? (string) $post->permalink : '';
+    if (is_int($post)) {
+        // Real WordPress accepts a post ID too; resolve it via the fixture map
+        // of permalinks (tests that never set it get '' as before).
+        return (string) ($GLOBALS['cinatra_test']['permalinks'][$post] ?? '');
+    }
+    if (!$post instanceof WP_Post) {
+        return '';
+    }
+    if ('' !== (string) $post->permalink) {
+        return (string) $post->permalink;
+    }
+    // A post object built from a row ( no fixture permalink ): core builds the
+    // link from the object's own fields; with permalink_base set the stub
+    // does the same from its slug.
+    $base = $GLOBALS['cinatra_test']['permalink_base'] ?? null;
+    return null !== $base && '' !== (string) $post->post_name ? $base . $post->post_name . '/' : '';
 }
 function get_post_type_object($post_type) {
     $registry = $GLOBALS['cinatra_test']['post_types'] ?? [
@@ -358,10 +432,15 @@ function delete_option($name) {
 // ---------------------------------------------------------------------------
 // Auth / nonces / user
 // ---------------------------------------------------------------------------
-function current_user_can($cap) {
+function current_user_can($cap, ...$args) {
     // Cap-aware when a per-capability map is provided (e.g. edit_post vs
     // publish_posts differ); otherwise the single boolean drives every check.
     // Backward compatible: tests that never set ['caps'] behave as before.
+    // A test that needs a per-object answer (edit_post on ONE post id) sets
+    // ['caps_fn'] => callable($cap, ...$args); it wins over everything else.
+    if (isset($GLOBALS['cinatra_test']['caps_fn']) && is_callable($GLOBALS['cinatra_test']['caps_fn'])) {
+        return (bool) call_user_func($GLOBALS['cinatra_test']['caps_fn'], $cap, ...$args);
+    }
     $caps = $GLOBALS['cinatra_test']['caps'] ?? null;
     if (is_array($caps) && array_key_exists($cap, $caps)) {
         return (bool) $caps[$cap];
@@ -376,7 +455,8 @@ function wp_verify_nonce($nonce, $action = -1) {
         ? 1 : false;
 }
 function wp_generate_uuid4() { return '00000000-0000-4000-8000-000000000000'; }
-function wp_unslash($v) { return is_string($v) ? stripslashes($v) : $v; }
+/** As core: recursive over arrays. */
+function wp_unslash($v) { return is_array($v) ? array_map('wp_unslash', $v) : (is_string($v) ? stripslashes($v) : $v); }
 
 // ---------------------------------------------------------------------------
 // Transients (in-memory)
@@ -472,9 +552,11 @@ function wp_remote_retrieve_body($resp) { return $resp['body'] ?? ''; }
 class WP_Error {
     private $code;
     private $message;
-    public function __construct($code = '', $message = '') { $this->code = $code; $this->message = $message; }
+    private $data;
+    public function __construct($code = '', $message = '', $data = '') { $this->code = $code; $this->message = $message; $this->data = $data; }
     public function get_error_code() { return $this->code; }
     public function get_error_message() { return $this->message; }
+    public function get_error_data() { return $this->data; }
 }
 
 class WP_REST_Response {
