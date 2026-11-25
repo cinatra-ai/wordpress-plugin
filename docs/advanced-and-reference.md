@@ -84,40 +84,57 @@ from the database, not from a cache.
 
 **`cinatra/post-update-if-unchanged`**. Input: `post_id`,
 `if_unmodified_since` (the `post_modified_gmt` of the read that the change is
-based on), `expected` (the post status that was read, and the before-value of
-each field that is written), and one or more of `title`, `content`, `excerpt`
-and `status`. In one database transaction, the ability locks the post row,
-compares `post_modified_gmt`, the post status and each `expected` value byte
-for byte, and writes only when all of them are equal. If another save occurs between the read and the write, the write is
-refused and nothing is written. The byte comparison also finds a second save in
-the same second.
+based on), `expected` (the `title`, `content`, `excerpt` and `status` from that
+read), and one or more of `title`, `content`, `excerpt` and `status`. In one
+database transaction, the ability locks the post row and compares
+`post_modified_gmt` and all four `expected` values byte for byte. It writes
+only when all of them are equal. If another save occurs between the read and
+the write, the write is refused and nothing is written. Because all four
+values are compared, the ability also finds a second save in the same second,
+also when that save changed a field that this write does not change.
 
-- `expected.status` is always required. It is the `post_status` from the read,
-  and it is always compared, also when the status is not written. The status
-  is part of what the review saw: an edit to a published page is live
-  immediately.
-- Each written `title`, `content` or `excerpt` must have an `expected` entry.
-  An `expected` entry for one of these fields that is not written is refused.
-- A status-only change sends, for example,
-  `"expected": { "status": "publish" }, "status": "draft"`.
-- `status` may only be `"draft"`. It moves the post to draft in the same save,
-  for example when a review says to unpublish a published page. If `status` is
-  not given, the status does not change. Thus an edit to a published page is
-  live immediately. The ability never publishes.
+- `expected` must always contain all four values, `title`, `content`,
+  `excerpt` and `status`, exactly as the read returned them, also for fields
+  that are not written. For example, a change to draft only sends all four
+  values in `expected` and `"status": "draft"`.
+- The ability writes only published posts and drafts. Other statuses have
+  their own WordPress flows and are refused with `unsupported_status`:
+  `trash` (restoring from the trash goes through WordPress's untrash flow),
+  `future`, `private`, `pending` and `auto-draft`.
+- `status` may only be `"draft"`. It moves a published post to draft in the
+  same save, for example when a review says to unpublish a page. On a draft,
+  it changes nothing. If `status` is not given, the status does not change.
+  Thus an edit to a published page is live immediately. The ability never
+  publishes.
 - The ability applies the same filters that a normal save by that user
   applies. For users without the `unfiltered_html` capability, WordPress
-  removes disallowed HTML. Thus the stored value can be different from the sent
-  value. The answer contains the stored values, the new `post_modified_gmt`,
-  and `sanitized_fields`, which names each field that a filter changed.
+  removes disallowed HTML. Thus the stored value of a written field can be
+  different from the sent value. The answer contains the stored values, the
+  new `post_modified_gmt`, and `sanitized_fields`, which names each written
+  field that a filter changed.
+- The ability never silently changes a field that the caller did not ask to
+  change. WordPress applies the save filters to all content fields of a post on
+  every save, also to the fields that are not changed, and other plugins'
+  hooks can change fields too. After the save, inside the transaction, the
+  ability compares every field that was not written with the value read under
+  the lock. If one is different, the save is rolled back and refused with
+  `untouched_field_changed` (`data.changed` names the fields). Thus a user
+  without `unfiltered_html` cannot edit a post whose unchanged content contains
+  HTML that their role may not write. This is correct for an agent that acts
+  with that user's rights.
+- One WordPress behavior is allowed: for a draft whose publication date was
+  never set, WordPress sets `post_date` to the current time on every save. The
+  answer reports this in `also_changed`. WordPress also stores a revision of
+  the previous version, as for every update.
 - The ability saves the full row that it read under the lock, with the written
-  fields on top. A copy of the post in the object cache cannot write an old
-  value back.
+  fields on top, and clears the post's object cache first. A copy of the post
+  in the object cache cannot write an old value back.
 - The posts table must use the InnoDB storage engine, because other engines
   cannot lock a row. Each write reads the engine again inside its transaction,
   after the row lock. On other engines, the write is refused.
 - `wp_update_post()` runs other plugins' save hooks inside the transaction. A
-  plugin that writes through a different database connection is not part of
-  the transaction.
+  plugin that writes through a different database connection, or that changes
+  post meta or terms, is not covered by these checks.
 
 Both abilities require the `edit_post` capability for the specific post. An
 unknown post, a post that is not a post or a page, and a post that the user
@@ -126,8 +143,9 @@ cannot edit give the same `not_found` answer.
 A refusal is a normal result, not an error:
 `{ "success": false, "code": "...", "message": "...", "data": { "current_modified_gmt": ... } }`.
 The codes are `post_changed` (`data.changed` names the fields that differ),
-`post_locked` (another user is editing the post), `invalid`, `not_found`,
-`unsupported_storage`, `update_failed` and `db_error`. After a refusal, nothing
+`post_locked` (another user is editing the post), `unsupported_status`
+(`data.current_status` names the status), `untouched_field_changed`,
+`invalid`, `not_found`, `unsupported_storage`, `update_failed` and `db_error`. After a refusal, nothing
 is written, and a refusal never contains post content.
 `current_modified_gmt` is `null` when the caller may not see it. The Abilities
 API itself refuses an input that does not match the input schema, and a call

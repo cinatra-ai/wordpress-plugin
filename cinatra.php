@@ -4264,9 +4264,10 @@ add_action( CINATRA_SITE_INVENTORY_CRON_HOOK, 'cinatra_send_site_inventory' );
 // table (no object cache), so the review is based on a fresh site value.
 // - cinatra/post-update-if-unchanged writes only when the post is still as
 // reviewed: in ONE database transaction it locks the post row
-// (SELECT ... FOR UPDATE), compares post_modified_gmt, the post status and the
-// before-value of every written field byte for byte, and only then calls
-// wp_update_post() with the full row read under the lock.
+// (SELECT ... FOR UPDATE), compares post_modified_gmt and the before-values of
+// the whole reviewed post (title, content, excerpt, status) byte for byte,
+// calls wp_update_post() with the full row read under the lock, and rolls
+// back if any column the caller did not ask to change was changed.
 // An edit saved in between makes the write refuse, and nothing is written.
 //
 // Both register on the Abilities API hooks only; the plugin loads unchanged
@@ -4467,15 +4468,14 @@ function cinatra_ability_post_read( $input = array() ): array {
 /**
  * Validate the input of cinatra/post-update-if-unchanged. Pure: no database.
  *
- * @param mixed $input Ability input.
- * Pairing rule: every written text field ( title, content, excerpt ) has its
- * before-value in expected, and expected names no text field that is not
- * written. expected.status ( the post status that was read ) is ALWAYS
- * required, whether or not status is written, and is compared under the lock:
- * the status is part of what the review saw ( an edit to a published page is
- * live at once ), and a write of status needs its before-value like any field.
+ * The expected object must hold the before-values of the WHOLE post: title,
+ * content, excerpt and status, always, whether or not each is written ( the
+ * read returns them all ). All four are compared under the lock, so a save of
+ * an unwritten field in the same second as the read is still detected.
+ * Written fields are any of title, content, excerpt, and status "draft".
  *
- * @return array<string,mixed> On success: [ 'ok' => true, 'id', 'since', 'fields' ( column => new value ), 'expected' ( column => before-value, post_status included ), 'status' ( 'draft' or null ) ]; otherwise an 'invalid' refusal result.
+ * @param mixed $input Ability input.
+ * @return array<string,mixed> On success: [ 'ok' => true, 'id', 'since', 'fields' ( column => new value ), 'expected' ( column => before-value, all four ), 'status' ( 'draft' or null ) ]; otherwise an 'invalid' refusal result.
  */
 function cinatra_content_parse_update_input( $input ): array {
 	if ( ! is_array( $input ) ) {
@@ -4498,35 +4498,39 @@ function cinatra_content_parse_update_input( $input ): array {
 		return cinatra_content_refusal( 'invalid', __( 'if_unmodified_since must be the post_modified_gmt value of the read the change is based on.', 'cinatra' ) );
 	}
 
-	$expected_in = $input['expected'] ?? array();
+	$expected_in = $input['expected'] ?? null;
+	$columns     = array_merge( $writable, array( 'status' => 'post_status' ) );
 	if ( ! is_array( $expected_in ) ) {
 		return cinatra_content_refusal( 'invalid', __( 'expected must be an object.', 'cinatra' ) );
 	}
-	if ( array() !== array_diff( array_keys( $expected_in ), array_merge( array_keys( $writable ), array( 'status' ) ) ) ) {
-		return cinatra_content_refusal( 'invalid', __( 'expected may only name title, content, excerpt or status.', 'cinatra' ) );
+	$names = array_keys( $expected_in );
+	sort( $names );
+	$required = array_keys( $columns );
+	sort( $required );
+	if ( $names !== $required ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected must hold exactly title, content, excerpt and status as read.', 'cinatra' ) );
 	}
-	if ( ! isset( $expected_in['status'] ) || ! is_string( $expected_in['status'] ) || '' === $expected_in['status'] ) {
-		return cinatra_content_refusal( 'invalid', __( 'expected.status is required: the post status of the read the change is based on.', 'cinatra' ) );
-	}
-
-	$fields   = array();
 	$expected = array();
-	foreach ( $writable as $name => $column ) {
-		$written    = array_key_exists( $name, $input );
-		$has_before = array_key_exists( $name, $expected_in );
-		if ( $written !== $has_before ) {
-			return cinatra_content_refusal( 'invalid', __( 'Every written title, content or excerpt needs its before-value in expected, and expected may only name written fields (and status).', 'cinatra' ) );
+	foreach ( $columns as $name => $column ) {
+		if ( ! is_string( $expected_in[ $name ] ) ) {
+			return cinatra_content_refusal( 'invalid', __( 'The expected before-values must be strings.', 'cinatra' ) );
 		}
-		if ( ! $written ) {
-			continue;
-		}
-		if ( ! is_string( $input[ $name ] ) || ! is_string( $expected_in[ $name ] ) ) {
-			return cinatra_content_refusal( 'invalid', __( 'Field values and their expected before-values must be strings.', 'cinatra' ) );
-		}
-		$fields[ $column ]   = $input[ $name ];
 		$expected[ $column ] = $expected_in[ $name ];
 	}
-	$expected['post_status'] = $expected_in['status'];
+	if ( '' === $expected['post_status'] ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected.status must be the post status as read.', 'cinatra' ) );
+	}
+
+	$fields = array();
+	foreach ( $writable as $name => $column ) {
+		if ( ! array_key_exists( $name, $input ) ) {
+			continue;
+		}
+		if ( ! is_string( $input[ $name ] ) ) {
+			return cinatra_content_refusal( 'invalid', __( 'Field values must be strings.', 'cinatra' ) );
+		}
+		$fields[ $column ] = $input[ $name ];
+	}
 
 	$status = null;
 	if ( array_key_exists( 'status', $input ) ) {
@@ -4551,6 +4555,20 @@ function cinatra_content_parse_update_input( $input ): array {
 }
 
 /**
+ * Post statuses the write operates on. A plain field update is what
+ * WordPress itself does for a published post and a draft. The others have
+ * their own flows and are refused: trash ( untrash restores the previous
+ * status and clears the trash metadata ), auto-draft and inherit ( not
+ * user content ), future ( scheduled publishing ), private and pending
+ * ( their own visibility and review semantics ).
+ *
+ * @return string[] Writable statuses.
+ */
+function cinatra_content_writable_statuses(): array {
+	return array( 'publish', 'draft' );
+}
+
+/**
  * Roll back the open transaction and, when a write may have run, drop the
  * post's object cache so no request serves the rolled-back value.
  *
@@ -4568,10 +4586,11 @@ function cinatra_content_rollback( int $touched_id = 0 ): void {
 /**
  * Execute callback for cinatra/post-update-if-unchanged.
  *
- * In one transaction: lock the post row, verify the InnoDB engine, refuse
- * when another user holds the edit lock, compare post_modified_gmt, the post
- * status and every written field's before-value byte for byte, then
- * wp_update_post() with the full locked row and COMMIT. Any refusal or error rolls
+ * In one transaction: lock the post row, verify the InnoDB engine, refuse a
+ * post that is not published or a draft, refuse when another user holds the
+ * edit lock, compare post_modified_gmt and the before-values of title,
+ * content, excerpt and status byte for byte, then wp_update_post() with the
+ * full locked row, refuse when any untouched column changed, and COMMIT. Any refusal or error rolls
  * back, so nothing is written. Content passes through the same filters a
  * normal save by this user applies ( kses for users without unfiltered_html ),
  * so the stored value can differ from the sent one: the answer returns what is
@@ -4614,6 +4633,16 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		return cinatra_content_not_found();
 	}
 	$current_modified = (string) $row['post_modified_gmt'];
+
+	if ( ! in_array( (string) $row['post_status'], cinatra_content_writable_statuses(), true ) ) {
+		cinatra_content_rollback();
+		return cinatra_content_refusal(
+			'unsupported_status',
+			__( 'This ability writes only published posts and drafts. Nothing was written.', 'cinatra' ),
+			$current_modified,
+			array( 'current_status' => (string) $row['post_status'] )
+		);
+	}
 
 	if ( ! function_exists( 'wp_check_post_lock' ) ) {
 		require_once ABSPATH . 'wp-admin/includes/post.php';
@@ -4680,6 +4709,43 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		return cinatra_content_refusal( 'db_error', __( 'The post could not be read back after the update. Nothing was written.', 'cinatra' ), $current_modified );
 	}
 
+	// Nothing the caller did not ask to change may change silently. Core's
+	// wp_insert_post() runs the save filters ( kses for a user without
+	// unfiltered_html ) over EVERY content field of the merged post, also the
+	// untouched ones, and other plugins' hooks may rewrite columns. So every
+	// untouched column of the stored row is compared byte for byte with the
+	// row read under the lock; a difference rolls the whole save back.
+	// Excluded: the written columns, post_status when written, and the
+	// modification times. One documented core behaviour is allowed and
+	// reported in also_changed: a draft whose date was never set ( floating,
+	// post_date_gmt zero ) gets post_date = now on every save.
+	$skip = array_merge( array_keys( $parsed['fields'] ), array( 'ID', 'post_modified', 'post_modified_gmt' ) );
+	if ( null !== $parsed['status'] ) {
+		$skip[] = 'post_status';
+	}
+	$floating     = ( '0000-00-00 00:00:00' === (string) $row['post_date_gmt'] && 'draft' === (string) $stored['post_status'] );
+	$also_changed = array();
+	$untouched    = array();
+	foreach ( $row as $column => $before ) {
+		if ( in_array( $column, $skip, true ) || (string) ( $stored[ $column ] ?? '' ) === (string) $before ) {
+			continue;
+		}
+		if ( $floating && 'post_date' === $column ) {
+			$also_changed[] = $column;
+			continue;
+		}
+		$untouched[] = (string) $column;
+	}
+	if ( array() !== $untouched ) {
+		cinatra_content_rollback( $id );
+		return cinatra_content_refusal(
+			'untouched_field_changed',
+			__( 'The save would also change fields that were not asked to change (for example the save filters for this user, or another plugin). Nothing was written.', 'cinatra' ),
+			$current_modified,
+			array( 'changed' => $untouched )
+		);
+	}
+
 	if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control.
 		cinatra_content_rollback( $id );
 		return cinatra_content_refusal( 'db_error', __( 'The database transaction could not be committed. Nothing was written.', 'cinatra' ), $current_modified );
@@ -4696,6 +4762,7 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		}
 	}
 	$answer['sanitized_fields'] = $sanitized;
+	$answer['also_changed']     = $also_changed;
 	return $answer;
 }
 
@@ -4722,6 +4789,7 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 					'items' => array( 'type' => 'string' ),
 				),
 				'wp_error_code'        => array( 'type' => 'string' ),
+				'current_status'       => array( 'type' => 'string' ),
 			),
 			'additionalProperties' => false,
 		),
@@ -4739,6 +4807,11 @@ function cinatra_content_output_schema( bool $with_sanitized ): array {
 			'type'        => 'array',
 			'items'       => array( 'type' => 'string' ),
 			'description' => __( 'Written fields whose stored value differs from the sent value because the save filters changed it.', 'cinatra' ),
+		);
+		$properties['also_changed']     = array(
+			'type'        => 'array',
+			'items'       => array( 'type' => 'string' ),
+			'description' => __( 'Columns WordPress changed beyond the written fields; only post_date of a draft without a set date.', 'cinatra' ),
 		);
 	}
 	return array(
@@ -4826,7 +4899,7 @@ function cinatra_register_content_abilities(): void {
 		CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED,
 		array(
 			'label'               => __( 'Write a reviewed change to a post', 'cinatra' ),
-			'description'         => __( 'Write title, content and/or excerpt (and optionally move the post to draft) only if the post is unchanged since the read the review was based on. Refuses with post_changed, post_locked or invalid, and then writes nothing.', 'cinatra' ),
+			'description'         => __( 'Write title, content and/or excerpt of a published post or draft (and optionally move it to draft) only if the post is unchanged since the read the review was based on. Refuses with a code (for example post_changed, post_locked, unsupported_status, untouched_field_changed or invalid) and then writes nothing.', 'cinatra' ),
 			'category'            => CINATRA_ABILITY_CATEGORY,
 			'input_schema'        => array(
 				'type'                 => 'object',
@@ -4845,9 +4918,9 @@ function cinatra_register_content_abilities(): void {
 							'excerpt' => $text,
 							'status'  => $text,
 						),
-						'required'             => array( 'status' ),
+						'required'             => array( 'title', 'content', 'excerpt', 'status' ),
 						'additionalProperties' => false,
-						'description'          => __( 'The before-value of each written field, byte for byte as read, and always the post status as read.', 'cinatra' ),
+						'description'          => __( 'The title, content, excerpt and status as read, byte for byte; always all four.', 'cinatra' ),
 					),
 					'title'               => $text,
 					'content'             => $text,

@@ -26,7 +26,12 @@
  *     core's wp_update_post() (get_post() from the cache, then array_merge),
  *     and the ability passes the full locked row and cleans the cache;
  *   - slashing with backslashes and quotes;
- *   - the expected/written field pairing; the status values;
+ *   - expected holds title, content, excerpt and status ALWAYS, all compared;
+ *   - only publish and draft are written (unsupported_status otherwise); the
+ *     only status change is to draft;
+ *   - an untouched column changed by the save (core re-filters every content
+ *     field; another plugin hook) rolls back as untouched_field_changed;
+ *     the floating draft date is reported in also_changed;
  *   - the read (raw values, no lock, no transaction) and the registration.
  */
 
@@ -138,6 +143,15 @@ if (!function_exists('wp_update_post')) {
             $GLOBALS['cinatra_test']['post_cache'][$id] = $wpdb->rows[$id];
         }
         $merged = array_merge(wp_slash($GLOBALS['cinatra_test']['post_cache'][$id]), $postarr);
+        // Core: a draft whose date was never set ("floating", post_date_gmt
+        // zero) gets post_date = now on every save.
+        if ('draft' === ($merged['post_status'] ?? '') && '0000-00-00 00:00:00' === ($merged['post_date_gmt'] ?? '')) {
+            $merged['post_date'] = $GLOBALS['cinatra_test']['now'];
+        }
+        // A hook of another plugin that rewrites a column (test switch).
+        if (isset($GLOBALS['cinatra_test']['hook_rewrites'])) {
+            $merged = array_merge($merged, $GLOBALS['cinatra_test']['hook_rewrites']);
+        }
         foreach (array_keys($wpdb->rows[$id]) as $col) {
             if ('ID' === $col || 'post_modified_gmt' === $col || !array_key_exists($col, $merged)) {
                 continue;
@@ -208,6 +222,7 @@ function reset_fixture(array $overrides = []) {
             'post_name'         => 'about',
             'post_author'       => '3',
             'post_date_gmt'     => '2026-01-01 09:00:00',
+            'post_date'         => '2026-01-01 10:00:00',
         ],
         7 => [
             'ID'                => '7',
@@ -220,6 +235,7 @@ function reset_fixture(array $overrides = []) {
             'post_name'         => 'logo',
             'post_author'       => '3',
             'post_date_gmt'     => '2026-01-01 09:00:00',
+            'post_date'         => '2026-01-01 10:00:00',
         ],
     ];
     $GLOBALS['cinatra_test'] = array_merge([
@@ -262,11 +278,21 @@ function statement_kinds(): array {
     }, $wpdb->log);
 }
 
+/** The before-values of the whole reviewed post (the fixture page as read). */
+function full_expected(array $over = []): array {
+    return array_merge([
+        'title'   => 'About "us"',
+        'content' => T_CONTENT,
+        'excerpt' => 'Old excerpt',
+        'status'  => 'publish',
+    ], $over);
+}
+
 function base_update(array $extra = []): array {
     return array_merge([
         'post_id'             => T_ID,
         'if_unmodified_since' => T_MODIFIED,
-        'expected'            => ['content' => T_CONTENT, 'status' => 'publish'],
+        'expected'            => full_expected(),
         'content'             => '<p>New body</p>',
     ], $extra);
 }
@@ -340,7 +366,7 @@ check('ROLLBACK and no update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGI
 
 echo "Refusal: post_changed (byte-level difference, trailing space)\n";
 reset_fixture();
-$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => ['content' => T_CONTENT . ' ', 'status' => 'publish']]));
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['content' => T_CONTENT . ' '])]));
 check('a one-byte difference refuses', is_refusal($r, 'post_changed') && ['post_content'] === $r['data']['changed']);
 
 echo "Refusal: post_locked\n";
@@ -363,7 +389,7 @@ $wpdb->log = [];
 $forbidden = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => 5]));
 $forbidden_log = statement_kinds();
 $wpdb->log = [];
-$other_type = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => 7, 'expected' => ['content' => '', 'status' => 'inherit'], 'content' => 'x']));
+$other_type = cinatra_ability_post_update_if_unchanged(base_update(['post_id' => 7, 'expected' => ['title' => 'logo', 'content' => '', 'excerpt' => '', 'status' => 'inherit'], 'content' => 'x']));
 check('unknown post -> not_found', is_refusal($unknown, 'not_found'));
 check('forbidden post -> not_found', is_refusal($forbidden, 'not_found'));
 check('attachment (not post/page) -> not_found', is_refusal($other_type, 'not_found'));
@@ -412,7 +438,7 @@ $new_title   = 'Title with \\ and "quotes" and \'single\'';
 $r = cinatra_ability_post_update_if_unchanged([
     'post_id'             => T_ID,
     'if_unmodified_since' => T_MODIFIED,
-    'expected'            => ['content' => T_CONTENT, 'title' => 'About "us"', 'status' => 'publish'],
+    'expected'            => full_expected(),
     'content'             => $new_content,
     'title'               => $new_title,
 ]);
@@ -435,17 +461,19 @@ check('sanitized_fields names post_content', ['post_content'] === $r['sanitized_
 // ---------------------------------------------------------------------------
 echo "Pairing: written fields and expected entries must match\n";
 $pairing_cases = [
-    'written without expected'          => base_update(['expected' => ['status' => 'publish']]),
-    'expected without written'          => base_update(['expected' => ['content' => T_CONTENT, 'title' => 'About "us"', 'status' => 'publish']]),
-    'expected names an unknown field'   => base_update(['expected' => ['content' => T_CONTENT, 'status' => 'publish', 'slug' => 'x']]),
-    'non-string written value'          => base_update(['content' => ['x']]),
-    'non-string expected value'         => base_update(['expected' => ['content' => null, 'status' => 'publish']]),
-    'expected is not an object'         => base_update(['expected' => 'x']),
-    'expected.status missing'           => base_update(['expected' => ['content' => T_CONTENT]]),
-    'expected.status missing (status written)' => base_update(['status' => 'draft', 'expected' => ['content' => T_CONTENT]]),
+    'expected.title missing'            => base_update(['expected' => array_diff_key(full_expected(), ['title' => 1])]),
+    'expected.content missing (written)' => base_update(['expected' => array_diff_key(full_expected(), ['content' => 1])]),
+    'expected.excerpt missing'          => base_update(['expected' => array_diff_key(full_expected(), ['excerpt' => 1])]),
+    'expected.status missing'           => base_update(['expected' => array_diff_key(full_expected(), ['status' => 1])]),
+    'expected.status missing (status written)' => base_update(['status' => 'draft', 'expected' => array_diff_key(full_expected(), ['status' => 1])]),
     'status-only with empty expected'   => ['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => [], 'status' => 'draft'],
-    'non-string expected.status'        => base_update(['expected' => ['content' => T_CONTENT, 'status' => 1]]),
-    'nothing written'                   => ['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => ['status' => 'publish']],
+    'expected names an unknown field'   => base_update(['expected' => full_expected(['slug' => 'x'])]),
+    'non-string written value'          => base_update(['content' => ['x']]),
+    'non-string expected value'         => base_update(['expected' => full_expected(['excerpt' => null])]),
+    'non-string expected.status'        => base_update(['expected' => full_expected(['status' => 1])]),
+    'empty expected.status'             => base_update(['expected' => full_expected(['status' => ''])]),
+    'expected is not an object'         => base_update(['expected' => 'x']),
+    'nothing written'                   => ['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected()],
     'unknown top-level field'           => base_update(['post_date' => '2020-01-01 00:00:00']),
     'missing if_unmodified_since'       => array_diff_key(base_update(), ['if_unmodified_since' => 1]),
     'malformed if_unmodified_since'     => base_update(['if_unmodified_since' => '2026-11-25T10:00:00Z']),
@@ -466,15 +494,15 @@ $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft'])
 check('status draft with a field -> success, row is draft', true === $r['success'] && 'draft' === $wpdb->rows[T_ID]['post_status'] && 'draft' === $r['post_status']);
 check('wp_update_post received post_status draft', 'draft' === $GLOBALS['cinatra_test']['update_calls'][0]['post_status']);
 reset_fixture();
-$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => ['status' => 'publish'], 'status' => 'draft']);
+$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(), 'status' => 'draft']);
 check('status-only draft with expected.status -> success', true === $r['success'] && 'draft' === $wpdb->rows[T_ID]['post_status']);
 check('status-only write keeps the other fields from the locked row', T_CONTENT === $wpdb->rows[T_ID]['post_content'] && 'About "us"' === $wpdb->rows[T_ID]['post_title']);
 
 echo "Status: compared under the lock (same second, status changed by someone else)\n";
 reset_fixture();
-$wpdb->rows[T_ID]['post_status'] = 'private'; // same post_modified_gmt second
+$wpdb->rows[T_ID]['post_status'] = 'draft'; // unpublished by someone in the same post_modified_gmt second
 $before = $wpdb->rows;
-$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => ['status' => 'publish'], 'status' => 'draft']);
+$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(), 'status' => 'draft']);
 check('status-only write refuses post_changed naming post_status', is_refusal($r, 'post_changed') && ['post_status'] === $r['data']['changed']);
 check('nothing written', $before === $wpdb->rows);
 reset_fixture();
@@ -487,7 +515,7 @@ reset_fixture();
 $wpdb->rows[T_ID]['post_title'] = 'Title B (saved by someone, in the DB)';
 $GLOBALS['cinatra_test']['post_cache'][T_ID]['post_title'] = 'Title A (stale cache)';
 $GLOBALS['cinatra_test']['post_cache'][T_ID]['post_name']  = 'stale-slug';
-$r = cinatra_ability_post_update_if_unchanged(base_update());
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['title' => 'Title B (saved by someone, in the DB)'])]));
 check('content-only write succeeds', true === ($r['success'] ?? null));
 check('the DB title B survives (not the stale cached A)', 'Title B (saved by someone, in the DB)' === $wpdb->rows[T_ID]['post_title']);
 check('the DB slug survives (not the stale cached slug)', 'about' === $wpdb->rows[T_ID]['post_name']);
@@ -500,6 +528,80 @@ foreach (['publish', 'pending', 'private', 'future', 'trash', 'Draft', ''] as $b
     $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => $bad]));
     check("status \"$bad\" -> invalid, no statement", is_refusal($r, 'invalid') && [] === statement_kinds());
 }
+
+// ---------------------------------------------------------------------------
+echo "Expected: the whole reviewed post is compared (same-second change to an UNWRITTEN field)\n";
+reset_fixture();
+$wpdb->rows[T_ID]['post_title'] = 'Retitled by someone in the same second';
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('content write refuses when the unwritten title changed', is_refusal($r, 'post_changed') && ['post_title'] === $r['data']['changed']);
+check('nothing written', $before === $wpdb->rows);
+reset_fixture();
+$wpdb->rows[T_ID]['post_content'] = T_CONTENT . ' changed';
+$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(), 'status' => 'draft']);
+check('status-only unpublish refuses when the content is not what was reviewed', is_refusal($r, 'post_changed') && ['post_content'] === $r['data']['changed']);
+reset_fixture();
+$wpdb->rows[T_ID]['post_excerpt'] = 'Other excerpt';
+$r = cinatra_ability_post_update_if_unchanged(base_update(['title' => 'T', 'content' => 'C']));
+check('unwritten excerpt change refuses too', is_refusal($r, 'post_changed') && ['post_excerpt'] === $r['data']['changed']);
+
+// ---------------------------------------------------------------------------
+echo "State: only published posts and drafts are written\n";
+foreach (['pending', 'future', 'private', 'trash', 'auto-draft'] as $state) {
+    reset_fixture();
+    $wpdb->rows[T_ID]['post_status'] = $state;
+    $before = $wpdb->rows;
+    $r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => $state])]));
+    check("current status $state -> unsupported_status", is_refusal($r, 'unsupported_status') && $state === ($r['data']['current_status'] ?? null));
+    check("current status $state -> ROLLBACK, no update", ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds() && $before === $wpdb->rows);
+}
+reset_fixture();
+$wpdb->rows[T_ID]['post_status'] = 'trash';
+$r = cinatra_ability_post_update_if_unchanged(['post_id' => T_ID, 'if_unmodified_since' => T_MODIFIED, 'expected' => full_expected(['status' => 'trash']), 'status' => 'draft']);
+check('trash -> draft ("restore" outside the untrash flow) is refused', is_refusal($r, 'unsupported_status') && 'trash' === $wpdb->rows[T_ID]['post_status']);
+reset_fixture();
+$wpdb->rows[T_ID]['post_status'] = 'draft';
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft'])]));
+check('a draft is edited', true === $r['success'] && 'draft' === $r['post_status']);
+reset_fixture();
+$wpdb->rows[T_ID]['post_status'] = 'draft';
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft']), 'status' => 'draft']));
+check('status draft on a draft is allowed (no change)', true === $r['success'] && 'draft' === $r['post_status']);
+
+// ---------------------------------------------------------------------------
+echo "Untouched columns: never changed silently\n";
+// A title-only request by a user without unfiltered_html:
+reset_fixture(['unfiltered_html' => false]);
+$wpdb->rows[T_ID]['post_content'] = '<p>Admin markup</p><script>track()</script>';
+$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged([
+    'post_id'             => T_ID,
+    'if_unmodified_since' => T_MODIFIED,
+    'expected'            => full_expected(['content' => '<p>Admin markup</p><script>track()</script>']),
+    'title'               => 'New title',
+]);
+check('title-only edit by a restricted user whose save would re-filter the untouched body -> untouched_field_changed', is_refusal($r, 'untouched_field_changed') && ['post_content'] === $r['data']['changed']);
+check('the body markup is not lost (rolled back)', $before === $wpdb->rows);
+check('the refusal does not echo the body', false === strpos(json_encode($r), 'track()'));
+check('statements: update ran, then ROLLBACK, no COMMIT', !in_array('COMMIT', statement_kinds(), true) && in_array('ROLLBACK', statement_kinds(), true));
+reset_fixture(['hook_rewrites' => ['post_name' => 'changed-by-a-hook']]);
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a hook that rewrites an untouched column -> untouched_field_changed naming it', is_refusal($r, 'untouched_field_changed') && ['post_name'] === $r['data']['changed'] && $before === $wpdb->rows);
+reset_fixture();
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('a normal write reports no other change', true === $r['success'] && [] === $r['also_changed']);
+reset_fixture();
+$wpdb->rows[T_ID]['post_status']   = 'draft';
+$wpdb->rows[T_ID]['post_date_gmt'] = '0000-00-00 00:00:00';
+$GLOBALS['cinatra_test']['post_cache'][T_ID] = $wpdb->rows[T_ID];
+$r = cinatra_ability_post_update_if_unchanged(base_update(['expected' => full_expected(['status' => 'draft'])]));
+check('a floating-date draft: core moves post_date to now; success reports it in also_changed', true === $r['success'] && ['post_date'] === $r['also_changed'] && T_NOW === $wpdb->rows[T_ID]['post_date']);
+reset_fixture(['hook_rewrites' => ['post_date' => '2030-01-01 00:00:00']]);
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('post_date change on a fixed-date post -> untouched_field_changed', is_refusal($r, 'untouched_field_changed') && ['post_date'] === $r['data']['changed']);
 
 // ---------------------------------------------------------------------------
 echo "Errors: rollback on update failure, start failure and commit failure\n";
