@@ -259,9 +259,26 @@ function cinatra_it_post( string $status, string $content ): int {
  */
 function cinatra_it_record_query( $query ) {
 	if ( $GLOBALS['cinatra_it_recording'] ) {
-		$GLOBALS['cinatra_it_sql'][] = (string) $query;
+		$GLOBALS['cinatra_it_filtered'][] = (string) $query;
 	}
 	return $query;
+}
+
+/**
+ * Every statement sent since cinatra_it_record(), as wpdb logged it
+ * ( SAVEQUERIES: no hook, so the ability's control statements, which run
+ * with the query filter suspended, are included ).
+ *
+ * @return string[] The statements.
+ */
+function cinatra_it_sql(): array {
+	global $wpdb;
+	return array_map(
+		function ( $entry ) {
+			return (string) $entry[0];
+		},
+		array_slice( (array) $wpdb->queries, (int) $GLOBALS['cinatra_it_q0'] )
+	);
 }
 
 /**
@@ -270,7 +287,9 @@ function cinatra_it_record_query( $query ) {
  * @return void
  */
 function cinatra_it_record(): void {
-	$GLOBALS['cinatra_it_sql']       = array();
+	global $wpdb;
+	$GLOBALS['cinatra_it_q0']        = count( (array) $wpdb->queries );
+	$GLOBALS['cinatra_it_filtered']  = array();
 	$GLOBALS['cinatra_it_recording'] = true;
 }
 
@@ -282,7 +301,7 @@ function cinatra_it_record(): void {
 function cinatra_it_probe_statements(): array {
 	return array_values(
 		array_filter(
-			$GLOBALS['cinatra_it_sql'],
+			cinatra_it_sql(),
 			function ( $sql ) {
 				return 1 === preg_match( '/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) /', $sql );
 			}
@@ -298,7 +317,7 @@ function cinatra_it_probe_statements(): array {
  */
 function cinatra_it_publish_stored(): bool {
 	global $wpdb;
-	foreach ( $GLOBALS['cinatra_it_sql'] as $sql ) {
+	foreach ( cinatra_it_sql() as $sql ) {
 		if ( preg_match( '/^\s*UPDATE\s+`?' . preg_quote( $wpdb->posts, '/' ) . '`?\s.*`?post_status`?\s*=\s*\'publish\'/is', $sql ) ) {
 			return true;
 		}
@@ -357,16 +376,24 @@ function cinatra_it_case( string $name, callable $run ): void {
 
 $GLOBALS['cinatra_it_posts']     = array();
 $GLOBALS['cinatra_it_editor']    = 0;
+$GLOBALS['cinatra_it_users']     = array();
 $GLOBALS['cinatra_it_recording'] = false;
-$GLOBALS['cinatra_it_sql']       = array();
+$GLOBALS['cinatra_it_q0']         = 0;
+$GLOBALS['cinatra_it_filtered']   = array();
 $GLOBALS['cinatra_it_current']   = 'setup';
 $GLOBALS['cinatra_it_option']    = 'cinatra_it_foreign_probe';
 $cinatra_it_failure              = null;
 
+// The statement log ( wpdb::$queries ) needs SAVEQUERIES; the query filter
+// below is the site filter the ability must suspend for its control statements.
+if ( ! defined( 'SAVEQUERIES' ) ) {
+	define( 'SAVEQUERIES', true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedConstantFound -- Core's constant.
+}
 add_filter( 'query', 'cinatra_it_record_query' );
 
 try {
 	global $wpdb;
+	cinatra_it_assert( SAVEQUERIES, 'SAVEQUERIES is defined false: the statement log needs it (setup)' );
 
 	$admin = get_user_by( 'login', 'admin' );
 	if ( ! $admin ) {
@@ -462,7 +489,7 @@ try {
 				if ( (int) $post_id === $id ) {
 					$seen[] = array(
 						'tracker_open' => cinatra_content_transaction()['open'],
-						'commit_seen'  => in_array( 'COMMIT', $GLOBALS['cinatra_it_sql'], true ),
+						'commit_seen'  => in_array( 'COMMIT', cinatra_it_sql(), true ),
 						'diag'         => cinatra_it_diag(),
 					);
 				}
@@ -510,8 +537,8 @@ try {
 			cinatra_it_assert( true === ( $result['success'] ?? null ), 'the update did not succeed', $result );
 			$row = cinatra_it_row( $id );
 			cinatra_it_assert( 'draft' === $row['post_status'] && 'draft' === $result['post_status'], 'the post was not stored as draft', array( $row['post_status'], $result['post_status'] ?? null ) );
-			cinatra_it_assert( ! cinatra_it_publish_stored(), 'a statement stored post_status publish', $GLOBALS['cinatra_it_sql'] );
-			return count( $GLOBALS['cinatra_it_sql'] ) . ' statements recorded, none stores publish';
+			cinatra_it_assert( ! cinatra_it_publish_stored(), 'a statement stored post_status publish', cinatra_it_sql() );
+			return count( cinatra_it_sql() ) . ' statements recorded, none stores publish';
 		}
 	);
 
@@ -684,7 +711,7 @@ try {
 			}
 			cinatra_it_assert( cinatra_it_refused( $result, 'site_policy_conflict' ), 'the publishing filter was not refused with site_policy_conflict', $result );
 			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
-			cinatra_it_assert( ! cinatra_it_publish_stored(), 'a statement stored post_status publish', $GLOBALS['cinatra_it_sql'] );
+			cinatra_it_assert( ! cinatra_it_publish_stored(), 'a statement stored post_status publish', cinatra_it_sql() );
 			return 'changed=' . wp_json_encode( $result['data']['changed'] ?? null );
 		}
 	);
@@ -747,59 +774,76 @@ try {
 	);
 
 	cinatra_it_case(
-		'a query filter ends the transaction before the locked read -> write_outcome_unknown ( differs ); no permission filter, save filter or pre_post_update runs, no UPDATE is sent',
+		'site query filters are suspended for the control statements: a filter that would act at START TRANSACTION or the locked read is never called for them; the save succeeds, the filters are back, no transaction stays open',
 		function () {
 			global $wpdb;
-			$id      = cinatra_it_post( 'publish', 'body' );
-			$read    = cinatra_it_read( $id );
-			$before  = cinatra_it_row( $id );
-			$ran     = 0;
-			$counter = function ( $data ) use ( &$ran ) {
-				++$ran;
-				return $data;
-			};
-			$end     = function ( $query ) use ( &$end ) {
+			$id     = cinatra_it_post( 'publish', 'body' );
+			$read   = cinatra_it_read( $id );
+			$acted  = array();
+			$act    = function ( $query ) use ( &$acted ) {
 				global $wpdb;
-				if ( false !== strpos( (string) $query, 'FOR UPDATE' ) ) {
-					// Ends this save's transaction right before its locked read:
-					// the read then runs with autocommit and locks nothing.
-					remove_filter( 'query', $end );
-					$wpdb->query( 'COMMIT' );
+				$q = trim( (string) $query );
+				if ( 'START TRANSACTION' === $q || false !== strpos( $q, 'FOR UPDATE' ) || 0 === strpos( $q, 'SAVEPOINT' ) || 'COMMIT' === $q ) {
+					$acted[] = $q;
+					$wpdb->query( 'SELECT 1' );
 				}
 				return $query;
 			};
-			$caps    = 0;
-			$cap_rec = function ( $allcaps ) use ( &$caps ) {
-				++$caps;
-				return $allcaps;
-			};
-			$input   = cinatra_it_input( $read, array( 'content' => 'must not be written' ) );
-			add_filter( 'wp_insert_post_data', $counter );
-			add_action( 'pre_post_update', $counter );
-			add_filter( 'user_has_cap', $cap_rec );
-			add_filter( 'query', $end );
+			add_filter( 'query', $act, 5 );
+			$hook = $GLOBALS['wp_filter']['query'];
 			cinatra_it_record();
 			try {
-				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, $input );
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it filters suspended' ) ) );
 			} finally {
 				$GLOBALS['cinatra_it_recording'] = false;
-				remove_filter( 'query', $end );
-				remove_filter( 'user_has_cap', $cap_rec );
-				remove_filter( 'wp_insert_post_data', $counter );
-				remove_action( 'pre_post_update', $counter );
+				$back = $GLOBALS['wp_filter']['query'] ?? null;
+				remove_filter( 'query', $act, 5 );
 			}
-			$updates = array_filter(
-				$GLOBALS['cinatra_it_sql'],
-				function ( $sql ) use ( $wpdb ) {
-					return 0 === strpos( ltrim( $sql ), 'UPDATE `' . $wpdb->posts . '`' );
-				}
+			$sent     = cinatra_it_sql();
+			$filtered = $GLOBALS['cinatra_it_filtered'];
+			cinatra_it_assert( true === ( $result['success'] ?? null ), 'the save did not succeed', $result );
+			cinatra_it_assert( array() === $acted, 'a site query filter ran for a control statement', $acted );
+			cinatra_it_assert( in_array( 'START TRANSACTION', $sent, true ) && in_array( 'COMMIT', $sent, true ) && ! in_array( 'COMMIT', $filtered, true ), 'the statement log and the filter view do not show the suspension', array( $sent, $filtered ) );
+			cinatra_it_assert( 1 === count( preg_grep( '/^UPDATE `/', $filtered ) ), 'the site filter did not see the UPDATE', $filtered );
+			cinatra_it_assert( $hook === $back && 10 === has_filter( 'query', 'cinatra_it_record_query' ), 'the query hook object or its callbacks were not restored' );
+			cinatra_it_assert( '' === cinatra_content_open_transaction_state() && false === cinatra_content_transaction()['open'], 'a transaction stayed open after the save', cinatra_it_diag() );
+			return 'filter calls on control statements: 0';
+		}
+	);
+
+	cinatra_it_case(
+		'a caller without edit_post on an existing post gets the same not_found as for a missing post, with no FOR UPDATE',
+		function () {
+			$id      = cinatra_it_post( 'publish', 'body' );
+			$read    = cinatra_it_read( $id );
+			$user_id = wp_insert_user(
+				array(
+					'user_login' => 'cinatra-it-author-' . wp_generate_password( 8, false ),
+					'user_pass'  => wp_generate_password( 24 ),
+					'user_email' => 'cinatra-it-' . wp_generate_password( 8, false ) . '@example.com',
+					'role'       => 'author',
+				)
 			);
-			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'differs' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'the lost transaction was not answered write_outcome_unknown ( differs )', $result );
-			cinatra_it_assert( 0 === $ran, 'a save filter or pre_post_update ran although the transaction was lost', $ran );
-			cinatra_it_assert( 0 === $caps, 'the permission check ran although the transaction was lost', $caps );
-			cinatra_it_assert( array() === $updates, 'an UPDATE of the posts table was sent', array_values( $updates ) );
-			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'something was written' );
-			return 'refused before any callback';
+			cinatra_it_assert( ! is_wp_error( $user_id ), 'the author user could not be created', is_wp_error( $user_id ) ? $user_id->get_error_message() : null );
+			$GLOBALS['cinatra_it_users'][] = (int) $user_id;
+			wp_set_current_user( (int) $user_id );
+			try {
+				cinatra_it_record();
+				$forbidden      = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'must not be written' ) ) );
+				$forbidden_sql  = cinatra_it_sql();
+				$missing_input  = cinatra_it_input( $read, array( 'content' => 'must not be written' ) );
+				$missing_input['post_id'] = PHP_INT_MAX;
+				cinatra_it_record();
+				$missing     = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, $missing_input );
+				$missing_sql = cinatra_it_sql();
+			} finally {
+				$GLOBALS['cinatra_it_recording'] = false;
+				wp_set_current_user( (int) $GLOBALS['cinatra_it_admin'] );
+			}
+			$locks = preg_grep( '/FOR UPDATE|START TRANSACTION/', array_merge( $forbidden_sql, $missing_sql ) );
+			cinatra_it_assert( cinatra_it_refused( $forbidden, 'not_found' ) && $forbidden === $missing, 'the forbidden and the missing post do not get the same answer', array( $forbidden, $missing ) );
+			cinatra_it_assert( array() === $locks, 'a lock or transaction was taken for a caller who may not edit', array_values( $locks ) );
+			return 'code=not_found, no lock';
 		}
 	);
 
@@ -852,11 +896,14 @@ try {
 				$GLOBALS['cinatra_it_recording'] = false;
 				remove_action( 'pre_post_update', $own );
 			}
-			$sent  = $GLOBALS['cinatra_it_sql'];
+			$sent  = cinatra_it_sql();
 			$start = array_search( 'START TRANSACTION', array_reverse( $sent, true ), true );
 			$after = false === $start ? array() : array_slice( $sent, $start + 1 );
+			$lost = cinatra_content_transaction();
 			// The callback's own transaction: it commits it.
 			$wpdb->query( 'COMMIT' );
+			cinatra_it_assert( false === $lost['open'] && true === ( $lost['lost'] ?? null ), 'the tracker pretends the connection is clean after the loss', $lost );
+			cinatra_it_assert( '' === cinatra_content_open_transaction_state(), 'a transaction is still open after the callback committed its own', cinatra_it_diag() );
 			$kept = $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = 'cinatra_it_independent'", $id ) );
 			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'differs' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'not answered write_outcome_unknown ( differs )', $result );
 			cinatra_it_assert( array() === array_intersect( array( 'ROLLBACK', 'COMMIT' ), $after ), 'the ability sent COMMIT or ROLLBACK into the callback\'s transaction', $after );
@@ -867,22 +914,21 @@ try {
 	);
 
 	cinatra_it_case(
-		'a query filter ROLLs BACK right before the COMMIT -> write_outcome_unknown ( differs ), never success, no after-save hook',
+		'a query filter that would ROLL BACK at the COMMIT is not called for it: the save succeeds with its after-save hooks',
 		function () {
-			global $wpdb;
 			$id      = cinatra_it_post( 'publish', 'body' );
 			$read    = cinatra_it_read( $id );
-			$before  = cinatra_it_row( $id );
 			$updated = 0;
+			$called  = 0;
 			$after   = function ( $post_id ) use ( &$updated, $id ) {
 				if ( (int) $post_id === $id ) {
 					++$updated;
 				}
 			};
-			$undo    = function ( $query ) use ( &$undo ) {
+			$undo    = function ( $query ) use ( &$called ) {
 				global $wpdb;
 				if ( 'COMMIT' === trim( (string) $query ) ) {
-					remove_filter( 'query', $undo );
+					++$called;
 					$wpdb->query( 'ROLLBACK' );
 				}
 				return $query;
@@ -890,34 +936,34 @@ try {
 			add_action( 'post_updated', $after );
 			add_filter( 'query', $undo );
 			try {
-				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it rolled back by a filter' ) ) );
+				$result = cinatra_it_call( CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED, cinatra_it_input( $read, array( 'content' => 'cinatra-it committed' ) ) );
 			} finally {
 				remove_filter( 'query', $undo );
 				remove_action( 'post_updated', $after );
 			}
-			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown', 'differs' ), 'the rolled-back write was not answered write_outcome_unknown ( differs )', $result );
-			cinatra_it_assert( 0 === $updated, 'after-save hooks ran for an absent write' );
-			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'the row changed (setup)' );
-			return 'cause=differs, no hook';
+			cinatra_it_assert( true === ( $result['success'] ?? null ) && 0 === $called, 'the filter was called for the COMMIT or the save failed', array( $result, $called ) );
+			cinatra_it_assert( 1 === $updated && 'cinatra-it committed' === cinatra_it_row( $id )['post_content'], 'the committed save or its hook is missing' );
+			return 'filter calls at COMMIT: 0';
 		}
 	);
 
 	cinatra_it_case(
-		'a query filter COMMITs right before the ROLLBACK of a refusal -> write_outcome_unknown, never "nothing written"',
+		'a query filter that would COMMIT at the ROLLBACK of a refusal is not called for it: the refusal rolls everything back',
 		function () {
-			global $wpdb;
-			$id    = cinatra_it_post( 'publish', 'body' );
-			$read  = cinatra_it_read( $id );
-			$slug  = function ( $post_id ) use ( $id ) {
+			$id     = cinatra_it_post( 'publish', 'body' );
+			$read   = cinatra_it_read( $id );
+			$before = cinatra_it_row( $id );
+			$called = 0;
+			$slug   = function ( $post_id ) use ( $id ) {
 				global $wpdb;
 				if ( (int) $post_id === $id ) {
 					$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->posts} SET post_name = 'cinatra-it-by-a-callback' WHERE ID = %d", $id ) );
 				}
 			};
-			$keep  = function ( $query ) use ( &$keep ) {
+			$keep   = function ( $query ) use ( &$called ) {
 				global $wpdb;
 				if ( 'ROLLBACK' === trim( (string) $query ) ) {
-					remove_filter( 'query', $keep );
+					++$called;
 					$wpdb->query( 'COMMIT' );
 				}
 				return $query;
@@ -930,9 +976,9 @@ try {
 				remove_filter( 'query', $keep );
 				remove_action( 'pre_post_update', $slug );
 			}
-			cinatra_it_assert( cinatra_it_refused( $result, 'write_outcome_unknown' ) && true === ( $result['data']['site_changes_possible'] ?? null ), 'the refusal claimed nothing was written although its transaction was committed', $result );
-			cinatra_it_assert( 'cinatra-it-by-a-callback' === cinatra_it_row( $id )['post_name'], 'the committed change is missing (setup)' );
-			return 'cause=' . ( $result['data']['cause'] ?? '?' );
+			cinatra_it_assert( cinatra_it_refused( $result, 'site_policy_conflict' ) && 0 === $called, 'not a clean refusal, or the filter ran at the ROLLBACK', array( $result, $called ) );
+			cinatra_it_assert( cinatra_it_row( $id ) === $before, 'the refused save left a change behind' );
+			return 'filter calls at ROLLBACK: 0';
 		}
 	);
 
@@ -1166,9 +1212,11 @@ try {
 	}
 	$wpdb->delete( $wpdb->options, array( 'option_name' => $GLOBALS['cinatra_it_option'] ) );
 	$wpdb->delete( $wpdb->options, array( 'option_name' => $GLOBALS['cinatra_it_option'] . '_after' ) );
-	if ( 0 < $GLOBALS['cinatra_it_editor'] ) {
-		require_once ABSPATH . 'wp-admin/includes/user.php';
-		wp_delete_user( $GLOBALS['cinatra_it_editor'] );
+	require_once ABSPATH . 'wp-admin/includes/user.php';
+	foreach ( array_merge( array( $GLOBALS['cinatra_it_editor'] ), $GLOBALS['cinatra_it_users'] ) as $cinatra_it_user_id ) {
+		if ( 0 < $cinatra_it_user_id ) {
+			wp_delete_user( $cinatra_it_user_id );
+		}
 	}
 }
 

@@ -229,58 +229,58 @@ made in the transaction are rolled back with it.
   names those columns. Nothing is written, and no after-save hook runs.
 - The ability owns exactly one transaction, and it claims an outcome only
   while it can show that this transaction is intact:
-  - At the start, it reads this session's statement counters
-    (`SHOW SESSION STATUS`: `Questions`, `Com_commit`, `Com_rollback`; no
-    privilege needed), sends `START TRANSACTION` and three savepoints with a
-    random name (`cinatra_lock_<random>_1` to `_3`), and reads the counters
-    again. They must show exactly these statements: no site code (a `query`
-    filter) ran a statement in between.
-  - After the row lock, before any site code runs (the permission check's
-    filters, the save filters, `wp_insert_post_data`, `pre_post_update`),
-    and again right before the update, it releases one savepoint
-    (`RELEASE SAVEPOINT`, the last one first; none is set again). Outside a
+  - Its own control statements (the open-transaction probe, `START
+    TRANSACTION`, the savepoints and their release, the session settings,
+    the locked read, the engine check, the read-back, `COMMIT` and
+    `ROLLBACK`) run with the site's callbacks on WordPress's `query` filter
+    taken out for exactly that statement, and put back (the same hook
+    object) afterwards, also after an exception. The same holds for the
+    other hooks that WordPress can run inside a statement
+    (`log_query_custom_data` with `SAVEQUERIES`, `pre_get_table_charset` and
+    `pre_get_col_charset` for a statement that is not plain ASCII,
+    `incompatible_sql_modes` on a reconnect); database errors are kept out
+    of the error output then, so no translation filter runs either. So no
+    site code can act between two of these statements. The site's own
+    statements, and the update itself, keep their `query` filters.
+  - Right after `START TRANSACTION` it sets four savepoints with a random
+    name (`cinatra_lock_<random>_1` to `_4`). After the row lock, before any
+    site code runs, it releases `_4`; right before the update `_3`; right
+    before `COMMIT` or `ROLLBACK` `_2`. None is set again; `_1` stays as the
+    mark that the transaction is still the one it started. Outside a
     transaction MySQL and MariaDB accept `SAVEPOINT` but keep nothing, and a
     `COMMIT`, a `ROLLBACK`, a statement that commits implicitly, a new
-    transaction and a reconnect remove all savepoints, so the release fails.
-    The connection object must also be the same one.
-  - It ends with `COMMIT` or `ROLLBACK` in a second counted window: counters,
-    the session settings, the release of the first savepoint, the `COMMIT`
-    or `ROLLBACK`, counters. The counters must show exactly these statements
-    and one `COMMIT` or one `ROLLBACK`, and every statement must succeed on
-    the same connection object.
-  - If any of this cannot be shown (site code committed, rolled back or
-    began a transaction, a savepoint is gone, the connection was replaced, or
-    an update, `COMMIT` or `ROLLBACK` was not acknowledged), the ability
-    sends nothing more on the connection: no `ROLLBACK`, no `COMMIT`, no
-    retry, because a transaction that is open now is not its own. It runs no
-    after-save hook. It reads the row and answers `write_outcome_unknown`
-    with `data.site_changes_possible` `true`: `data.cause` is `matches` only
-    if the row is exactly the intended row, otherwise `differs` (also when
-    the row is the row before the save: that does not prove that nothing was
-    written) or `unreadable`. The answer is never a success and never says
-    that nothing was written.
-  - So "refused, nothing written" and "saved" are answered only when the
-    transaction was shown intact up to and including its own acknowledged
-    `COMMIT` or `ROLLBACK`. After a shown `COMMIT` no transaction is open:
-    `completion_type` `NO_CHAIN` starts none, and with `autocommit` 1 the
-    last counter read starts none. Only then do the after-save and revision
+    transaction and a reconnect end the transaction and remove all
+    savepoints. The connection object must also stay the same.
+  - It sends its own `ROLLBACK` only for a transaction it started itself:
+    right after `START TRANSACTION` (when the savepoints cannot be set;
+    nothing else has run), or later while `_1` still releases on the same
+    connection, for example after a `COMMIT` that was not acknowledged. Then
+    nothing was written.
+  - If `_1` does not release, the transaction it started has already ended,
+    and a transaction that is open now belongs to site code. The ability
+    then sends nothing more on the connection, records that state (its
+    shutdown handler then does nothing, because rolling back would discard
+    the site's writes), runs no after-save hook, reads the row and answers
+    `write_outcome_unknown` with `data.site_changes_possible` `true`:
+    `data.cause` is `matches` only if the row is exactly the intended row,
+    otherwise `differs` (also when the row is the row before the save: that
+    does not prove that nothing was written) or `unreadable`.
+  - "Saved" is answered only after an acknowledged `COMMIT` that followed the
+    release of `_2`; then no transaction is open: `completion_type`
+    `NO_CHAIN` starts none (checked before the start and again right before
+    `COMMIT`; if site code changed it or `autocommit` during the save, the
+    ability rolls its own transaction back and refuses with
+    `transaction_conflict`), and only then do the after-save and revision
     hooks run.
-  - The proof depends on `autocommit` 1 and `completion_type` `NO_CHAIN`
-    (read before the start and again in the last window) and on readable
-    session counters. A session with `completion_type` `CHAIN` or `RELEASE`
-    is refused with `transaction_conflict` (`data.cause`
-    `completion_type`); unreadable counters with `unsupported_storage`.
-    Both are refused before anything is written.
+  - Preconditions, refused before anything is written: a database class
+    other than WordPress's own `wpdb` (a `db.php` drop-in, which can run
+    anything inside a statement) with `unsupported_storage`; `autocommit` 0
+    and `completion_type` other than `NO_CHAIN` with `transaction_conflict`.
   - What remains: site code that reads the savepoint names from the
-    statements, ends the transaction, begins a new one and sets the same
-    names again before the next release, or that rewrites the ability's own
-    statements in its `query` filter, is deliberate interference that no
-    check on the same connection can rule out. No portable statement can
-    tell inside the update itself whether it runs in this transaction
-    (`@@in_transaction` exists only in MariaDB, and
-    `information_schema.INNODB_TRX` needs the `PROCESS` privilege), and
-    WordPress offers no supported way to send a statement without the
-    `query` filters.
+    statements and re-creates them in a new transaction, or sends `RELEASE`
+    or `ROLLBACK TO` for them, is deliberate interference that no check on
+    the same connection can rule out. A reconnect that fails ends the
+    request inside WordPress (`dead_db()`, `wp_die()`).
 - A failed database read is a database error, never `not_found`: the locked
   read, the engine check and the read of `cinatra/post-read` answer
   `db_error` with `data.cause` `lock_wait_timeout` (error 1205, another save
@@ -390,8 +390,11 @@ from the database again. The post must equal the row before the capability
 check and again after it. If it does not (for example, an object-cache drop-in
 keeps an older entry, or site code changes what `get_post()` returns), the
 decision cannot be verified. The read then reads the row again once, because
-another save can occur between its read and its check. The write holds the
-row lock, so it refuses at once. The refusal is `permission_unverified`:
+another save can occur between its read and its check. The write does the
+same before it takes any lock or starts a transaction, so a caller who may
+not edit the post gets the same `not_found` as for a missing post, and
+neither takes a lock. Under the row lock it checks again (the post may have
+changed) and then refuses at once. The refusal is `permission_unverified`:
 nothing is read or written, and the answer contains no post content. A site's
 capability policy that reads post meta or terms reads data outside the row,
 which this check does not cover.
