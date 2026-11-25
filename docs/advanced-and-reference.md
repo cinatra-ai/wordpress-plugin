@@ -95,8 +95,8 @@ The caller must be logged in and have the `edit_post` capability for the post.
 A post that does not exist, a post that is not a post or a page, and a post
 that the caller may not edit all give the same answer, `not_found`, so the
 answer does not show whether the post exists. A failed database read gives
-`db_error`. A refusal is a normal result, `{success: false, code, message,
-data}`, and never contains post content.
+`db_error`. A refusal is a normal result with the fields `success` (false), `code`,
+`message` and `data`, and never contains post content.
 
 ## Compatibility
 
