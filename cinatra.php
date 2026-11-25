@@ -4365,64 +4365,58 @@ function cinatra_content_can_edit( $input = array() ): bool {
 }
 
 /**
- * The post fields core's map_meta_cap() reads for edit_post, through
- * get_post(): ID ( the privacy policy page check ), post_type, post_author,
- * post_status, and post_parent ( for a revision ). For a trashed post it
- * also reads the _wp_trash_meta_status meta, which is outside the row.
+ * Whether a post object holds exactly the given row: every column of the row,
+ * compared through the row token's canonical encoding. map_meta_cap() reads
+ * the post through get_post() ( core reads ID, post_type, post_author,
+ * post_status and, for a revision, post_parent; a site's own policy may read
+ * any other column ), so the whole row is compared, not a field list.
  *
- * @return string[] Field names.
+ * @param mixed                $post The object get_post() returned.
+ * @param array<string,string> $row  Posts-table row ( every column ).
+ * @return bool True when the object's columns equal the row.
  */
-function cinatra_content_capability_fields(): array {
-	return array( 'ID', 'post_type', 'post_author', 'post_status', 'post_parent' );
-}
-
-/**
- * Whether get_post() - the road map_meta_cap() takes - returns the given
- * row's capability fields.
- *
- * @param array<string,string> $row Posts-table row.
- * @return bool True when they all match.
- */
-function cinatra_content_get_post_matches_row( array $row ): bool {
-	$post = get_post( (int) $row['ID'] );
+function cinatra_content_post_matches_row( $post, array $row ): bool {
 	if ( ! $post instanceof WP_Post ) {
 		return false;
 	}
-	foreach ( cinatra_content_capability_fields() as $field ) {
-		if ( (string) $post->$field !== (string) $row[ $field ] ) {
+	$fields = array();
+	foreach ( array_keys( $row ) as $column ) {
+		if ( ! property_exists( $post, $column ) ) {
 			return false;
 		}
+		$fields[ $column ] = $post->$column;
 	}
-	return true;
+	return hash_equals( cinatra_content_row_token( $row ), cinatra_content_row_token( $fields ) );
 }
 
 /**
- * Capability check that is PROVABLY decided on a fresh row. The row is put
- * into the object cache exactly as WP_Post::get_instance() caches a raw row,
- * so current_user_can() ( map_meta_cap reads the post through get_post() )
- * decides on this row and not on an older cached copy. Because that can fail
- * ( wp_cache_set() fails, an object-cache drop-in ignores it, site code
- * changes what get_post() returns ), get_post() is read back before and
- * after the decision and must return the row's capability fields both times;
- * otherwise the decision is not verifiable and the answer is "unverified".
- * The write calls it while it holds the row lock.
+ * Capability check that is PROVABLY decided on a fresh row, without writing
+ * the shared object cache. current_user_can() decides on what get_post()
+ * returns. When that is not the fresh row, the post's cache is invalidated by
+ * core's own road ( clean_post_cache(), which cannot install data ) and
+ * get_post() reloads it from the database. The object get_post() returns must
+ * equal the fresh row over every column before the decision and again after
+ * it; otherwise ( a drop-in served something else, site code changed what
+ * get_post() returns, or another request committed in between ) the decision
+ * is not verifiable.
  *
  * @param array<string,string> $row Posts-table row ( every column ).
- * @return string "allowed", "denied" or "unverified".
+ * @return array{0:string,1:WP_Post|null} "allowed", "denied" or "unverified", and the verified post object.
  */
-function cinatra_content_row_permission( array $row ): string {
-	$id             = (int) $row['ID'];
-	$cached         = (object) $row;
-	$cached->filter = 'raw';
-	wp_cache_set( $id, $cached, 'posts' );
-	if ( ! cinatra_content_get_post_matches_row( $row ) ) {
-		return 'unverified';
+function cinatra_content_row_permission( array $row ): array {
+	$id = (int) $row['ID'];
+	if ( ! cinatra_content_post_matches_row( get_post( $id ), $row ) ) {
+		clean_post_cache( $id );
+		if ( ! cinatra_content_post_matches_row( get_post( $id ), $row ) ) {
+			return array( 'unverified', null );
+		}
 	}
 	$allowed = (bool) current_user_can( 'edit_post', $id ); // phpcs:ignore WordPress.WP.Capabilities.Undetermined -- edit_post is a core meta capability resolved per object.
-	if ( ! cinatra_content_get_post_matches_row( $row ) ) {
-		return 'unverified';
+	$post    = get_post( $id );
+	if ( ! cinatra_content_post_matches_row( $post, $row ) ) {
+		return array( 'unverified', null );
 	}
-	return $allowed ? 'allowed' : 'denied';
+	return array( $allowed ? 'allowed' : 'denied', $post );
 }
 
 /**
@@ -4434,7 +4428,7 @@ function cinatra_content_row_permission( array $row ): string {
 function cinatra_content_permission_unverified(): array {
 	return cinatra_content_refusal(
 		'permission_unverified',
-		__( 'The permission check could not be verified against the current post ( the object cache did not take the fresh post ). Nothing was read or written.', 'cinatra' )
+		__( 'The permission check could not be verified against the current post ( the post WordPress returned differs from the database row ). Nothing was read or written.', 'cinatra' )
 	);
 }
 
@@ -4570,15 +4564,20 @@ function cinatra_ability_post_read( $input = array() ): array {
 	if ( ! cinatra_content_can_edit( $input ) ) {
 		return cinatra_content_not_found();
 	}
-	$id  = cinatra_content_post_id( $input );
-	$row = cinatra_content_select_row( $id, false );
-	if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
-		return cinatra_content_not_found();
+	$id = cinatra_content_post_id( $input );
+	// Re-check against the row just read. Another request may commit between
+	// the read and the check ( the read holds no lock ): then read again,
+	// once, before refusing.
+	for ( $attempt = 0; ; $attempt++ ) {
+		$row = cinatra_content_select_row( $id, false );
+		if ( null === $row || ! in_array( (string) $row['post_type'], cinatra_content_post_types(), true ) ) {
+			return cinatra_content_not_found();
+		}
+		$permission = cinatra_content_row_permission( $row )[0];
+		if ( 'unverified' !== $permission || 1 <= $attempt ) {
+			break;
+		}
 	}
-	// Re-check against the row just read; then drop the primed cache entry,
-	// so the read leaves the object cache as WordPress would fill it.
-	$permission = cinatra_content_row_permission( $row );
-	wp_cache_delete( $id, 'posts' );
 	if ( 'unverified' === $permission ) {
 		return cinatra_content_permission_unverified();
 	}
@@ -4704,6 +4703,35 @@ function cinatra_content_writable_statuses(): array {
  */
 function cinatra_content_core_data_columns(): array {
 	return array( 'post_author', 'post_date', 'post_date_gmt', 'post_content', 'post_content_filtered', 'post_title', 'post_excerpt', 'post_status', 'post_type', 'comment_status', 'ping_status', 'post_password', 'post_name', 'to_ping', 'pinged', 'post_modified', 'post_modified_gmt', 'post_parent', 'menu_order', 'post_mime_type', 'guid' );
+}
+
+/**
+ * The defaults wp_insert_post() merges into $postarr with wp_parse_args().
+ *
+ * @return array<string,mixed> Core's defaults.
+ */
+function cinatra_content_insert_defaults(): array {
+	return array(
+		'post_author'           => get_current_user_id(),
+		'post_content'          => '',
+		'post_content_filtered' => '',
+		'post_title'            => '',
+		'post_excerpt'          => '',
+		'post_status'           => 'draft',
+		'post_type'             => 'post',
+		'comment_status'        => '',
+		'ping_status'           => '',
+		'post_password'         => '',
+		'to_ping'               => '',
+		'pinged'                => '',
+		'post_parent'           => 0,
+		'menu_order'            => 0,
+		'guid'                  => '',
+		'import_id'             => 0,
+		'context'               => '',
+		'post_date'             => '',
+		'post_date_gmt'         => '',
+	);
 }
 
 /**
@@ -4837,11 +4865,11 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		cinatra_content_rollback();
 		return cinatra_content_not_found();
 	}
-	$permission = cinatra_content_row_permission( $row );
+	// The row is locked: no legitimate change is possible, so an unverified
+	// decision refuses at once.
+	list( $permission, $post_before ) = cinatra_content_row_permission( $row );
 	if ( 'unverified' === $permission ) {
-		// Drop the entry that did not take the fresh row ( it may be stale ).
-		wp_cache_delete( $id, 'posts' );
-		cinatra_content_rollback();
+		cinatra_content_rollback( $id );
 		return cinatra_content_permission_unverified();
 	}
 	if ( 'allowed' !== $permission ) {
@@ -4897,14 +4925,40 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		);
 	}
 
-	// The written fields. Each runs through exactly the chain wp_insert_post()
-	// runs for it ( sanitize_post_field( ..., 'db' ): pre_post_<field> and
-	// <field>_save_pre, which carry kses for a user without unfiltered_html
-	// and the site's own save filters ). Those filters expect slashed data, as
-	// on a normal save.
-	$written = array();
+	/*
+	 * Core's argument arrays for this update, built as wp_update_post() and
+	 * wp_insert_post() build them ( wp-includes/post.php ):
+	 *
+	 *     $post = get_post( $postarr['ID'], ARRAY_A ); // WP_Post::to_array().
+	 *     $post = wp_slash( $post );
+	 *     $postarr = array_merge( $post, $postarr );    // The requested fields win.
+	 *     $unsanitized_postarr = $postarr;
+	 *     $postarr = wp_parse_args( $postarr, $defaults );
+	 *     unset( $postarr['filter'] );
+	 *     $postarr = sanitize_post( $postarr, 'db' );
+	 *
+	 * The existing post is the verified locked row. sanitize_post() runs every
+	 * field's chain ( pre_post_<field> and <field>_save_pre, kses for a user
+	 * without unfiltered_html, the site's own save filters ), as core does;
+	 * only the written fields and the status are taken from it. Core's
+	 * floating draft date ( a draft without a set date gets the current
+	 * date ) is not applied: this save keeps the stored date.
+	 */
+	$request = array( 'ID' => $id );
 	foreach ( $parsed['fields'] as $column => $value ) {
-		$written[ $column ] = wp_unslash( sanitize_post_field( $column, wp_slash( $value ), $id, 'db' ) );
+		$request[ $column ] = $value;
+	}
+	if ( null !== $parsed['status'] ) {
+		$request['post_status'] = 'draft';
+	}
+	$unsanitized_postarr = array_merge( wp_slash( $post_before->to_array() ), wp_slash( $request ) );
+	$postarr             = wp_parse_args( $unsanitized_postarr, cinatra_content_insert_defaults() );
+	unset( $postarr['filter'] );
+	$postarr = sanitize_post( $postarr, 'db' );
+
+	$written = array();
+	foreach ( array_keys( $parsed['fields'] ) as $column ) {
+		$written[ $column ] = wp_unslash( (string) $postarr[ $column ] );
 		if ( 'utf8' === $wpdb->get_col_charset( $wpdb->posts, $column ) ) {
 			// As wp_insert_post(): a utf8 ( not utf8mb4 ) column stores emoji as entities.
 			$written[ $column ] = wp_encode_emoji( $written[ $column ] );
@@ -4915,13 +4969,12 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 		cinatra_content_rollback();
 		return cinatra_content_refusal( 'invalid', __( 'Title, content and excerpt cannot all be empty.', 'cinatra' ), $current_modified );
 	}
-	// The status runs through core's status chain too ( pre_post_status and
-	// status_save_pre, slashed, as sanitize_post() runs it for an update ):
-	// "draft" when asked, otherwise the current status, which this save keeps.
-	// A workflow policy that turns it into anything else cannot be applied by
-	// this save: refuse.
+	// The status went through core's status chain above ( pre_post_status and
+	// status_save_pre ): "draft" when asked, otherwise the current status,
+	// which this save keeps. A workflow policy that turns it into anything
+	// else cannot be applied by this save: refuse.
 	$store_status = null !== $parsed['status'] ? 'draft' : (string) $row['post_status'];
-	$status_after = wp_unslash( sanitize_post_field( 'post_status', wp_slash( $store_status ), $id, 'db' ) );
+	$status_after = wp_unslash( (string) $postarr['post_status'] );
 	if ( $status_after !== $store_status ) {
 		cinatra_content_rollback();
 		return cinatra_content_refusal(
@@ -4952,8 +5005,6 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 	// anything else ( the status this save stores, or any column this save
 	// does not write ) cannot be applied without a wider write than the one
 	// checked: refuse before anything is written or fired.
-	$postarr             = wp_slash( array_merge( $prospective, array( 'ID' => $id ) ) );
-	$unsanitized_postarr = wp_slash( array_merge( $prospective, $parsed['fields'], array( 'ID' => $id ) ) );
 	/** This filter is documented in wp-includes/post.php. */
 	$filtered = apply_filters( 'wp_insert_post_data', wp_slash( $prospective ), $postarr, $unsanitized_postarr, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own save filter, run as wp_insert_post() runs it.
 	$conflict = cinatra_content_policy_conflicts( $prospective, $filtered, array_diff( array_keys( $written ), array( 'post_status' ) ) );
@@ -4971,8 +5022,6 @@ function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
 	foreach ( array_keys( $written ) as $column ) {
 		$data[ $column ] = (string) $filtered[ $column ];
 	}
-
-	$post_before = get_post( $id ); // The locked row ( primed in the object cache above ).
 
 	/** This action is documented in wp-includes/post.php ( fired by core right before the update, with the full unslashed data ). */
 	do_action( 'pre_post_update', $id, $filtered ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook, fired where wp_insert_post() fires it.

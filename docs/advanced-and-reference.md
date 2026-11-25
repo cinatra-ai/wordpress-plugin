@@ -149,9 +149,11 @@ made in the transaction are rolled back with it.
   removes disallowed HTML. Thus the stored value of a written field can be
   different from the sent value. The answer contains the stored values, the
   new `post_modified_gmt`, and `sanitized_fields`, which names each written
-  field that a filter changed. Fields that are not written go through no
-  filter and are not changed. Thus a restricted user can change the title of a
-  page whose content contains HTML that their role may not write.
+  field that a filter changed. As in WordPress, the fields that are not
+  written also go through their save filters, but only to build the post
+  array that WordPress passes to `wp_insert_post_data` (see below). Their
+  stored values are not changed. Thus a restricted user can change the title
+  of a page whose content contains HTML that their role may not write.
 - The ability does not change the slug, the dates, the author, the parent, the
   menu order, the comment settings, the categories, the tags or other terms.
   A title change does not change the slug of a published page. A draft without
@@ -167,8 +169,18 @@ made in the transaction are rolled back with it.
   full post data (all the columns that WordPress builds for an update: the
   locked row with the requested fields, the status and the new modification
   times) and passes it, slashed, through `wp_insert_post_data` with the same
-  arguments as WordPress (the data, the post array, the unsanitized post
-  array, and `true` for an update). The stored values of the requested fields
+  arguments as WordPress: the data, the post array, the unsanitized post
+  array, and `true` for an update. The post array and the unsanitized post
+  array are built as `wp_update_post()` and `wp_insert_post()` build them:
+  the existing post as `get_post()` returns it as an array (every column and
+  `filter`, `ancestors`, `page_template`, `post_category` and `tags_input`),
+  slashed and merged with the requested fields. That merged array is the
+  unsanitized post array. The post array is the same array with WordPress's
+  defaults, without `filter`, after all its fields went through their save
+  filters. As in WordPress, the post array contains the stored modification
+  times, not the new ones. One difference: WordPress gives a draft without a
+  set date the current date on each update; this ability keeps the date, so
+  both arrays contain the stored date. The stored values of the requested fields
   and the modification times are the filters' results. `sanitized_fields`
   also names a field that one of these filters changed. If a filter changes
   the status that this save stores, or any column that this save does not
@@ -209,15 +221,20 @@ post or a page, and a post that the user cannot edit give the same `not_found`
 answer.
 
 WordPress decides `edit_post` on the post that `get_post()` returns, which can
-come from the object cache. The abilities put the row that they read into the
-cache and read it back through `get_post()` before and after the capability
-check. The fields that WordPress uses for this decision (`ID`, `post_type`,
-`post_author`, `post_status` and `post_parent`) must equal the row both times.
-If they do not (for example, the object cache did not store the row, or site
-code changes what `get_post()` returns), the decision cannot be verified. The
-ability then refuses with `permission_unverified`: nothing is read or written,
-and the answer contains no post content. The read removes its cache entry
-afterwards, and a refused write removes an entry that did not take the row.
+come from the object cache. The abilities never write the object cache
+themselves. Before the capability check, they compare the post that
+`get_post()` returns with the row that they read, over every column of the
+row (with the row token's encoding). If it differs, they invalidate the post's
+cache through WordPress (`clean_post_cache()`), and `get_post()` loads the post
+from the database again. The post must equal the row before the capability
+check and again after it. If it does not (for example, an object-cache drop-in
+keeps an older entry, or site code changes what `get_post()` returns), the
+decision cannot be verified. The read then reads the row again once, because
+another save can occur between its read and its check. The write holds the
+row lock, so it refuses at once. The refusal is `permission_unverified`:
+nothing is read or written, and the answer contains no post content. A site's
+capability policy that reads post meta or terms reads data outside the row,
+which this check does not cover.
 
 A refusal is a normal result, not an error:
 `{ "success": false, "code": "...", "message": "...", "data": { "current_modified_gmt": ... } }`.

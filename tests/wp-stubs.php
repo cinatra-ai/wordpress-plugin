@@ -287,9 +287,22 @@ class WP_Post {
     public $post_name;
     // The list ability (wordpress-plugin#82) serializes the GMT publish date.
     public $post_date_gmt;
-    // The fields core's map_meta_cap reads for edit_post ( content abilities ).
+    // The remaining wp_posts columns, as core's WP_Post declares them ( content abilities ).
     public $post_author;
     public $post_parent;
+    public $post_date;
+    public $post_content_filtered;
+    public $comment_status;
+    public $ping_status;
+    public $post_password;
+    public $to_ping;
+    public $pinged;
+    public $post_modified;
+    public $guid;
+    public $menu_order;
+    public $post_mime_type;
+    public $comment_count;
+    public $filter;
     public function __construct(array $fields = []) {
         $this->ID = $fields['ID'] ?? 0;
         $this->post_type = $fields['post_type'] ?? 'post';
@@ -303,6 +316,25 @@ class WP_Post {
         $this->post_date_gmt = $fields['post_date_gmt'] ?? '2026-06-24 12:00:00';
         $this->post_author = $fields['post_author'] ?? '0';
         $this->post_parent = $fields['post_parent'] ?? 0;
+        foreach (['post_date', 'post_content_filtered', 'comment_status', 'ping_status', 'post_password', 'to_ping', 'pinged', 'post_modified', 'guid', 'menu_order', 'post_mime_type', 'comment_count', 'filter'] as $k) {
+            $this->$k = $fields[$k] ?? null;
+        }
+    }
+    /** As core: get_object_vars() plus ancestors, page_template, post_category, tags_input ( fixture values ). */
+    public function to_array() {
+        // Core's WP_Post declares its properties in this order ( the posts table's
+        // column order, then filter ); get_object_vars() follows it.
+        $post = [];
+        foreach (['ID', 'post_author', 'post_date', 'post_date_gmt', 'post_content', 'post_title', 'post_excerpt', 'post_status', 'comment_status', 'ping_status', 'post_password', 'post_name', 'to_ping', 'pinged', 'post_modified', 'post_modified_gmt', 'post_content_filtered', 'post_parent', 'guid', 'menu_order', 'post_type', 'post_mime_type', 'comment_count', 'filter'] as $k) {
+            $post[$k] = $this->$k;
+        }
+        $extra = $GLOBALS['cinatra_test']['post_extra'][(int) $this->ID] ?? [];
+        return array_merge($post, [
+            'ancestors'     => $extra['ancestors'] ?? [],
+            'page_template' => $extra['page_template'] ?? '',
+            'post_category' => $extra['post_category'] ?? [],
+            'tags_input'    => $extra['tags_input'] ?? [],
+        ]);
     }
 }
 function get_the_title($post) {

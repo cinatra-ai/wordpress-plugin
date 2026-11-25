@@ -80,7 +80,13 @@ class Cinatra_Test_Wpdb {
         if (!preg_match('/WHERE ID = (\d+)/', $sql, $m)) {
             return null;
         }
-        return $this->rows[(int) $m[1]] ?? null;
+        $row = $this->rows[(int) $m[1]] ?? null;
+        // after_select: another request runs right after this SELECT returned
+        // ( it may commit a newer row and clean the cache, as core does ).
+        if (isset($GLOBALS['cinatra_test']['after_select'])) {
+            ($GLOBALS['cinatra_test']['after_select'])($sql);
+        }
+        return $row;
     }
     public function get_var($sql) {
         $this->log[] = $sql;
@@ -132,17 +138,12 @@ if (!function_exists('wp_check_post_lock')) {
         return $GLOBALS['cinatra_test']['post_lock'][(int) $post_id] ?? false;
     }
 }
-if (!function_exists('wp_cache_set')) {
-    /** cache_set_mode: 'fail' ( returns false, keeps the old entry ) or 'ignore' ( a drop-in that reports success but keeps the old entry ). */
-    function wp_cache_set($key, $data, $group = '', $expire = 0) {
-        $mode = $GLOBALS['cinatra_test']['cache_set_mode'] ?? '';
-        if ('fail' === $mode) {
-            return false;
-        }
-        if ('posts' === $group && 'ignore' !== $mode) {
-            $GLOBALS['cinatra_test']['post_cache'][(int) $key] = (array) $data;
-        }
-        return true;
+// Spy: every cache WRITE is recorded. The abilities must never write the posts
+// group themselves ( core's own get_post() fills the cache in this harness
+// without these functions, as WP_Post::get_instance() does with wp_cache_add ).
+foreach (['wp_cache_set', 'wp_cache_add', 'wp_cache_replace'] as $cinatra_fn) {
+    if (!function_exists($cinatra_fn)) {
+        eval("function $cinatra_fn(\$key, \$data, \$group = '', \$expire = 0) { \$GLOBALS['cinatra_test']['cache_writes'][] = ['$cinatra_fn', \$key, \$group]; if ('posts' === \$group) { \$GLOBALS['cinatra_test']['post_cache'][(int) \$key] = (array) \$data; } return true; }");
     }
 }
 if (!function_exists('wp_cache_delete')) {
@@ -157,7 +158,10 @@ if (!function_exists('clean_post_cache')) {
     function clean_post_cache($post_id) {
         global $wpdb;
         $GLOBALS['cinatra_test']['cleaned'][] = (int) $post_id;
-        unset($GLOBALS['cinatra_test']['post_cache'][(int) $post_id]);
+        // clean_ignored: a broken object-cache drop-in that keeps the entry.
+        if (empty($GLOBALS['cinatra_test']['clean_ignored'])) {
+            unset($GLOBALS['cinatra_test']['post_cache'][(int) $post_id]);
+        }
         $wpdb->log[] = 'CLEAN-CACHE';
     }
 }
@@ -173,7 +177,11 @@ if (!function_exists('get_post')) {
             $GLOBALS['cinatra_test']['post_cache'][$id] = $wpdb->rows[$id];
         }
         $p = new WP_Post($GLOBALS['cinatra_test']['post_cache'][$id]);
+        // As WP_Post::get_instance(): sanitize_post( $_post, 'raw' ) casts the int fields; filter is 'raw'.
         $p->ID = (int) $p->ID;
+        $p->post_parent = (int) $p->post_parent;
+        $p->menu_order = (int) $p->menu_order;
+        $p->filter = 'raw';
         // get_post_rewrite: site code that changes what get_post() returns.
         if (isset($GLOBALS['cinatra_test']['get_post_rewrite'])) {
             $p = ($GLOBALS['cinatra_test']['get_post_rewrite'])($p);
@@ -188,22 +196,60 @@ if (!function_exists('current_time')) {
 }
 if (!function_exists('sanitize_post_field')) {
     /**
-     * Core's db-context chain for one field: pre_post_<x> then <x>_save_pre
-     * (the kses filters are on the latter for a user without unfiltered_html).
-     * Like core's filters, it expects and returns SLASHED data.
+     * Core's sanitize_post_field() for the db context ( wp-includes/post.php ):
+     * ID, post_parent, menu_order cast to int; ancestors absint and returned;
+     * a post_-prefixed field runs pre_<field> then <field without post_>_save_pre,
+     * any other field pre_post_<field> then <field>_pre. kses sits on
+     * title/content/excerpt/content_filtered _save_pre for a user without
+     * unfiltered_html. Like core's filters, it expects and returns SLASHED data.
      */
     function sanitize_post_field($field, $value, $post_id, $context = 'display') {
+        if (in_array($field, ['ID', 'post_parent', 'menu_order'], true)) {
+            $value = (int) $value;
+        }
+        if ('ancestors' === $field) {
+            return array_map('absint', $value);
+        }
         $GLOBALS['cinatra_test']['sanitized'][] = $field;
-        $short = substr($field, 5); // post_title -> title
-        foreach (["pre_{$field}", "{$short}_save_pre"] as $hook) {
+        if (false !== strpos($field, 'post_')) {
+            $hooks = ["pre_{$field}", str_replace('post_', '', $field) . '_save_pre'];
+        } else {
+            $hooks = ["pre_post_{$field}", "{$field}_pre"];
+        }
+        foreach ($hooks as $hook) {
             foreach ($GLOBALS['cinatra_test']['save_filters'][$hook] ?? [] as $cb) {
                 $value = $cb($value);
             }
-        }
-        if (!current_user_can('unfiltered_html')) {
-            $value = addslashes(preg_replace('#<script\b[^>]*>.*?</script>#is', '', stripslashes($value)));
+            if (in_array($hook, ['title_save_pre', 'content_save_pre', 'excerpt_save_pre', 'content_filtered_save_pre'], true) && is_string($value) && !current_user_can('unfiltered_html')) {
+                $value = addslashes(preg_replace('#<script\b[^>]*>.*?</script>#is', '', stripslashes($value)));
+            }
         }
         return $value;
+    }
+}
+if (!function_exists('absint')) {
+    function absint($v) { return abs((int) $v); }
+}
+if (!function_exists('sanitize_post')) {
+    /** Core's sanitize_post() for an array ( wp-includes/post.php ). */
+    function sanitize_post($post, $context = 'display') {
+        if (isset($post['filter']) && $context === $post['filter']) {
+            return $post;
+        }
+        if (!isset($post['ID'])) {
+            $post['ID'] = 0;
+        }
+        foreach (array_keys($post) as $field) {
+            $post[$field] = sanitize_post_field($field, $post[$field], $post['ID'], $context);
+        }
+        $post['filter'] = $context;
+        return $post;
+    }
+}
+if (!function_exists('wp_parse_args')) {
+    /** Core's wp_parse_args() for arrays: array_merge( $defaults, $args ). */
+    function wp_parse_args($args, $defaults = []) {
+        return is_array($defaults) && $defaults ? array_merge($defaults, $args) : $args;
     }
 }
 if (!function_exists('wp_encode_emoji')) {
@@ -560,6 +606,57 @@ $a = hook_args('wp_after_insert_post');
 check('wp_after_insert_post(post_id, post, true, post_before)', T_ID === $a[0] && $a[1] instanceof WP_Post && true === $a[2] && T_CONTENT === $a[3]->post_content);
 
 // ---------------------------------------------------------------------------
+echo "wp_insert_post_data: core's postarr and unsanitized_postarr\n";
+/*
+ * The expected arguments, derived from core 6.8 ( wp-includes/post.php ):
+ *   wp_update_post():  $post = get_post( $postarr['ID'], ARRAY_A );   // WP_Post::to_array(): every column, filter,
+ *                                                                       // ancestors, page_template, post_category, tags_input
+ *                      $post = wp_slash( $post );
+ *                      $postarr = array_merge( $post, $postarr );       // the caller's fields win
+ *                      $postarr['post_category'] = $post_cats;          // the existing categories
+ *   wp_insert_post():  $unsanitized_postarr = $postarr;
+ *                      $postarr = wp_parse_args( $postarr, $defaults ); // array_merge( $defaults, $postarr )
+ *                      unset( $postarr['filter'] );
+ *                      $postarr = sanitize_post( $postarr, 'db' );      // every field through its chain; filter = 'db'
+ * Core never puts the new modification times into $postarr: they exist only in $data.
+ */
+function t_core_args(array $row, array $request): array {
+    $existing = $row;
+    foreach (['ID', 'post_parent', 'menu_order'] as $k) { $existing[$k] = (int) $existing[$k]; }
+    $existing['filter'] = 'raw';
+    $existing = array_merge($existing, ['ancestors' => [], 'page_template' => '', 'post_category' => [], 'tags_input' => []]);
+    $unsanitized = array_merge(wp_slash($existing), wp_slash($request));
+    $defaults = ['post_author' => 3, 'post_content' => '', 'post_content_filtered' => '', 'post_title' => '', 'post_excerpt' => '', 'post_status' => 'draft', 'post_type' => 'post', 'comment_status' => '', 'ping_status' => '', 'post_password' => '', 'to_ping' => '', 'pinged' => '', 'post_parent' => 0, 'menu_order' => 0, 'guid' => '', 'import_id' => 0, 'context' => '', 'post_date' => '', 'post_date_gmt' => ''];
+    $postarr = array_merge($defaults, $unsanitized);
+    unset($postarr['filter']);
+    foreach ($postarr as $k => $v) {
+        if (in_array($k, ['ID', 'post_parent', 'menu_order'], true)) { $postarr[$k] = (int) $v; }
+    }
+    $postarr['filter'] = 'db';
+    return [$postarr, $unsanitized];
+}
+$parity = [
+    'content-only'    => [base_update(['content' => "<p>New \\ \"body\"</p>"]), ['ID' => T_ID, 'post_content' => "<p>New \\ \"body\"</p>"]],
+    'status to draft' => [array_diff_key(base_update(['status' => 'draft']), ['content' => 1]), ['ID' => T_ID, 'post_status' => 'draft']],
+    'combined'        => [base_update(['title' => 'T "2"', 'content' => '<p>c</p>', 'excerpt' => 'e', 'status' => 'draft']), ['ID' => T_ID, 'post_title' => 'T "2"', 'post_content' => '<p>c</p>', 'post_excerpt' => 'e', 'post_status' => 'draft']],
+];
+foreach ($parity as $label => [$input, $request]) {
+    reset_fixture();
+    $r = cinatra_ability_post_update_if_unchanged($input);
+    $f = null;
+    foreach ($GLOBALS['cinatra_test']['filter_calls'] as $call) { if ('wp_insert_post_data' === $call[0]) { $f = $call; } }
+    [$want_postarr, $want_unsanitized] = t_core_args(t_row(T_ID, 'page'), $request);
+    check("$label: postarr is core's merged, parsed, sanitized array, field by field", true === ($r['success'] ?? null) && null !== $f && $want_postarr === $f[2][0]);
+    check("$label: unsanitized_postarr is core's merged array before sanitising", null !== $f && $want_unsanitized === $f[2][1]);
+}
+reset_fixture(['unfiltered_html' => false]);
+$seen = [];
+$GLOBALS['cinatra_test']['save_filters']['wp_insert_post_data'][] = function ($d, $postarr, $raw) use (&$seen) { $seen = [$raw['post_content'], $postarr['post_content'], $postarr['post_modified'], $postarr['post_modified_gmt']]; return $d; };
+$r = cinatra_ability_post_update_if_unchanged(base_update(['content' => '<p>x</p><script>y()</script>']));
+check('a four-argument filter sees the caller\'s raw content in unsanitized_postarr and the sanitized one in postarr', wp_slash('<p>x</p><script>y()</script>') === ($seen[0] ?? null) && '<p>x</p>' === ($seen[1] ?? null));
+check('postarr post_modified is what core gives it: the stored value, not the new time', '2026-11-25 11:00:00' === ($seen[2] ?? null) && T_MODIFIED === ($seen[3] ?? null));
+
+// ---------------------------------------------------------------------------
 echo "Status: never publishes; draft only when asked, as the literal value\n";
 reset_fixture();
 $r = cinatra_ability_post_update_if_unchanged(base_update(['status' => 'draft', 'expected' => full_expected()]));
@@ -589,12 +686,12 @@ check('the early permission callback (cache) would still allow', true === cinatr
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
 check('write refused as not_found after the lock', is_refusal($r, 'not_found'));
-check('ROLLBACK, no update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'ROLLBACK'] === statement_kinds() && $before === $wpdb->rows);
+check('the stale entry is invalidated by core ( clean_post_cache ), then ROLLBACK, no update', ['START TRANSACTION', 'SELECT-FOR-UPDATE', 'ENGINE', 'CLEAN-CACHE', 'ROLLBACK'] === statement_kinds() && $before === $wpdb->rows);
 reset_fixture();
 $wpdb->rows[T_ID]['post_author'] = '9';
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
 check('read refused as not_found too', is_refusal($r, 'not_found'));
-check('the read leaves no primed cache entry behind', !isset($GLOBALS['cinatra_test']['post_cache'][T_ID]));
+check('the read decided on the fresh row by core\'s own road ( invalidated, reloaded ), and wrote no cache entry itself', [] === ($GLOBALS['cinatra_test']['cache_writes'] ?? []) && in_array(T_ID, $GLOBALS['cinatra_test']['cleaned'] ?? [], true) && '9' === $GLOBALS['cinatra_test']['post_cache'][T_ID]['post_author']);
 
 echo "Capability: unknown, forbidden and other-type posts look the same\n";
 reset_fixture();
@@ -681,8 +778,7 @@ $r = cinatra_ability_post_update_if_unchanged([
 check('a restricted user\'s title edit succeeds', true === ($r['success'] ?? null));
 check('the untouched body (admin markup) is kept byte for byte', $admin_markup === $wpdb->rows[T_ID]['post_content']);
 check('the written title went through kses', 'New title' === $wpdb->rows[T_ID]['post_title'] && ['post_title'] === $r['sanitized_fields']);
-check('only post_title ( and the status, which this save stores ) ran through a save chain; content and excerpt did not', ['post_title', 'post_status'] === $GLOBALS['cinatra_test']['sanitized']);
-check('the content chain did not run for an unwritten body', empty($GLOBALS['cinatra_test']['content_chain_ran']));
+check('the unwritten body\'s chain runs only to build core\'s $postarr ( as core does ); the stored body is untouched', !empty($GLOBALS['cinatra_test']['content_chain_ran']) && $admin_markup === $wpdb->rows[T_ID]['post_content'] && !array_key_exists('post_content', $wpdb->updates[0]['data'] ?? []));
 reset_fixture();
 $GLOBALS['cinatra_test']['save_filters']['content_save_pre'][] = function ($v) { return str_replace('darn', 'd**n', $v); };
 $r = cinatra_ability_post_update_if_unchanged(base_update(['content' => '<p>darn</p>']));
@@ -911,56 +1007,47 @@ check('status draft on a draft is allowed (no change)', true === $r['success'] &
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-echo "Permission: provably decided on the fresh row\n";
-// The object cache still holds the row with author 3 ( allowed ); the fresh row says author 9.
-foreach (['fail' => 'wp_cache_set fails', 'ignore' => 'a drop-in ignores wp_cache_set'] as $mode => $label) {
-    reset_fixture(['cache_set_mode' => $mode]);
-    $wpdb->rows[T_ID]['post_author'] = '9';
-    $r = cinatra_ability_post_read(['post_id' => T_ID]);
-    check("$label with a stale allowing row cached: read -> permission_unverified, no content", is_refusal($r, 'permission_unverified') && !isset($r['post_content']) && false === strpos(json_encode($r), 'Old excerpt') && null === $r['data']['current_modified_gmt']);
-    check("$label: the stale cache entry is dropped after the read", !isset($GLOBALS['cinatra_test']['post_cache'][T_ID]));
-    reset_fixture(['cache_set_mode' => $mode]);
-    $wpdb->rows[T_ID]['post_author'] = '9';
-    $before = $wpdb->rows;
-    $r = cinatra_ability_post_update_if_unchanged(base_update());
-    check("$label with a stale allowing row cached: write -> permission_unverified, nothing written, no hook", is_refusal($r, 'permission_unverified') && $before === $wpdb->rows && [] === $wpdb->updates && !in_array('COMMIT', statement_kinds(), true));
-    check("$label: write drops the stale cache entry", !isset($GLOBALS['cinatra_test']['post_cache'][T_ID]));
-}
-reset_fixture(['cache_set_mode' => 'ignore']);
-$wpdb->rows[T_ID]['post_content'] = 'content changed, capability fields equal';
-t_state_is_read();
-$GLOBALS['cinatra_test']['post_cache'][T_ID]['post_content'] = 'older cached content';
-$r = cinatra_ability_post_read(['post_id' => T_ID]);
-check('an ignored set with equal capability fields is verified: the read returns the fresh content', true === ($r['success'] ?? null) && 'content changed, capability fields equal' === $r['post_content']);
-foreach (['post_author' => '3', 'post_type' => 'page', 'post_status' => 'publish', 'post_parent' => '0'] as $field => $stale) {
-    reset_fixture(['cache_set_mode' => 'ignore']);
-    $fresh = ['post_author' => '9', 'post_type' => 'post', 'post_status' => 'draft', 'post_parent' => '5'][$field];
-    $wpdb->rows[T_ID][$field] = $fresh;
-    $GLOBALS['cinatra_test']['post_cache'][T_ID][$field] = $stale;
-    $r = cinatra_ability_post_read(['post_id' => T_ID]);
-    check("the cached $field differs from the fresh row -> permission_unverified, no content", is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
-}
+echo "Permission: provably decided on the fresh row, no cache writes\n";
+// The object cache holds the row with author 3 ( allowed ); the fresh row says author 9.
 reset_fixture();
 $wpdb->rows[T_ID]['post_author'] = '9';
-$GLOBALS['cinatra_test']['get_post_rewrite'] = function ($p) { $p->post_author = '3'; return $p; };
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
-check('a get_post rewrite returning a different author -> read refused with permission_unverified', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+check('stale allowing cache entry: core invalidation + reload decides on the fresh row -> not_found, no content', is_refusal($r, 'not_found') && !isset($r['post_content']));
+reset_fixture();
+$wpdb->rows[T_ID]['post_author'] = '9';
 $before = $wpdb->rows;
 $r = cinatra_ability_post_update_if_unchanged(base_update());
-check('a get_post rewrite returning a different author -> write refused, nothing written', is_refusal($r, 'permission_unverified') && $before === $wpdb->rows);
-reset_fixture();
-$GLOBALS['cinatra_test']['get_post_rewrite'] = function ($p) { $p->post_status = 'private'; return $p; };
+check('stale allowing cache entry, write: decided on the fresh locked row -> not_found, nothing written', is_refusal($r, 'not_found') && $before === $wpdb->rows);
+reset_fixture(['clean_ignored' => true]);
+$wpdb->rows[T_ID]['post_author'] = '9';
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
-check('a get_post rewrite of the status ( allowed author ) is still refused: not verifiable', is_refusal($r, 'permission_unverified'));
+check('a drop-in that ignores invalidation ( stale allowing entry stays ): read -> permission_unverified, no content', is_refusal($r, 'permission_unverified') && !isset($r['post_content']) && false === strpos(json_encode($r), 'Old excerpt'));
+check('the read retried once from a fresh SELECT before refusing', 2 === count(array_filter(statement_kinds(), function ($k) { return 'SELECT' === $k; })));
+reset_fixture(['clean_ignored' => true]);
+$wpdb->rows[T_ID]['post_author'] = '9';
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('the same for the write: permission_unverified at once ( row locked ), nothing written, no hook', is_refusal($r, 'permission_unverified') && $before === $wpdb->rows && 1 === count(array_filter(statement_kinds(), function ($k) { return 'SELECT-FOR-UPDATE' === $k; })));
+// Whole-row rule: any column of the object get_post() returns must equal the fresh row.
+foreach (['post_name' => 'old-slug', 'post_content' => 'older cached content', 'post_author' => '3', 'post_type' => 'post', 'post_status' => 'draft', 'post_parent' => '5', 'menu_order' => '4', 'guid' => 'x'] as $col => $stale) {
+    reset_fixture(['clean_ignored' => true]);
+    if ('post_author' === $col) {
+        $wpdb->rows[T_ID]['post_author'] = '9'; // fresh: someone else's post; the stale entry ( 3 ) would allow
+    }
+    $GLOBALS['cinatra_test']['post_cache'][T_ID][$col] = $stale;
+    $r = cinatra_ability_post_read(['post_id' => T_ID]);
+    check("a cached $col that differs from the fresh row ( not invalidated ) -> permission_unverified", is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+}
 reset_fixture();
-$calls = 0;
-$GLOBALS['cinatra_test']['get_post_rewrite'] = function ($p) use (&$calls) { if (2 === ++$calls) { $GLOBALS['cinatra_test']['flip'] = true; } if (!empty($GLOBALS['cinatra_test']['flip'])) { $p->post_author = '9'; } return $p; };
+$GLOBALS['cinatra_test']['get_post_rewrite'] = function ($p) { $p->post_name = 'policy-sees-this'; return $p; };
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
-check('the cached row changing during the capability check -> permission_unverified', is_refusal($r, 'permission_unverified'));
-// The decision inside current_user_can() is bracketed by a read-back before and after.
+check('a get_post rewrite of a non-capability field ( slug ) -> permission_unverified', is_refusal($r, 'permission_unverified'));
+$before = $wpdb->rows;
+$r = cinatra_ability_post_update_if_unchanged(base_update());
+check('the same for the write, nothing written', is_refusal($r, 'permission_unverified') && $before === $wpdb->rows);
+// The decision is bracketed by the whole-row comparison before and after.
 $decide_by_get_post = function ($post_id) { $p = get_post($post_id); return null !== $p && (int) $GLOBALS['cinatra_test']['current_user_id'] === (int) $p->post_author; };
-// B: the stale entry decides, then is evicted ( get_post reloads the fresh row ): only the BEFORE read-back sees it.
-reset_fixture(['cache_set_mode' => 'ignore']);
+reset_fixture(['clean_ignored' => true]);
 $wpdb->rows[T_ID]['post_author'] = '9';
 $GLOBALS['cinatra_test']['early_done'] = false;
 $GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use ($decide_by_get_post) {
@@ -971,23 +1058,44 @@ $GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use ($decide_by_
     return $allowed;
 };
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
-check('a stale entry that decides and is then evicted -> permission_unverified ( the read-back before the decision )', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
-// A: another process puts a stale row into the shared cache during the check: only the AFTER read-back sees it.
+check('a stale entry that decides and is then evicted -> permission_unverified ( the comparison before the decision )', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
 reset_fixture();
 $wpdb->rows[T_ID]['post_author'] = '9';
 $GLOBALS['cinatra_test']['post_cache'][T_ID]['post_author'] = '9';
 $GLOBALS['cinatra_test']['early_done'] = false;
 $GLOBALS['cinatra_test']['caps_fn'] = function ($cap, ...$args) use ($decide_by_get_post) {
     if ('edit_post' !== $cap) { return 'unfiltered_html' === $cap; }
-    if (!$GLOBALS['cinatra_test']['early_done']) { $GLOBALS['cinatra_test']['early_done'] = true; return true; } // the early ( cache ) permission callback
+    if (!$GLOBALS['cinatra_test']['early_done']) { $GLOBALS['cinatra_test']['early_done'] = true; return true; }
     $GLOBALS['cinatra_test']['post_cache'][(int) $args[0]]['post_author'] = '3'; // stale, allowing
     return $decide_by_get_post((int) $args[0]);
 };
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
-check('a stale row put into the cache during the decision -> permission_unverified ( the read-back after the decision )', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+check('a stale row put into the cache during the decision -> permission_unverified ( the comparison after the decision )', is_refusal($r, 'permission_unverified') && !isset($r['post_content']));
+
+echo "Two requests: B commits a newer row between A's SELECT and A's permission check\n";
+// The strongest form this single-process harness allows: one shared cache,
+// request B interleaved by a hook right after A's SELECT. B commits and cleans
+// the cache as core does after its update. A must never write the posts
+// cache, and must decide on and return a row that is current.
 reset_fixture();
+$cache_history = [];
+$b_done = false;
+$GLOBALS['cinatra_test']['after_select'] = function ($sql) use (&$b_done) {
+    global $wpdb;
+    if ($b_done) { return; }
+    $b_done = true;
+    $wpdb->rows[T_ID]['post_content'] = 'committed by B';
+    $wpdb->rows[T_ID]['post_modified_gmt'] = '2026-11-25 10:05:00';
+    clean_post_cache(T_ID);
+};
 $r = cinatra_ability_post_read(['post_id' => T_ID]);
-check('normal case: the fresh row verified, read succeeds', true === ($r['success'] ?? null));
+check('A issued no cache write of its own ( spy )', [] === ($GLOBALS['cinatra_test']['cache_writes'] ?? []));
+check('A did not return or decide on its older row: it retried and returned B\'s committed row', true === ($r['success'] ?? null) && 'committed by B' === $r['post_content']);
+check('the cache never holds A\'s older row afterwards', 'committed by B' === ($GLOBALS['cinatra_test']['post_cache'][T_ID]['post_content'] ?? 'committed by B'));
+reset_fixture();
+$r1 = cinatra_ability_post_read(['post_id' => T_ID]);
+$r2 = cinatra_ability_post_update_if_unchanged(base_update());
+check('normal case: read and write succeed with no cache write and no invalidation before the save', true === ($r1['success'] ?? null) && true === ($r2['success'] ?? null) && [] === ($GLOBALS['cinatra_test']['cache_writes'] ?? []));
 
 echo "Read: raw values, fresh capability\n";
 reset_fixture();
