@@ -263,7 +263,11 @@ function wp_clear_scheduled_hook($hook) {
 }
 // HTML sanitisation stubs (pass-through for tests; the tag/attribute filter is irrelevant
 // in the test harness since no real HTML output is asserted in these tests).
-function wp_kses($text, $allowed_html, $allowed_protocols = []) { return $text; }
+// A test can model kses with ['kses'] => callable( $text, $allowed_html ); otherwise the text is unchanged.
+function wp_kses($text, $allowed_html, $allowed_protocols = []) {
+    $kses = $GLOBALS['cinatra_test']['kses'] ?? null;
+    return is_callable($kses) ? $kses($text, $allowed_html) : $text;
+}
 function wp_kses_post($text) { return $text; }
 
 // ---------------------------------------------------------------------------

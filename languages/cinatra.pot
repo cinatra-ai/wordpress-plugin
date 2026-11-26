@@ -9,7 +9,7 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-11-25T21:18:03+00:00\n"
+"POT-Creation-Date: 2026-11-25T21:18:25+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: cinatra\n"
@@ -451,5 +451,99 @@ msgid "Read the raw stored title, content, excerpt, status, type, permalink and 
 msgstr ""
 
 #: cinatra.php:4567
+#: cinatra.php:4922
 msgid "The numeric ID of the post or page."
+msgstr ""
+
+#: cinatra.php:4644
+msgid "The input must be an object."
+msgstr ""
+
+#: cinatra.php:4649
+msgid "The input contains an unknown field."
+msgstr ""
+
+#: cinatra.php:4653
+msgid "post_id must be a positive integer."
+msgstr ""
+
+#: cinatra.php:4657
+msgid "if_unmodified_since must be the post_modified_gmt value of the read the change is based on."
+msgstr ""
+
+#: cinatra.php:4662
+msgid "expected must be an object."
+msgstr ""
+
+#: cinatra.php:4669
+msgid "expected must hold exactly title, content, excerpt, status and row_token as read."
+msgstr ""
+
+#: cinatra.php:4673
+msgid "expected.row_token must be the row_token of the read the change is based on."
+msgstr ""
+
+#: cinatra.php:4678
+msgid "The expected before-values must be strings."
+msgstr ""
+
+#: cinatra.php:4688
+msgid "Field values must be strings."
+msgstr ""
+
+#: cinatra.php:4695
+msgid "status may only be \"draft\". This ability never publishes."
+msgstr ""
+
+#: cinatra.php:4700
+msgid "Nothing to write: give at least one of title, content, excerpt or status."
+msgstr ""
+
+#: cinatra.php:4794
+msgid "This ability writes only published posts and drafts. Nothing was written."
+msgstr ""
+
+#: cinatra.php:4800
+msgid "Another user is editing this post right now. Nothing was written."
+msgstr ""
+
+#: cinatra.php:4817
+#: cinatra.php:4869
+msgid "The post changed since it was read. Nothing was written."
+msgstr ""
+
+#: cinatra.php:4849
+msgid "The posts table has a column name this ability cannot compare safely. Nothing was written."
+msgstr ""
+
+#: cinatra.php:4863
+msgid "The database connection was lost during the write, so it is not known whether the change was stored. Read the post before trying again."
+msgstr ""
+
+#: cinatra.php:4866
+msgid "The database update failed. Nothing was written."
+msgstr ""
+
+#: cinatra.php:4907
+msgid "Written fields whose stored value differs from the sent value because WordPress removed HTML the user may not write."
+msgstr ""
+
+#: cinatra.php:4913
+msgid "Write a reviewed change to a post"
+msgstr ""
+
+#: cinatra.php:4914
+msgid "Write title, content and/or excerpt of a published post or draft (and optionally move it to draft) only if the post row is unchanged since the read the review was based on. Refuses with a code (post_changed, post_locked, unsupported_status, not_found, invalid or db_error) and then writes nothing."
+msgstr ""
+
+#: cinatra.php:4927
+msgid "The post_modified_gmt value of the read the change is based on."
+msgstr ""
+
+#: cinatra.php:4943
+msgid "The title, content, excerpt and status as read, byte for byte, and the row_token of that read; always all five."
+msgstr ""
+
+#: cinatra.php:4951
+msgid "Only \"draft\": move the post to draft in the same write. Omit to keep the current status."
 msgstr ""

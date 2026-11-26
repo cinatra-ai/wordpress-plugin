@@ -4586,3 +4586,387 @@ function cinatra_register_content_read_ability(): void {
 	);
 }
 add_action( 'wp_abilities_api_init', 'cinatra_register_content_read_ability' );
+
+// ---------------------------------------------------------------------------
+// Content ability: write a reviewed change only if the post is unchanged
+// (cinatra#3745).
+//
+// cinatra/post-update-if-unchanged stores the reviewed values of a post only
+// if the post row is still exactly the row the review was based on. The
+// guarantee comes from ONE statement: an UPDATE whose WHERE requires every
+// column of the row to hold the value read, which the database applies
+// atomically. One changed row means stored; no changed row means the row
+// changed since the read ( post_changed ), and nothing was written. There is
+// no transaction, no lock and no other state. After a stored write the
+// post cache is cleared and WordPress's normal after-save hooks run, with the
+// post before and after the save, as wp_insert_post() fires them after its
+// own UPDATE.
+// ---------------------------------------------------------------------------
+
+const CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED = 'cinatra/post-update-if-unchanged';
+
+/**
+ * Map of ability field names to posts-table columns for the writable fields.
+ *
+ * @return array<string,string> Field name => column name.
+ */
+function cinatra_content_writable_fields(): array {
+	return array(
+		'title'   => 'post_title',
+		'content' => 'post_content',
+		'excerpt' => 'post_excerpt',
+	);
+}
+
+/**
+ * Post statuses the write operates on. The others have their own flows and
+ * are refused: trash, auto-draft, inherit, future, private and pending.
+ *
+ * @return string[] Writable statuses.
+ */
+function cinatra_content_writable_statuses(): array {
+	return array( 'publish', 'draft' );
+}
+
+/**
+ * Validate the input of cinatra/post-update-if-unchanged. Pure: no database.
+ *
+ * The expected object holds the before-values of the whole post as read
+ * ( title, content, excerpt, status ) and the row_token of that read, always
+ * all five. Written fields are any of title, content, excerpt, and status
+ * "draft".
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed> [ 'ok' => true, 'id', 'since', 'fields', 'expected', 'token', 'status' ], or an 'invalid' refusal.
+ */
+function cinatra_content_parse_update_input( $input ): array {
+	if ( ! is_array( $input ) ) {
+		return cinatra_content_refusal( 'invalid', __( 'The input must be an object.', 'cinatra' ) );
+	}
+	$writable = cinatra_content_writable_fields();
+	$allowed  = array_merge( array( 'post_id', 'if_unmodified_since', 'expected', 'status' ), array_keys( $writable ) );
+	if ( array() !== array_diff( array_keys( $input ), $allowed ) ) {
+		return cinatra_content_refusal( 'invalid', __( 'The input contains an unknown field.', 'cinatra' ) );
+	}
+	$id = cinatra_content_post_id( $input );
+	if ( 1 > $id ) {
+		return cinatra_content_refusal( 'invalid', __( 'post_id must be a positive integer.', 'cinatra' ) );
+	}
+	$since = $input['if_unmodified_since'] ?? null;
+	if ( ! is_string( $since ) || 1 !== preg_match( '/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/', $since ) ) {
+		return cinatra_content_refusal( 'invalid', __( 'if_unmodified_since must be the post_modified_gmt value of the read the change is based on.', 'cinatra' ) );
+	}
+	$expected_in = $input['expected'] ?? null;
+	$columns     = array_merge( $writable, array( 'status' => 'post_status' ) );
+	if ( ! is_array( $expected_in ) ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected must be an object.', 'cinatra' ) );
+	}
+	$names = array_keys( $expected_in );
+	sort( $names );
+	$required = array_merge( array_keys( $columns ), array( 'row_token' ) );
+	sort( $required );
+	if ( $names !== $required ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected must hold exactly title, content, excerpt, status and row_token as read.', 'cinatra' ) );
+	}
+	$token = $expected_in['row_token'];
+	if ( ! is_string( $token ) || 1 !== preg_match( '/^[0-9a-f]{64}$/', $token ) ) {
+		return cinatra_content_refusal( 'invalid', __( 'expected.row_token must be the row_token of the read the change is based on.', 'cinatra' ) );
+	}
+	$expected = array();
+	foreach ( $columns as $name => $column ) {
+		if ( ! is_string( $expected_in[ $name ] ) ) {
+			return cinatra_content_refusal( 'invalid', __( 'The expected before-values must be strings.', 'cinatra' ) );
+		}
+		$expected[ $column ] = $expected_in[ $name ];
+	}
+	$fields = array();
+	foreach ( $writable as $name => $column ) {
+		if ( ! array_key_exists( $name, $input ) ) {
+			continue;
+		}
+		if ( ! is_string( $input[ $name ] ) ) {
+			return cinatra_content_refusal( 'invalid', __( 'Field values must be strings.', 'cinatra' ) );
+		}
+		$fields[ $column ] = $input[ $name ];
+	}
+	$status = null;
+	if ( array_key_exists( 'status', $input ) ) {
+		if ( 'draft' !== $input['status'] ) {
+			return cinatra_content_refusal( 'invalid', __( 'status may only be "draft". This ability never publishes.', 'cinatra' ) );
+		}
+		$status = 'draft';
+	}
+	if ( array() === $fields && null === $status ) {
+		return cinatra_content_refusal( 'invalid', __( 'Nothing to write: give at least one of title, content, excerpt or status.', 'cinatra' ) );
+	}
+	return array(
+		'ok'       => true,
+		'id'       => $id,
+		'since'    => $since,
+		'fields'   => $fields,
+		'expected' => $expected,
+		'token'    => $token,
+		'status'   => $status,
+	);
+}
+
+/**
+ * The capability-dependent sanitisation WordPress applies to a written field:
+ * the kses filter that WordPress installed on the field's save filter for the
+ * current user ( kses_init_filters(), for a user without unfiltered_html:
+ * wp_filter_kses on title_save_pre, wp_filter_post_kses on content_save_pre
+ * and excerpt_save_pre ). Only that filter runs, on slashed data as in core;
+ * no other save filter of the site runs, so the reviewed value is otherwise
+ * stored as reviewed.
+ *
+ * @param string $column The posts-table column.
+ * @param string $value  The sent value ( unslashed ).
+ * @return string The value to store.
+ */
+function cinatra_content_kses_field( string $column, string $value ): string {
+	$map    = array(
+		'post_title'   => array( 'title_save_pre', 'wp_filter_kses' ),
+		'post_content' => array( 'content_save_pre', 'wp_filter_post_kses' ),
+		'post_excerpt' => array( 'excerpt_save_pre', 'wp_filter_post_kses' ),
+	);
+	$filter = $map[ $column ] ?? null;
+	if ( null === $filter || false === has_filter( $filter[0], $filter[1] ) ) {
+		return $value;
+	}
+	if ( 'wp_filter_kses' === $filter[1] ) {
+		// wp_filter_kses() uses the running filter as the kses context.
+		return wp_kses( $value, $filter[0] );
+	}
+	return wp_kses( $value, 'post' );
+}
+
+/**
+ * The WHERE condition that the row is still exactly the row read: one
+ * condition per column ( the columns the row token covers ), NULL-safe and
+ * byte-exact. A NULL column must be NULL; any other column's SHA-256,
+ * computed by the server over its value in the connection character set
+ * ( the bytes wpdb read ), must equal the hash of the value read. A hash
+ * comparison does not depend on the column's collation ( a case-insensitive
+ * or PAD SPACE collation would make "a" equal "A" or "a " in a plain = ).
+ *
+ * @param array<string,mixed> $row The row as read.
+ * @return array{0:string,1:string[]}|null The condition with %s placeholders and its values, or null when a column name is not a plain identifier.
+ */
+function cinatra_content_row_condition( array $row ): ?array {
+	global $wpdb;
+	$charset = (string) $wpdb->charset;
+	$parts   = array();
+	$values  = array();
+	foreach ( $row as $column => $value ) {
+		if ( 1 !== preg_match( '/^[A-Za-z0-9_]+$/', (string) $column ) ) {
+			return null;
+		}
+		if ( null === $value ) {
+			$parts[] = "`{$column}` IS NULL";
+			continue;
+		}
+		$parts[]  = 1 === preg_match( '/^[a-z0-9_]+$/', $charset ) ? "SHA2(CONVERT(`{$column}` USING {$charset}), 256) = %s" : "SHA2(`{$column}`, 256) = %s";
+		$values[] = hash( 'sha256', (string) $value );
+	}
+	return array( implode( ' AND ', $parts ), $values );
+}
+
+/**
+ * Execute callback for cinatra/post-update-if-unchanged.
+ *
+ * @param mixed $input Ability input.
+ * @return array<string,mixed> The stored values, or a refusal result.
+ */
+function cinatra_ability_post_update_if_unchanged( $input = array() ): array {
+	global $wpdb;
+	$parsed = cinatra_content_parse_update_input( $input );
+	if ( true !== ( $parsed['ok'] ?? false ) ) {
+		return $parsed;
+	}
+	$id                    = (int) $parsed['id'];
+	list( $refusal, $row ) = cinatra_content_permitted_row( $id );
+	if ( null !== $refusal ) {
+		return $refusal;
+	}
+	$modified = array( 'current_modified_gmt' => (string) $row['post_modified_gmt'] );
+
+	if ( ! in_array( (string) $row['post_status'], cinatra_content_writable_statuses(), true ) ) {
+		return cinatra_content_refusal( 'unsupported_status', __( 'This ability writes only published posts and drafts. Nothing was written.', 'cinatra' ), $modified + array( 'current_status' => (string) $row['post_status'] ) );
+	}
+	if ( ! function_exists( 'wp_check_post_lock' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/post.php';
+	}
+	if ( false !== wp_check_post_lock( $id ) ) {
+		return cinatra_content_refusal( 'post_locked', __( 'Another user is editing this post right now. Nothing was written.', 'cinatra' ), $modified );
+	}
+
+	// The row as read now must be the row the review was based on.
+	$changed = array();
+	if ( (string) $row['post_modified_gmt'] !== $parsed['since'] ) {
+		$changed[] = 'post_modified_gmt';
+	}
+	foreach ( $parsed['expected'] as $column => $before ) {
+		if ( (string) $row[ $column ] !== $before ) {
+			$changed[] = $column;
+		}
+	}
+	if ( ! hash_equals( cinatra_content_row_token( $row ), $parsed['token'] ) ) {
+		$changed[] = 'row_token';
+	}
+	if ( array() !== $changed ) {
+		return cinatra_content_refusal( 'post_changed', __( 'The post changed since it was read. Nothing was written.', 'cinatra' ), $modified + array( 'changed' => $changed ) );
+	}
+
+	$data = array();
+	foreach ( $parsed['fields'] as $column => $value ) {
+		$data[ $column ] = cinatra_content_kses_field( $column, $value );
+	}
+	if ( null !== $parsed['status'] ) {
+		$data['post_status'] = $parsed['status'];
+	}
+	$data['post_modified']     = current_time( 'mysql' );
+	$data['post_modified_gmt'] = current_time( 'mysql', 1 );
+	$sanitized                 = array();
+	foreach ( $parsed['fields'] as $column => $value ) {
+		if ( $data[ $column ] !== $value ) {
+			$sanitized[] = $column;
+		}
+	}
+	$stored = array_merge( $row, $data );
+
+	// Nothing differs from the row read ( an identical write in the same
+	// second ): there is nothing to store, and the database would report no
+	// changed row.
+	if ( $stored === $row ) {
+		return array_merge( cinatra_content_shape_row( $row ), array( 'sanitized_fields' => $sanitized ) );
+	}
+
+	// The one statement. It changes the row only while every column holds the
+	// value read, and the SET list differs from that row, so one changed row
+	// means stored and no changed row means the row changed since the read.
+	$condition = cinatra_content_row_condition( $row );
+	if ( null === $condition ) {
+		return cinatra_content_refusal( 'db_error', __( 'The posts table has a column name this ability cannot compare safely. Nothing was written.', 'cinatra' ) );
+	}
+	$set    = array();
+	$values = array();
+	foreach ( $data as $column => $value ) {
+		$set[]    = "`{$column}` = %s";
+		$values[] = $value;
+	}
+	$sql     = 'UPDATE `' . $wpdb->posts . '` SET ' . implode( ', ', $set ) . ' WHERE `ID` = %d AND ' . $condition[0];
+	$dbh     = $wpdb->dbh;
+	$updated = $wpdb->query( $wpdb->prepare( $sql, array_merge( $values, array( $id ), $condition[1] ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- The conditional write; column names are this save's fixed columns and checked identifiers, every value a placeholder; the cache is cleared below.
+	if ( $wpdb->dbh !== $dbh ) {
+		// wpdb reconnected and sent the statement again ( after error 2006 ):
+		// the first attempt may have been stored before the connection broke.
+		return cinatra_content_refusal( 'db_error', __( 'The database connection was lost during the write, so it is not known whether the change was stored. Read the post before trying again.', 'cinatra' ) );
+	}
+	if ( false === $updated || 1 < (int) $updated ) {
+		return cinatra_content_refusal( 'db_error', __( 'The database update failed. Nothing was written.', 'cinatra' ) );
+	}
+	if ( 0 === (int) $updated ) {
+		return cinatra_content_refusal( 'post_changed', __( 'The post changed since it was read. Nothing was written.', 'cinatra' ), array( 'changed' => array( 'row_token' ) ) );
+	}
+
+	// Stored. Now, as an ordinary later step, what wp_insert_post() does after
+	// its UPDATE, in its order and with its arguments; core stores the revision
+	// on post_updated ( wp_save_post_revision ). The hooks get the post as this
+	// save stored it and as it was read before the save.
+	clean_post_cache( $id );
+	$post_before = new WP_Post( sanitize_post( (object) $row, 'raw' ) );
+	$post        = new WP_Post( sanitize_post( (object) $stored, 'raw' ) );
+	wp_transition_post_status( (string) $stored['post_status'], (string) $row['post_status'], $post );
+	do_action( "edit_post_{$post->post_type}", $id, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	do_action( 'edit_post', $id, $post ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	do_action( 'post_updated', $id, $post, $post_before ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook ( core stores the revision on it ).
+	do_action( "save_post_{$post->post_type}", $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	do_action( 'save_post', $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	do_action( 'wp_insert_post', $id, $post, true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core's own update hook.
+	wp_after_insert_post( $post, true, $post_before );
+
+	return array_merge( cinatra_content_shape_row( $stored ), array( 'sanitized_fields' => $sanitized ) );
+}
+
+/**
+ * Register cinatra/post-update-if-unchanged. Runs on wp_abilities_api_init.
+ *
+ * @return void
+ */
+function cinatra_register_content_write_ability(): void {
+	if ( ! function_exists( 'wp_register_ability' ) ) {
+		return;
+	}
+	$text   = array( 'type' => 'string' );
+	$output = cinatra_content_read_output_schema();
+
+	$output['properties']['code']['enum']     = array( 'invalid', 'not_found', 'unsupported_status', 'post_locked', 'post_changed', 'db_error' );
+	$output['properties']['sanitized_fields'] = array(
+		'type'        => 'array',
+		'items'       => $text,
+		'description' => __( 'Written fields whose stored value differs from the sent value because WordPress removed HTML the user may not write.', 'cinatra' ),
+	);
+	cinatra_call_optional(
+		'wp_register_ability',
+		CINATRA_ABILITY_POST_UPDATE_IF_UNCHANGED,
+		array(
+			'label'               => __( 'Write a reviewed change to a post', 'cinatra' ),
+			'description'         => __( 'Write title, content and/or excerpt of a published post or draft (and optionally move it to draft) only if the post row is unchanged since the read the review was based on. Refuses with a code (post_changed, post_locked, unsupported_status, not_found, invalid or db_error) and then writes nothing.', 'cinatra' ),
+			'category'            => CINATRA_ABILITY_CATEGORY,
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'post_id'             => array(
+						'type'        => 'integer',
+						'minimum'     => 1,
+						'description' => __( 'The numeric ID of the post or page.', 'cinatra' ),
+					),
+					'if_unmodified_since' => array(
+						'type'        => 'string',
+						'pattern'     => '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$',
+						'description' => __( 'The post_modified_gmt value of the read the change is based on.', 'cinatra' ),
+					),
+					'expected'            => array(
+						'type'                 => 'object',
+						'properties'           => array(
+							'title'     => $text,
+							'content'   => $text,
+							'excerpt'   => $text,
+							'status'    => $text,
+							'row_token' => array(
+								'type'    => 'string',
+								'pattern' => '^[0-9a-f]{64}$',
+							),
+						),
+						'required'             => array( 'title', 'content', 'excerpt', 'status', 'row_token' ),
+						'additionalProperties' => false,
+						'description'          => __( 'The title, content, excerpt and status as read, byte for byte, and the row_token of that read; always all five.', 'cinatra' ),
+					),
+					'title'               => $text,
+					'content'             => $text,
+					'excerpt'             => $text,
+					'status'              => array(
+						'type'        => 'string',
+						'enum'        => array( 'draft' ),
+						'description' => __( 'Only "draft": move the post to draft in the same write. Omit to keep the current status.', 'cinatra' ),
+					),
+				),
+				'required'             => array( 'post_id', 'if_unmodified_since', 'expected' ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => $output,
+			'execute_callback'    => 'cinatra_ability_post_update_if_unchanged',
+			'permission_callback' => 'cinatra_content_precheck',
+			'meta'                => array(
+				'mcp'          => array( 'public' => true ),
+				'annotations'  => array(
+					'readonly'    => false,
+					'destructive' => true,
+					'idempotent'  => false,
+				),
+				'show_in_rest' => true,
+			),
+		)
+	);
+}
+add_action( 'wp_abilities_api_init', 'cinatra_register_content_write_ability' );

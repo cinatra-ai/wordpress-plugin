@@ -71,10 +71,12 @@ fetch a credential for the browser, and the browser no longer takes one.
 ## Content abilities
 
 When the WordPress Abilities API (WordPress 6.9 or later) is present, the
-plugin registers the ability `cinatra/post-read` in the `cinatra` category.
-The MCP Adapter exposes it as the MCP tool `cinatra-post-read`. Without the
-Abilities API, the plugin registers nothing and works as before. The ability
-does nothing until a caller invokes it.
+plugin registers the abilities `cinatra/post-read` and
+`cinatra/post-update-if-unchanged` in the `cinatra` category. The MCP Adapter
+exposes them as the MCP tools `cinatra-post-read` and
+`cinatra-post-update-if-unchanged`. Without the Abilities API, the plugin
+registers nothing and works as before. The abilities do nothing until a
+caller invokes them.
 
 **`cinatra/post-read`** (read-only). Input: `post_id`. Output: the raw stored
 `post_title`, `post_content`, `post_excerpt`, `post_status`, `post_type`,
@@ -97,6 +99,50 @@ that the caller may not edit all give the same answer, `not_found`, so the
 answer does not show whether the post exists. A failed database read gives
 `db_error`. A refusal is a normal result with the fields `success` (false), `code`,
 `message` and `data`, and never contains post content.
+
+**`cinatra/post-update-if-unchanged`**. Input: `post_id`,
+`if_unmodified_since` (the `post_modified_gmt` of the read that the change is
+based on), `expected` (the `title`, `content`, `excerpt`, `status` and
+`row_token` from that read, always all five), and one or more of `title`,
+`content`, `excerpt` and `status` (only `draft`; the ability never
+publishes). It writes published posts and drafts only.
+
+What it guarantees: the reviewed change is stored only if the post's row is
+unchanged since the read. The ability reads the row, checks the permission,
+the status, the edit lock and that the row is the reviewed one (the
+modification time, the four values and the row token), and then sends ONE
+`UPDATE` that changes the row only while every column still holds the value
+that it read. The database applies that statement atomically. If it changes
+the row, the change is stored. If it changes no row, the row changed after
+the read, and the answer is `post_changed` with nothing written. There is no
+transaction and no lock.
+
+It writes only the requested fields, `post_status` `draft` when requested,
+and the two modification times. The values are stored as sent, except that
+WordPress's kses filter runs on each written field when WordPress has
+installed it for the user (a user without the `unfiltered_html` capability):
+it removes HTML that the user may not write. `sanitized_fields` names each
+field that kses changed.
+
+After a stored write, the ability clears the post's cache and runs the hooks
+that WordPress runs after it saves a post, in the same order and with the
+same arguments: `transition_post_status`, `edit_post`, `post_updated` (where
+WordPress stores a revision), `save_post`, `wp_insert_post` and
+`wp_after_insert_post`, with the post as stored and the post before the save.
+A hook that changes the post then makes a separate, later save; the answer
+reports what this save stored.
+
+What it does not do, compared with a save in the editor: it does not run the
+site's other save filters (`wp_insert_post_data`, the other per-field save
+filters) or the `pre_post_update` action before the write, so the reviewed
+values are stored as reviewed.
+
+The answer on success is the stored row as `cinatra/post-read` returns it,
+plus `sanitized_fields`. The refusal codes are `invalid`, `not_found`,
+`unsupported_status`, `post_locked`, `post_changed` and `db_error`. If the
+database connection is lost during the `UPDATE`, WordPress reconnects and
+sends it again; the first attempt may have been stored, so the answer is
+`db_error` and says that the outcome is not known.
 
 ## Compatibility
 
