@@ -68,6 +68,36 @@ The plugin registers one admin-gated REST endpoint under `wp-json/cinatra/v1/`:
 The earlier session-token and sign-in endpoints are removed. They existed to
 fetch a credential for the browser, and the browser no longer takes one.
 
+## Content abilities
+
+When the WordPress Abilities API (WordPress 6.9 or later) is present, the
+plugin registers the ability `cinatra/post-read` in the `cinatra` category.
+The MCP Adapter exposes it as the MCP tool `cinatra-post-read`. Without the
+Abilities API, the plugin registers nothing and works as before. The ability
+does nothing until a caller invokes it.
+
+**`cinatra/post-read`** (read-only). Input: `post_id`. Output: the raw stored
+`post_title`, `post_content`, `post_excerpt`, `post_status`, `post_type`,
+`post_modified_gmt` and `permalink` of a post or page, and `row_token`. The
+values come directly from the database, not from a cache. The permalink is
+computed from the row that was read, not by reading the post again.
+
+`row_token` is a fingerprint of every column of the post's row in the posts
+table, computed from the same row that the read returns. It is the SHA-256
+hash, as 64 lower-case hexadecimal characters, of this encoding: the ASCII text
+`cinatra-post-row-v1`, then each column in byte order of its name, as a 4-byte
+big-endian length of the name, the name, then the byte `0x00` for NULL, or the
+byte `0x01`, a 4-byte big-endian length of the value and the value as stored.
+The token covers the posts row only. Post meta and terms (categories, tags)
+are not in the row, so the token does not show changes to them.
+
+The caller must be logged in and have the `edit_post` capability for the post.
+A post that does not exist, a post that is not a post or a page, and a post
+that the caller may not edit all give the same answer, `not_found`, so the
+answer does not show whether the post exists. A failed database read gives
+`db_error`. A refusal is a normal result with the fields `success` (false), `code`,
+`message` and `data`, and never contains post content.
+
 ## Compatibility
 
 - **WordPress:** 5.9 or later (tested up to 7.1).

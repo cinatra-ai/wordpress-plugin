@@ -287,7 +287,24 @@ class WP_Post {
     public $post_name;
     // The list ability (wordpress-plugin#82) serializes the GMT publish date.
     public $post_date_gmt;
-    public function __construct(array $fields = []) {
+    // The remaining wp_posts columns, as core's WP_Post declares them ( content abilities ).
+    public $post_author;
+    public $post_parent;
+    public $post_date;
+    public $post_content_filtered;
+    public $comment_status;
+    public $ping_status;
+    public $post_password;
+    public $to_ping;
+    public $pinged;
+    public $post_modified;
+    public $guid;
+    public $menu_order;
+    public $post_mime_type;
+    public $comment_count;
+    public $filter;
+    public function __construct($fields = []) {
+        $fields = (array) $fields; // core takes an object ( get_object_vars ); the tests also pass arrays
         $this->ID = $fields['ID'] ?? 0;
         $this->post_type = $fields['post_type'] ?? 'post';
         $this->post_title = $fields['post_title'] ?? '';
@@ -298,13 +315,28 @@ class WP_Post {
         $this->post_excerpt = $fields['post_excerpt'] ?? '';
         $this->post_name = $fields['post_name'] ?? '';
         $this->post_date_gmt = $fields['post_date_gmt'] ?? '2026-06-24 12:00:00';
+        $this->post_author = $fields['post_author'] ?? '0';
+        $this->post_parent = $fields['post_parent'] ?? 0;
+        foreach (['post_date', 'post_content_filtered', 'comment_status', 'ping_status', 'post_password', 'to_ping', 'pinged', 'post_modified', 'guid', 'menu_order', 'post_mime_type', 'comment_count', 'filter'] as $k) {
+            $this->$k = $fields[$k] ?? null;
+        }
     }
 }
 function get_the_title($post) {
     return $post instanceof WP_Post ? (string) $post->post_title : '';
 }
 function get_permalink($post) {
-    return $post instanceof WP_Post ? (string) $post->permalink : '';
+    if (!$post instanceof WP_Post) {
+        return '';
+    }
+    if ('' !== (string) $post->permalink) {
+        return (string) $post->permalink;
+    }
+    // A post object built from a row ( no fixture permalink ): core builds the
+    // link from the object's own fields; with permalink_base set the stub
+    // does the same from its slug.
+    $base = $GLOBALS['cinatra_test']['permalink_base'] ?? null;
+    return null !== $base && '' !== (string) $post->post_name ? $base . $post->post_name . '/' : '';
 }
 function get_post_type_object($post_type) {
     $registry = $GLOBALS['cinatra_test']['post_types'] ?? [
@@ -358,10 +390,15 @@ function delete_option($name) {
 // ---------------------------------------------------------------------------
 // Auth / nonces / user
 // ---------------------------------------------------------------------------
-function current_user_can($cap) {
+function current_user_can($cap, ...$args) {
     // Cap-aware when a per-capability map is provided (e.g. edit_post vs
     // publish_posts differ); otherwise the single boolean drives every check.
     // Backward compatible: tests that never set ['caps'] behave as before.
+    // A test that needs a per-object answer (edit_post on ONE post id) sets
+    // ['caps_fn'] => callable($cap, ...$args); it wins over everything else.
+    if (isset($GLOBALS['cinatra_test']['caps_fn']) && is_callable($GLOBALS['cinatra_test']['caps_fn'])) {
+        return (bool) call_user_func($GLOBALS['cinatra_test']['caps_fn'], $cap, ...$args);
+    }
     $caps = $GLOBALS['cinatra_test']['caps'] ?? null;
     if (is_array($caps) && array_key_exists($cap, $caps)) {
         return (bool) $caps[$cap];
